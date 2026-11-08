@@ -176,6 +176,7 @@ mod tests {
         use crate::render::{Encoder, MediaRef, Profile, RenderJob, Style};
         let media = |name: &str| MediaRef { path: std::path::PathBuf::from(name), duration: 60.0, has_audio: true };
         RenderJob {
+            decode: Default::default(),
             source: media("/v/src.mp4"),
             source_aspect: 16.0 / 9.0,
             start: 0.0,

@@ -78,7 +78,7 @@ pub fn accept_all(app: &AppHandle, project_id: i64) -> Result<String, String> {
 
 /// Собирает черновики, как кнопка «Собрать черновики».
 pub fn generate(app: &AppHandle, project_id: i64) -> Result<String, String> {
-    let n = crate::drafts::drafts_generate(app.clone(), app.state(), project_id)?;
+    let n = crate::drafts::generate_and_render(app, project_id)?;
     Ok(format!("создано черновиков: {n}"))
 }
 
@@ -89,7 +89,7 @@ pub fn rerender(app: &AppHandle, draft_id: i64) {
 
 /// Запускает финальный рендер одобренных черновиков, как кнопка «Финальный рендер».
 pub fn finals(app: &AppHandle, project_id: i64) -> Result<String, String> {
-    let n = crate::drafts::finals_start(app.clone(), app.state(), project_id)?;
+    let n = crate::drafts::start_finals(app, project_id)?;
     Ok(format!("запущено финалов: {n}"))
 }
 

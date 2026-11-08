@@ -324,9 +324,26 @@ export interface PostFailedEvent {
 
 /** `drafting` — пишется описание, `ready` — готово и ждёт запуска, `needs_check` — неясно, вышел ли ролик: проверь в TikTok. */
 export type JobState = "drafting" | "ready" | "queued" | "sending" | "done" | "failed" | "needs_check";
+/** Готовый ролик из папки: уже отрендеренный, выкладывается без рендера. */
+export interface ReadyVideo {
+  id: number;
+  name: string;
+  duration: number;
+  width: number;
+  height: number;
+  /** Не вертикальный кадр: ролик добавлен, но TikTok его обрежет или покажет с полями. */
+  warning: string | null;
+}
 export interface PublishJob {
   id: number;
-  draftId: number;
+  /** Ролик из пачки. У готового ролика из папки его нет. */
+  draftId: number | null;
+  /** Готовый ролик из папки. */
+  readyId: number | null;
+  /** Имя файла у готового ролика; у ролика из пачки пусто. */
+  name: string;
+  /** Аккаунт, выбранный вручную; `null` — по кругу. */
+  wantedAccount: number | null;
   caption: string;
   hashtags: string[];
   state: JobState;
@@ -416,6 +433,26 @@ export interface YoutubeStart {
   title: string;
   channel: string;
   thumb: string | null;
+}
+/** Пачка: элемент и его стадия. `awaiting_approval` — черновики ждут человека, `rendering` — идёт финал. */
+export type BatchStage = "queued" | "downloading" | "importing" | "analyzing" | "drafting" | "awaiting_approval" | "rendering" | "done" | "failed";
+export interface BatchItem {
+  id: number;
+  kind: "link" | "file";
+  source: string;
+  title: string;
+  precut: boolean;
+  stage: BatchStage;
+  /** Для «ошибки» — причина, для «готово» — заметка, сколько черновиков не собрались. */
+  error: string | null;
+  projectId: number | null;
+}
+export interface BatchNewItem {
+  kind: "link" | "file";
+  source: string;
+  title?: string;
+  preset?: string;
+  precut?: boolean;
 }
 export type DownloadStage = "queued" | "downloading" | "merging" | "finishing" | "importing";
 export interface StreamView {
@@ -511,6 +548,9 @@ const real = {
   queueApplyText: (projectId: number, caption: string, hashtags: string[]) => invoke<number>("queue_apply_text", { projectId, caption, hashtags }),
   queueJobUpdate: (id: number, caption: string, hashtags: string[]) => invoke<PublishJob>("queue_job_update", { id, caption, hashtags }),
   queueJobResolve: (id: number, action: JobResolve) => invoke<void>("queue_job_resolve", { id, action }),
+  queueJobAccount: (id: number, account: number | null) => invoke<void>("queue_job_account", { id, account }),
+  readyAdd: (projectId: number, paths: string[]) => invoke<ReadyVideo[]>("ready_add", { projectId, paths }),
+  readyRemove: (id: number) => invoke<void>("ready_remove", { id }),
   queueSettingsSet: (pauseMin: number, dailyLimit: number, windowStart: number, windowEnd: number) =>
     invoke<QueueSettings>("queue_settings_set", { pauseMin, dailyLimit, windowStart, windowEnd }),
   accountsAdd: (labels: string[]) => invoke<number>("accounts_add", { labels }),
@@ -523,6 +563,13 @@ const real = {
   youtubeAnalyze: (url: string) => invoke<YoutubeInfo>("youtube_analyze", { url }),
   youtubeDownload: (args: YoutubeStart) => invoke<string>("youtube_download", { args }),
   youtubeCancel: (jobId: string) => invoke<void>("youtube_cancel", { jobId }),
+  batchList: () => invoke<BatchItem[]>("batch_list"),
+  batchAdd: (items: BatchNewItem[]) => invoke<number>("batch_add", { items }),
+  batchStart: () => invoke<void>("batch_start"),
+  batchCancel: () => invoke<void>("batch_cancel"),
+  batchRemove: (id: number) => invoke<void>("batch_remove", { id }),
+  batchRetry: (id: number) => invoke<void>("batch_retry", { id }),
+  batchApproveReady: () => invoke<number>("batch_approve_ready"),
 };
 
 // Заглушка нужна только чтобы смотреть вёрстку в обычном браузере (`npm run dev`).
@@ -746,7 +793,7 @@ const mock: typeof real = {
   queueState: async () => demoQueueState(),
   queuePrepare: async (projectId) => {
     demoGenerating = true;
-    demoJobs = demoFinals.map((d, i) => ({ id: 300 + i, draftId: d.id, caption: "", hashtags: [], state: "drafting" as JobState, error: null, attempts: 0, notBefore: 0, len: 0, updatedAt: nowSec() }));
+    demoJobs = demoFinals.map((d, i) => ({ id: 300 + i, draftId: d.id, readyId: null, name: "", wantedAccount: null, caption: "", hashtags: [], state: "drafting" as JobState, error: null, attempts: 0, notBefore: 0, len: 0, updatedAt: nowSec() }));
     mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
     demoJobs.forEach((j, i) => {
       for (const [k, message] of ["Подбираю хэштеги", "Пишу описание, часть 2 из 4", "Пишу описание, часть 4 из 4"].entries()) {
@@ -779,7 +826,7 @@ const mock: typeof real = {
       const fields = { caption: caption.trim(), hashtags: tags, len, state: "ready" as JobState, error: null };
       const old = demoJobs.find((j) => j.draftId === d.id);
       if (old) Object.assign(old, fields);
-      else demoJobs.push({ id: 300 + demoJobs.length + 1, draftId: d.id, attempts: 0, notBefore: 0, updatedAt: nowSec(), ...fields });
+      else demoJobs.push({ id: 300 + demoJobs.length + 1, draftId: d.id, readyId: null, name: "", wantedAccount: null, attempts: 0, notBefore: 0, updatedAt: nowSec(), ...fields });
     }
     mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
     return eligible.length;
@@ -792,6 +839,9 @@ const mock: typeof real = {
     Object.assign(j, { caption: caption.trim(), hashtags: normalizeTags(hashtags), len, state: "ready" });
     return j;
   },
+  queueJobAccount: async () => {},
+  readyAdd: async (_projectId, paths) => paths.map((p, i) => ({ id: i + 1, name: p.split(/[\\/]/).pop() ?? p, duration: 60, width: 1080, height: 1920, warning: null })),
+  readyRemove: async () => {},
   queueJobResolve: async (id, action) => {
     const j = demoJobs.find((x) => x.id === id);
     if (!j) return;
@@ -917,6 +967,13 @@ const mock: typeof real = {
     mockBus.dispatchEvent(new CustomEvent("youtube-error", { detail: { jobId, message: "Остановлено — можно продолжить", cancelled: true } }));
   },
   momentAddManual: async (_p, start, end) => ({ ...demoMoments[0], id: 99, start, end, title: "Мой момент", status: "accepted", manual: true }),
+  batchList: async () => [],
+  batchAdd: async (items) => items.length,
+  batchStart: async () => {},
+  batchCancel: async () => {},
+  batchRemove: async () => {},
+  batchRetry: async () => {},
+  batchApproveReady: async () => 0,
 };
 
 export const api = inTauri || !import.meta.env.DEV ? real : mock;

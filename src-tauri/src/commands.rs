@@ -39,9 +39,9 @@ pub fn media_url(state: State<'_, AppState>, path: String) -> String {
 
 #[derive(Serialize, Clone)]
 pub struct Project {
-    id: i64,
+    pub(crate) id: i64,
     path: String,
-    title: String,
+    pub(crate) title: String,
     duration: f64,
     width: u32,
     height: u32,

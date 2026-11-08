@@ -145,6 +145,8 @@ pub struct EnvReport {
     pub os: &'static str,
     pub ffmpeg: Option<String>,
     pub nvenc: bool,
+    /// В ffmpeg есть CUDA: декодирование NVDEC. Сам по себе не значит, что карта NVIDIA стоит (проверяется рабочим рендером).
+    pub cuda: bool,
     pub libass: bool,
     /// Версия yt-dlp; `None`, если программы нет.
     pub ytdlp: Option<String>,
@@ -177,6 +179,7 @@ pub async fn check_env() -> EnvReport {
         os: std::env::consts::OS,
         ffmpeg,
         nvenc: has("h264_nvenc", &["-encoders"]).await,
+        cuda: has("cuda", &["-hwaccels"]).await,
         libass: has(" ass ", &["-filters"]).await,
         ytdlp_ok: ytdlp.as_deref().is_some_and(|v| crate::youtube::select::version_at_least(v, crate::youtube::select::MIN_YTDLP)),
         ytdlp,

@@ -207,6 +207,15 @@ pub enum Encoder {
     X264,
 }
 
+/// Кто декодирует видеовходы: процессор или NVDEC на видеокарте NVIDIA.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Decode {
+    #[default]
+    Cpu,
+    Nvidia,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaRef {
@@ -226,6 +235,9 @@ pub struct Word {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderJob {
+    /// Кто декодирует видео. Кадры всё равно возвращаются в память: фильтры наложения пока на процессоре.
+    #[serde(default)]
+    pub decode: Decode,
     pub source: MediaRef,
     /// Ширина исходника, делённая на высоту; 0 — неизвестно.
     #[serde(default)]

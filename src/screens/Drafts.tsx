@@ -55,6 +55,27 @@ export default function DraftsScreen() {
     return onEvent<number>("dev-edit", (id) => setEditing(id));
   }, []);
 
+  // Пачка: сколько роликов из пачки ждут одобрения (по всем видео сразу)
+  const [batchWaiting, setBatchWaiting] = useState(0);
+  const reloadBatch = useCallback(() => {
+    api.batchList().then((l) => setBatchWaiting(l.filter((i) => i.stage === "awaiting_approval").length)).catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    reloadBatch();
+    return onEvent("batch-changed", reloadBatch);
+  }, [reloadBatch]);
+
+  const approveBatch = async () => {
+    try {
+      const n = await api.batchApproveReady();
+      notify(n ? `Одобрено черновиков из пачки: ${n}. Финал соберётся сам` : "В пачке нечего одобрять: превью ещё не готовы");
+      reloadBatch();
+      await reload();
+    } catch (e) {
+      notify(errText(e), "error");
+    }
+  };
+
   const accepted = moments.filter((m) => m.status === "accepted").length;
   const missing = Math.max(0, accepted - drafts.length);
   const noBackground = !defaults || defaults.backgroundIds.length === 0;
@@ -135,6 +156,15 @@ export default function DraftsScreen() {
           {count(["failed"]) > 0 && <span className="chip !border-danger/50 !text-danger">Ошибок: {count(["failed"])}</span>}
         </div>
       </div>
+
+      {batchWaiting > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-accent/30 bg-accent/8 p-4 text-sm text-white/80">
+          <span>Из пачки ждут одобрения роликов: {batchWaiting}. Финал соберётся сам, как только одобришь.</span>
+          <button className="btn btn-primary" onClick={() => void approveBatch()}>
+            Одобрить готовые по пачке
+          </button>
+        </div>
+      )}
 
       {noBackground && (
         <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="flex items-center justify-between gap-4 rounded-2xl border border-[#ffb020]/30 bg-[#ffb020]/8 p-4 text-sm text-[#ffd88a]">

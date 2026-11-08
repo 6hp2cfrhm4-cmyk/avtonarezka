@@ -64,6 +64,7 @@ fn mref(path: &Path, dur: f64, audio: bool) -> MediaRef {
 fn job(name: &str) -> RenderJob {
     let m = media();
     RenderJob {
+        decode: Default::default(),
         source: mref(&m.source, 12.0, true),
         source_aspect: 1280.0 / 720.0,
         start: 2.0,

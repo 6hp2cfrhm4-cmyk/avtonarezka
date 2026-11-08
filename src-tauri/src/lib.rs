@@ -18,6 +18,8 @@ pub mod models;
 pub mod platform;
 mod state;
 mod publish_queue;
+mod batch;
+mod ready;
 mod tiktok_cmds;
 pub mod vulkan_loader;
 mod youtube_cmds;
@@ -53,6 +55,7 @@ pub fn run() {
             drafts::recover_interrupted(&db.0.lock().unwrap());
             tiktok_cmds::recover_interrupted_posts(&db.0.lock().unwrap());
             publish_queue::recover_interrupted_jobs(&db.0.lock().unwrap());
+            batch::recover_interrupted(&db.0.lock().unwrap());
             app.manage(state::AppState {
                 db,
                 media,
@@ -62,6 +65,7 @@ pub fn run() {
                 draft_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
                 final_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
                 nvenc: Default::default(),
+                cuda: Default::default(),
                 secrets: tiktok::secrets::Secrets::detect(),
                 login: Default::default(),
                 posting: Default::default(),
@@ -72,9 +76,11 @@ pub fn run() {
                 queue_note: Default::default(),
                 downloads: Default::default(),
                 youtube_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+                batch: Default::default(),
             });
             // модели качаются сами, если их нет: без них анализ не запустится
             model_download::start(app.handle());
+            batch::resume(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -131,6 +137,16 @@ pub fn run() {
             publish_queue::queue_start,
             publish_queue::queue_pause,
             publish_queue::queue_stop,
+            batch::batch_list,
+            batch::batch_add,
+            batch::batch_start,
+            batch::batch_cancel,
+            batch::batch_remove,
+            batch::batch_retry,
+            batch::batch_approve_ready,
+            ready::ready_add,
+            ready::ready_remove,
+            publish_queue::queue_job_account,
             accounts::accounts_add,
             accounts::accounts_set_enabled,
             accounts::accounts_remove,

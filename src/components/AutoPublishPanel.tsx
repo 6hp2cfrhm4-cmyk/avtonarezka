@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "motion/react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { api, errText, type JobResolve, type JobState, type PublishJob, type QueueState } from "../lib/api";
 import { captionLen, parseTags } from "../lib/caption";
 import { useUi } from "../store";
@@ -91,6 +92,7 @@ export default function AutoPublishPanel() {
 
   const finals = useMemo(() => drafts.filter((d) => d.status === "final_done"), [drafts]);
   const titleOf = useMemo(() => new Map(drafts.map((d) => [d.id, `Часть ${d.part} · ${d.title}`])), [drafts]);
+  const titleFor = (j: PublishJob) => (j.readyId !== null ? j.name : j.draftId !== null ? titleOf.get(j.draftId) : undefined) ?? "Ролик";
   const jobs = queue?.jobs ?? [];
   const byDraft = useMemo(() => new Map(jobs.map((j) => [j.draftId, j])), [jobs]);
   const todo = finals.filter((d) => !byDraft.has(d.id)).length;
@@ -102,6 +104,21 @@ export default function AutoPublishPanel() {
 
   const run = (p: Promise<unknown>) => p.catch((e) => notify(errText(e), "error"));
   const reload = () => api.queueState(project.id).then(setQueue).catch((e) => notify(errText(e), "error"));
+
+  const pickReady = async () => {
+    try {
+      const sel = await open({ multiple: true, filters: [{ name: "Видео", extensions: ["mp4"] }] });
+      if (!sel) return;
+      const added = await api.readyAdd(project.id, Array.isArray(sel) ? sel : [sel]);
+      for (const r of added) {
+        if (r.warning) notify(`${r.name}: ${r.warning}`, "error");
+      }
+      notify(`Готовых роликов добавлено: ${added.length}`);
+      await reload();
+    } catch (e) {
+      notify(errText(e), "error");
+    }
+  };
 
   const saveSettings = () => {
     const p = Math.round(Number(pause));
@@ -136,6 +153,15 @@ export default function AutoPublishPanel() {
         <span className={`chip ${queue.running ? "!border-accent/50 !text-accent" : ""}`}>
           {queue.generating ? "Пишу описания" : queue.running ? "Очередь идёт" : "Очередь стоит"}
         </span>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-black/20 p-4">
+        <p className="max-w-2xl text-sm text-white/60">
+          Готовые 1080×1920 из папки выкладываются без рендера. Им задаётся текст кнопкой «Один текст на все» или вручную.
+        </p>
+        <button className="btn" disabled={queue.running} onClick={() => void pickReady()}>
+          Выбрать из папки
+        </button>
       </div>
 
       <div className="flex flex-col gap-2">
@@ -211,7 +237,14 @@ export default function AutoPublishPanel() {
           {listOpen && (
             <div className="mt-3 flex flex-col gap-3">
               {jobs.map((j) => (
-                <JobRow key={j.id} job={j} title={titleOf.get(j.draftId) ?? `Ролик ${j.draftId}`} working={queueText[j.draftId]} q={queue} onChanged={reload} />
+                <JobRow
+                  key={j.id}
+                  job={j}
+                  title={titleFor(j)}
+                  working={j.draftId !== null ? queueText[j.draftId] : undefined}
+                  q={queue}
+                  onChanged={reload}
+                />
               ))}
             </div>
           )}
@@ -374,7 +407,11 @@ const JobRow = memo(function JobRow({ job, title, working, q, onChanged }: { job
         </div>
       </div>
 
-      {job.state === "drafting" && <div className="mt-2 text-xs text-white/55">{working ?? "Жду своей очереди у модели…"}</div>}
+      {job.state === "drafting" && (
+        <div className="mt-2 text-xs text-white/55">
+          {job.readyId !== null ? "Нужен текст: задай его кнопкой «Один текст на все» или вручную" : (working ?? "Жду своей очереди у модели…")}
+        </div>
+      )}
 
       {job.state !== "drafting" && !editing && (
         <>
@@ -401,7 +438,29 @@ const JobRow = memo(function JobRow({ job, title, working, q, onChanged }: { job
 
       {job.error && <div className="mt-2 text-xs leading-snug text-[#ffd3db]">{job.error}</div>}
 
+      {["queued", "ready", "drafting", "failed"].includes(job.state) && !editing && (
+        <label className="mt-3 flex items-center gap-2 text-xs text-white/55">
+          Аккаунт
+          <select
+            className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs outline-none"
+            value={job.wantedAccount ?? ""}
+            onChange={(e) => void run(api.queueJobAccount(job.id, e.target.value === "" ? null : Number(e.target.value)))}
+          >
+            <option value="" className="bg-[#14101f]">По кругу</option>
+            {q.accounts.map((a) => (
+              <option key={a.id} value={a.id} disabled={!a.enabled} className="bg-[#14101f]">
+                {a.label}
+                {a.enabled ? "" : " (выключен)"}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
       <div className="mt-3 flex flex-wrap gap-2">
+        {job.readyId !== null && ["drafting", "ready", "failed"].includes(job.state) && !editing && (
+          <button className="btn !py-1.5 !text-xs" onClick={() => void run(api.readyRemove(job.readyId!))}>Убрать ролик</button>
+        )}
         {editing ? (
           <>
             <button className="btn !py-1.5 !text-xs btn-primary" disabled={!fits || !text.trim() || tagList.length > q.maxTags || tagList.length === 0} onClick={() => void save()}>Сохранить</button>

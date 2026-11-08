@@ -97,15 +97,20 @@ pub fn build(job: &RenderJob, ass_path: Option<&Path>, fonts_dir: Option<&Path>)
         next - 1
     };
 
-    let i_src = add(&mut args, vec!["-ss".into(), f3(job.start), "-t".into(), f3(len)], &job.source.path);
+    // NVDEC: декодирование видеовходов на видеокарте; музыка декодируется на процессоре
+    let hw: Vec<String> = match job.decode {
+        Decode::Nvidia => vec!["-hwaccel".into(), "cuda".into()],
+        Decode::Cpu => vec![],
+    };
+    let i_src = add(&mut args, [hw.clone(), vec!["-ss".into(), f3(job.start), "-t".into(), f3(len)]].concat(), &job.source.path);
     let i_ban = freeze.and_then(|(_, d)| {
         job.banner
             .as_ref()
-            .map(|b| add(&mut args, vec!["-t".into(), f3(d)], &b.path))
+            .map(|b| add(&mut args, [hw.clone(), vec!["-t".into(), f3(d)]].concat(), &b.path))
     });
     let i_gp = add(
         &mut args,
-        vec!["-stream_loop".into(), "-1".into(), "-ss".into(), f3(job.gameplay_offset)],
+        [hw.clone(), vec!["-stream_loop".into(), "-1".into(), "-ss".into(), f3(job.gameplay_offset)]].concat(),
         &job.gameplay.path,
     );
     let i_mus = job.music.as_ref().filter(|_| st.audio.music > 0.0).map(|m| {
@@ -283,6 +288,7 @@ mod tests {
 
     fn job() -> RenderJob {
         RenderJob {
+            decode: Default::default(),
             source: media("/v/src.mp4", 600.0, true),
             source_aspect: 16.0 / 9.0,
             start: 100.0,
@@ -388,6 +394,22 @@ mod tests {
         let mut j = job();
         j.style.banner.enabled = false;
         assert!(build(&j, None, None).filter.find("chromakey").is_none());
+    }
+
+    #[test]
+    fn nvdec_is_asked_for_video_inputs_only_and_cpu_mode_adds_nothing() {
+        let cpu = build(&job(), None, None);
+        assert!(!cpu.args.iter().any(|a| a == "-hwaccel"), "по умолчанию декодирует процессор");
+        let mut j = job();
+        j.decode = Decode::Nvidia;
+        let gpu = build(&j, None, None);
+        // источник, баннер и геймплей — видеовходы; музыки в этом задании нет
+        let hw = gpu.args.iter().filter(|a| *a == "-hwaccel").count();
+        assert_eq!(hw, 3, "{:?}", gpu.args);
+        assert!(gpu.args.windows(2).filter(|w| w[0] == "-hwaccel").all(|w| w[1] == "cuda"));
+        // -hwaccel стоит до своего -i: это входная опция
+        let first_i = gpu.args.iter().position(|a| a == "-i").unwrap();
+        assert!(gpu.args[..first_i].iter().any(|a| a == "-hwaccel"));
     }
 
     #[test]

@@ -107,7 +107,7 @@ export default function FinalScreen() {
         </AnimatePresence>
       </div>
 
-      {count(["final_done"]) > 0 && <AutoPublishPanel />}
+      <AutoPublishPanel />
 
       {finals.length === 0 ? (
         <motion.div initial={{ opacity: 0, rotateX: 15, y: 30 }} animate={{ opacity: 1, rotateX: 0, y: 0 }} className="glass grid place-items-center gap-5 rounded-[28px] p-14 text-center">

@@ -26,7 +26,7 @@ use crate::{
         api::{len_utf16, make_caption, normalize_hashtags, now_unix},
         browser::{find_chromium, run_browser_post, AfterClick, BrowserPost, CAPTION_LIMIT},
     },
-    tiktok_cmds::{begin_post, finish_post, latest_posts, mark_sent, PostDone, PostDto, PostFailed, PostProgress},
+    tiktok_cmds::{begin_post, begin_ready_post, finish_post, latest_posts, mark_sent, PostDone, PostDto, PostFailed, PostProgress},
 };
 
 type CmdResult<T> = Result<T, String>;
@@ -72,7 +72,14 @@ pub(crate) fn load_settings(db: &Connection) -> QueueSettings {
 #[serde(rename_all = "camelCase")]
 pub struct JobDto {
     pub id: i64,
-    pub draft_id: i64,
+    /// Черновик, если задача про ролик из пачки; у готового ролика из папки его нет.
+    pub draft_id: Option<i64>,
+    /// Готовый ролик из папки (`ready_videos`).
+    pub ready_id: Option<i64>,
+    /// Имя файла для готового ролика; у черновика пусто.
+    pub name: String,
+    /// Аккаунт, который человек выбрал для этого ролика; `None` — по кругу.
+    pub wanted_account: Option<i64>,
     pub caption: String,
     pub hashtags: Vec<String>,
     /// `drafting`, `ready`, `queued`, `sending`, `done`, `failed`, `needs_check`.
@@ -85,7 +92,9 @@ pub struct JobDto {
     pub updated_at: i64,
 }
 
-const JOB_SELECT: &str = "SELECT j.id, j.draft_id, j.caption, j.hashtags, j.state, j.error, j.attempts, j.not_before, j.updated_at FROM publish_jobs j";
+const JOB_SELECT: &str = "SELECT j.id, j.draft_id, j.caption, j.hashtags, j.state, j.error, j.attempts, j.not_before, j.updated_at,
+    j.ready_id, COALESCE(r.name, ''), j.wanted_account_id
+    FROM publish_jobs j LEFT JOIN ready_videos r ON r.id = j.ready_id";
 
 fn job_from_row(r: &Row) -> rusqlite::Result<JobDto> {
     let caption: String = r.get(2)?;
@@ -101,6 +110,9 @@ fn job_from_row(r: &Row) -> rusqlite::Result<JobDto> {
         attempts: r.get(6)?,
         not_before: r.get(7)?,
         updated_at: r.get(8)?,
+        ready_id: r.get(9)?,
+        name: r.get(10)?,
+        wanted_account: r.get(11)?,
     })
 }
 
@@ -108,9 +120,12 @@ fn job_by_id(db: &Connection, id: i64) -> rusqlite::Result<JobDto> {
     db.query_row(&format!("{JOB_SELECT} WHERE j.id = ?1"), [id], job_from_row)
 }
 
-/// Задачи проекта в порядке частей.
+/// Задачи проекта: сначала ролики из пачки по частям, потом готовые ролики из папки.
 pub(crate) fn jobs_for_project(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<JobDto>> {
-    let mut st = db.prepare(&format!("{JOB_SELECT} JOIN drafts d ON d.id = j.draft_id JOIN moments m ON m.id = d.moment_id WHERE m.project_id = ?1 ORDER BY d.part, j.id"))?;
+    let mut st = db.prepare(&format!(
+        "{JOB_SELECT} LEFT JOIN drafts d ON d.id = j.draft_id LEFT JOIN moments m ON m.id = d.moment_id
+         WHERE COALESCE(m.project_id, r.project_id) = ?1 ORDER BY COALESCE(d.part, 1000000), j.id"
+    ))?;
     let rows = st.query_map([project_id], job_from_row)?;
     rows.collect()
 }
@@ -231,6 +246,28 @@ pub(crate) fn apply_text(db: &Connection, project_id: i64, caption: &str, hashta
         .map_err(err)?;
         n += 1;
     }
+    // готовые ролики из папки: у них нет черновика, поэтому отдельный список
+    let readies: Vec<i64> = {
+        let mut st = db
+            .prepare(
+                "SELECT r.id FROM ready_videos r
+                 WHERE r.project_id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM publish_jobs j WHERE j.ready_id = r.id AND j.state IN ('queued', 'sending', 'done', 'needs_check'))
+                 ORDER BY r.id",
+            )
+            .map_err(err)?;
+        let rows: Vec<i64> = st.query_map([project_id], |r| r.get(0)).map_err(err)?.collect::<rusqlite::Result<_>>().map_err(err)?;
+        rows
+    };
+    for id in readies {
+        db.execute(
+            "INSERT INTO publish_jobs (ready_id, caption, hashtags, state) VALUES (?1, ?2, ?3, 'ready')
+             ON CONFLICT(ready_id) DO UPDATE SET caption = excluded.caption, hashtags = excluded.hashtags, state = 'ready', error = NULL, updated_at = unixepoch()",
+            params![id, caption.trim(), tags_json],
+        )
+        .map_err(err)?;
+        n += 1;
+    }
     Ok(n)
 }
 
@@ -245,7 +282,12 @@ pub(crate) fn resolve_job(db: &Connection, id: i64, action: &str) -> Result<(), 
             db.execute("UPDATE publish_jobs SET state = 'done', sent_at = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![id, now_unix()]).map_err(err)?;
             let account: Option<i64> = db.query_row("SELECT account_id FROM publish_jobs WHERE id = ?1", [id], |r| r.get(0)).ok().flatten();
             // чтобы на карточке ролика было видно, что он выложен, и повторный запуск его не тронул
-            if let Ok(post) = begin_post(db, job.draft_id, "browser", "browser") {
+            let post = match (job.draft_id, job.ready_id) {
+                (Some(draft), _) => begin_post(db, draft, "browser", "browser"),
+                (None, Some(ready)) => begin_ready_post(db, ready, "browser", "browser"),
+                (None, None) => return Err("Задача без ролика".into()),
+            };
+            if let Ok(post) = post {
                 finish_post(db, post, &Ok(("Выложено (отмечено вручную)".to_string(), None)));
                 // «он вышел» тоже входит в суточный лимит того аккаунта, с которого шла выкладка
                 mark_sent(db, post, account);
@@ -264,12 +306,14 @@ pub(crate) fn resolve_job(db: &Connection, id: i64, action: &str) -> Result<(), 
 pub(crate) fn start_jobs(db: &Connection, project_id: i64) -> Result<usize, String> {
     let jobs = jobs_for_project(db, project_id).map_err(err)?;
     for j in jobs.iter().filter(|j| j.state == "ready") {
-        validate_job(&j.caption, &j.hashtags).map_err(|e| format!("Описание ролика {} не подходит: {e}. Исправь его перед запуском", j.draft_id))?;
+        validate_job(&j.caption, &j.hashtags).map_err(|e| format!("Описание ролика №{} не подходит: {e}. Исправь его перед запуском", j.id))?;
     }
     db.execute(
         // паузу после прошлой выкладки не сбрасываем: иначе «стоп → старт» выпускает следующий ролик сразу
         "UPDATE publish_jobs SET state = 'queued', error = NULL, updated_at = unixepoch()
-         WHERE state = 'ready' AND draft_id IN (SELECT d.id FROM drafts d JOIN moments m ON m.id = d.moment_id WHERE m.project_id = ?1)",
+         WHERE state = 'ready' AND (
+             draft_id IN (SELECT d.id FROM drafts d JOIN moments m ON m.id = d.moment_id WHERE m.project_id = ?1)
+             OR ready_id IN (SELECT id FROM ready_videos WHERE project_id = ?1))",
         [project_id],
     )
     .map_err(err)?;
@@ -314,6 +358,8 @@ pub enum Action {
 pub struct QueuedJob {
     pub id: i64,
     pub not_before: i64,
+    /// Аккаунт, выбранный вручную; `None` — по кругу.
+    pub wanted: Option<i64>,
 }
 
 /// Аккаунт в круге и его выкладки за текущие местные сутки (более ранние в счёт не идут).
@@ -384,13 +430,26 @@ pub fn next_action(plan: &Plan, queued: &[QueuedJob]) -> Action {
     if !plan.in_window() {
         return Action::OutsideWindow(next_open(plan));
     }
-    let Some(account) = pick_account(plan) else {
-        return Action::LimitReached((plan.day_start() + DAY).max(first.not_before));
+    // выбранный вручную аккаунт: ролик ждёт своего аккаунта, а не уходит на другой (кроме отключённого аккаунта)
+    let account = match first.wanted.filter(|w| plan.accounts.iter().any(|t| t.id == *w)) {
+        Some(wanted) if under_limit(plan, wanted) => wanted,
+        Some(_) => return Action::LimitReached((plan.day_start() + DAY).max(first.not_before)),
+        None => match pick_account(plan) {
+            Some(account) => account,
+            None => return Action::LimitReached((plan.day_start() + DAY).max(first.not_before)),
+        },
     };
     if first.not_before > plan.now {
         return Action::WaitUntil(first.not_before);
     }
     Action::Send { job: first.id, account }
+}
+
+/// У аккаунта за местные сутки ещё нет полного лимита выкладок.
+fn under_limit(plan: &Plan, account: i64) -> bool {
+    let day = plan.day_start();
+    let limit = plan.daily_limit.max(1) as usize;
+    plan.accounts.iter().find(|a| a.id == account).is_some_and(|a| a.sent.iter().filter(|t| **t >= day).count() < limit)
 }
 
 /// Когда окно откроется в следующий раз: сегодня или завтра.
@@ -433,12 +492,15 @@ pub(crate) fn make_plan(db: &Connection, now: i64) -> Plan {
 
 fn queued_jobs(db: &Connection, project_id: i64) -> Vec<QueuedJob> {
     let Ok(mut st) = db.prepare(
-        "SELECT j.id, j.not_before FROM publish_jobs j JOIN drafts d ON d.id = j.draft_id JOIN moments m ON m.id = d.moment_id
-         WHERE m.project_id = ?1 AND j.state = 'queued' ORDER BY d.part, j.id",
+        "SELECT j.id, j.not_before, j.wanted_account_id FROM publish_jobs j
+         LEFT JOIN drafts d ON d.id = j.draft_id LEFT JOIN moments m ON m.id = d.moment_id LEFT JOIN ready_videos r ON r.id = j.ready_id
+         WHERE COALESCE(m.project_id, r.project_id) = ?1 AND j.state = 'queued' ORDER BY COALESCE(d.part, 1000000), j.id",
     ) else {
         return vec![];
     };
-    st.query_map([project_id], |r| Ok(QueuedJob { id: r.get(0)?, not_before: r.get(1)? })).map(|r| r.flatten().collect()).unwrap_or_default()
+    st.query_map([project_id], |r| Ok(QueuedJob { id: r.get(0)?, not_before: r.get(1)?, wanted: r.get(2)? }))
+        .map(|r| r.flatten().collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- события
@@ -456,7 +518,7 @@ struct TextEvent {
     message: String,
 }
 
-fn changed(app: &AppHandle, project_id: i64) {
+pub(crate) fn changed(app: &AppHandle, project_id: i64) {
     let _ = app.emit("queue-update", UpdateEvent { project_id });
 }
 
@@ -643,32 +705,59 @@ fn is_newer(a: &Path, b: &Path) -> bool {
 /// Выкладывает одну задачу с выбранного аккаунта. `Err` — очередь надо остановить; текст ошибки идёт в панель.
 async fn send_job(app: &AppHandle, job_id: i64, account: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
+    // `draft_id` здесь — ключ ролика: номер черновика, а у готового ролика из папки отрицательный номер готового файла
     let (draft_id, project_id, file, caption, post_id, profile, pool) = {
         let db = state.db.0.lock().unwrap();
-        let (draft_id, caption, tags_json): (i64, String, String) = db
-            .query_row("SELECT draft_id, caption, hashtags FROM publish_jobs WHERE id = ?1 AND state = 'queued'", [job_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        let (draft_id, ready_id, caption, tags_json): (Option<i64>, Option<i64>, String, String) = db
+            .query_row(
+                "SELECT draft_id, ready_id, caption, hashtags FROM publish_jobs WHERE id = ?1 AND state = 'queued'",
+                [job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
             .map_err(|_| "Задача пропала из очереди".to_string())?;
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        let d = get_draft(&db, draft_id)?;
-        let file = match d.final_path.clone().filter(|_| d.status == "final_done") {
-            Some(p) => PathBuf::from(p),
-            None => return Err(fail_job(&db, job_id, "У ролика нет готового файла".into())),
+        let (key, project_id, file, pool) = match (draft_id, ready_id) {
+            (Some(draft), _) => {
+                let d = get_draft(&db, draft)?;
+                let file = match d.final_path.clone().filter(|_| d.status == "final_done") {
+                    Some(p) => PathBuf::from(p),
+                    None => return Err(fail_job(&db, job_id, "У ролика нет готового файла".into())),
+                };
+                if !file.is_file() {
+                    return Err(fail_job(&db, job_id, format!("Файл не найден: {}", file.display())));
+                }
+                // два и больше включённых аккаунта — пул: ролик выходит без надписи «Часть N»
+                let pool = accounts::enabled_ids(&db).map_err(err)?.len() > 1;
+                (draft, d.project_id, file, pool)
+            }
+            (None, Some(ready)) => {
+                let (path, project_id): (String, i64) = db
+                    .query_row("SELECT path, project_id FROM ready_videos WHERE id = ?1", [ready], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|_| fail_job(&db, job_id, "Готовый ролик пропал из проекта".into()))?;
+                let file = PathBuf::from(path);
+                if !file.is_file() {
+                    return Err(fail_job(&db, job_id, format!("Файл не найден: {}", file.display())));
+                }
+                // надпись «Часть N» у готового ролика уже запечена, а перерисовать его без исходника нельзя: пул его не трогает
+                (-ready, project_id, file, false)
+            }
+            (None, None) => return Err(fail_job(&db, job_id, "Задача без ролика".into())),
         };
-        if !file.is_file() {
-            return Err(fail_job(&db, job_id, format!("Файл не найден: {}", file.display())));
-        }
         if let Err(e) = validate_job(&caption, &tags) {
             return Err(fail_job(&db, job_id, e));
         }
-        if state.posting.lock().unwrap().contains(&draft_id) {
+        if state.posting.lock().unwrap().contains(&key) {
             return Err(fail_job(&db, job_id, "Этот ролик уже отправляется другим способом".into()));
         }
         let profile = accounts::profile_dir(&db, &state.data_dir, Some(account)).map_err(|e| fail_job(&db, job_id, e))?;
-        // два и больше включённых аккаунта — пул: ролик выходит без надписи «Часть N»
-        let pool = accounts::enabled_ids(&db).map_err(err)?.len() > 1;
         db.execute("UPDATE publish_jobs SET state = 'sending', attempts = attempts + 1, account_id = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![job_id, account]).map_err(err)?;
-        let post_id = begin_post(&db, draft_id, "browser", "browser").map_err(err)?;
-        (draft_id, d.project_id, file, make_caption(&caption, &tags, CAPTION_LIMIT), post_id, profile, pool)
+        let post_id = match (draft_id, ready_id) {
+            (Some(draft), _) => begin_post(&db, draft, "browser", "browser"),
+            (None, Some(ready)) => begin_ready_post(&db, ready, "browser", "browser"),
+            (None, None) => return Err(fail_job(&db, job_id, "Задача без ролика".into())),
+        }
+        .map_err(err)?;
+        (key, project_id, file, make_caption(&caption, &tags, CAPTION_LIMIT), post_id, profile, pool)
     };
     state.posting.lock().unwrap().insert(draft_id);
     changed(app, project_id);
@@ -822,6 +911,34 @@ pub fn queue_job_update(state: State<'_, AppState>, id: i64, caption: String, ha
     update_job(&state.db.0.lock().unwrap(), id, &caption, &hashtags)
 }
 
+/// Выбирает аккаунт для ролика вручную (`None` — снова по кругу). Пока ролик не ушёл в работу.
+#[tauri::command]
+pub fn queue_job_account(app: AppHandle, state: State<'_, AppState>, id: i64, account: Option<i64>) -> CmdResult<()> {
+    let db = state.db.0.lock().unwrap();
+    let (job_state, project_id): (String, i64) = db
+        .query_row(
+            "SELECT j.state, COALESCE(m.project_id, r.project_id) FROM publish_jobs j
+             LEFT JOIN drafts d ON d.id = j.draft_id LEFT JOIN moments m ON m.id = d.moment_id LEFT JOIN ready_videos r ON r.id = j.ready_id
+             WHERE j.id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| "Задача не найдена".to_string())?;
+    if ["sending", "done", "needs_check"].contains(&job_state.as_str()) {
+        return Err("Аккаунт уже не поменять: ролик выкладывается, выложен или ждёт проверки".into());
+    }
+    if let Some(a) = account {
+        let exists: i64 = db.query_row("SELECT COUNT(*) FROM accounts WHERE id = ?1", [a], |r| r.get(0)).map_err(err)?;
+        if exists == 0 {
+            return Err("Такого аккаунта нет".into());
+        }
+    }
+    db.execute("UPDATE publish_jobs SET wanted_account_id = ?2, updated_at = unixepoch() WHERE id = ?1", params![id, account]).map_err(err)?;
+    drop(db);
+    changed(&app, project_id);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn queue_job_resolve(app: AppHandle, state: State<'_, AppState>, id: i64, action: String) -> CmdResult<()> {
     let project_id: Option<i64> = {
@@ -909,7 +1026,7 @@ mod tests {
     use super::*;
 
     fn q(id: i64, not_before: i64) -> QueuedJob {
-        QueuedJob { id, not_before }
+        QueuedJob { id, not_before, wanted: None }
     }
 
     /// План без окна и с часовым поясом UTC. `accounts` — круг: (аккаунт, его выкладки).
@@ -1066,7 +1183,7 @@ mod tests {
         store_text_failed(&c, 1, "сбой");
         let again = create_drafting_jobs(&c, 1).unwrap();
         assert_eq!(again.iter().map(|t| t.draft_id).collect::<Vec<_>>(), vec![1]);
-        let by_draft = |d: i64| jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.draft_id == d).unwrap();
+        let by_draft = |d: i64| jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.draft_id == Some(d)).unwrap();
         assert_eq!(by_draft(2).state, "ready", "готовое описание не переписывается");
         assert_eq!(by_draft(1).state, "drafting", "упавшее пишется заново");
     }
@@ -1145,7 +1262,7 @@ mod tests {
             store_ready(&c, d, &text, &normalize_hashtags(&tags)).unwrap();
         }
         assert_eq!(start_jobs(&c, 1).unwrap(), 2);
-        let states: Vec<_> = jobs_for_project(&c, 1).unwrap().iter().map(|j| (j.draft_id, j.state.clone())).collect();
+        let states: Vec<_> = jobs_for_project(&c, 1).unwrap().iter().map(|j| (j.draft_id.unwrap(), j.state.clone())).collect();
         assert_eq!(states, vec![(2, "queued".into()), (1, "queued".into())], "в порядке частей");
         assert_eq!(jobs_for_project(&c, 2).unwrap()[0].state, "ready", "чужой проект не тронут");
         assert_eq!(queued_jobs(&c, 1).iter().map(|j| j.id).collect::<Vec<_>>().len(), 2);
@@ -1163,13 +1280,13 @@ mod tests {
         let tags = vec!["юмор".to_string(), "#сериал".to_string()];
         assert_eq!(apply_text(&c, 1, "Один текст на всех", &tags).unwrap(), 2, "готовые ролики проекта 1: 2 и 1, неготовый 4 и чужой 3 не берём");
         let jobs = jobs_for_project(&c, 1).unwrap();
-        assert_eq!(jobs.iter().map(|j| (j.draft_id, j.state.as_str())).collect::<Vec<_>>(), vec![(2, "ready"), (1, "ready")], "в порядке частей");
+        assert_eq!(jobs.iter().map(|j| (j.draft_id.unwrap(), j.state.as_str())).collect::<Vec<_>>(), vec![(2, "ready"), (1, "ready")], "в порядке частей");
         assert!(jobs.iter().all(|j| j.caption == "Один текст на всех" && j.hashtags == ["#юмор", "#сериал"]));
         assert!(jobs_for_project(&c, 2).unwrap().is_empty(), "другой проект не тронут");
         assert_eq!(jobs[0].len, "Один текст на всех\n#юмор #сериал".chars().count());
 
         // новый текст заменяет прежний у готовых и упавших; идущие в работу и выложенные не трогаем
-        let by_draft = |d: i64| jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.draft_id == d).unwrap();
+        let by_draft = |d: i64| jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.draft_id == Some(d)).unwrap();
         c.execute("UPDATE publish_jobs SET state = 'queued' WHERE draft_id = 1", []).unwrap();
         assert_eq!(apply_text(&c, 1, "Новый текст", &tags).unwrap(), 1);
         assert_eq!((by_draft(2).caption.as_str(), by_draft(2).state.as_str()), ("Новый текст", "ready"));
@@ -1206,7 +1323,7 @@ mod tests {
         let p = begin_post(&c, 1, "browser", "browser").unwrap();
         finish_post(&c, p, &Ok(("Нажата кнопка «Опубликовать» в окне TikTok.".into(), None)));
         assert_eq!(apply_text(&c, 1, "Текст", &["а".to_string()]).unwrap(), 1);
-        assert_eq!(jobs_for_project(&c, 1).unwrap().iter().map(|j| j.draft_id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(jobs_for_project(&c, 1).unwrap().iter().map(|j| j.draft_id.unwrap()).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]
@@ -1261,11 +1378,11 @@ mod tests {
         let (text, tags) = good_text(0);
         store_ready(&c, 1, &text, &normalize_hashtags(&tags)).unwrap();
         let jobs = jobs_for_project(&c, 1).unwrap();
-        assert_eq!(jobs.iter().map(|j| j.draft_id).collect::<Vec<_>>(), vec![2, 1]);
-        let j = jobs.iter().find(|j| j.draft_id == 1).unwrap();
+        assert_eq!(jobs.iter().map(|j| j.draft_id.unwrap()).collect::<Vec<_>>(), vec![2, 1]);
+        let j = jobs.iter().find(|j| j.draft_id == Some(1)).unwrap();
         assert_eq!(j.len, 3995);
         assert_eq!(j.len, validate_job(&j.caption, &j.hashtags).unwrap().1);
-        assert_eq!(jobs.iter().find(|j| j.draft_id == 2).unwrap().len, 0);
+        assert_eq!(jobs.iter().find(|j| j.draft_id == Some(2)).unwrap().len, 0);
     }
 
     #[test]
@@ -1279,5 +1396,58 @@ mod tests {
         assert_eq!(load_settings(&c), QueueSettings { pause_min: 1, daily_limit: 50, window_start: 0, window_end: DAY_MIN });
         kv_set(&c, K_PAUSE, "не число").unwrap();
         assert_eq!(load_settings(&c).pause_min, 45);
+    }
+
+    fn with_ready_video(c: &Connection, id: i64, project: i64) {
+        c.execute("INSERT INTO ready_videos (id, project_id, path, name) VALUES (?1, ?2, ?3, ?4)", params![id, project, format!("/г/{id}.mp4"), format!("{id}.mp4")]).unwrap();
+        c.execute("INSERT INTO publish_jobs (ready_id, state) VALUES (?1, 'drafting')", [id]).unwrap();
+    }
+
+    #[test]
+    fn a_chosen_account_takes_its_video_even_when_the_circle_points_elsewhere() {
+        // по кругу следующим идёт аккаунт 2, а ролик выбрал аккаунт 1
+        let p = plan(1000, vec![(1, vec![]), (2, vec![])], Some(1), 5);
+        assert_eq!(next_action(&p, &[QueuedJob { id: 7, not_before: 0, wanted: Some(1) }]), Action::Send { job: 7, account: 1 });
+    }
+
+    #[test]
+    fn a_video_whose_chosen_account_is_at_its_limit_waits_instead_of_moving_to_another_account() {
+        let p = plan(1000, vec![(1, vec![999]), (2, vec![])], None, 1);
+        let queue = [QueuedJob { id: 7, not_before: 0, wanted: Some(1) }, q(8, 0)];
+        assert!(matches!(next_action(&p, &queue), Action::LimitReached(_)), "ролик 7 ждёт аккаунт 1, ролик 8 за ним");
+    }
+
+    #[test]
+    fn a_chosen_account_that_is_switched_off_falls_back_to_the_circle() {
+        let p = plan(1000, vec![(2, vec![])], None, 5);
+        assert_eq!(next_action(&p, &[QueuedJob { id: 7, not_before: 0, wanted: Some(9) }]), Action::Send { job: 7, account: 2 });
+    }
+
+    #[test]
+    fn a_ready_video_has_a_job_without_a_draft_and_shows_its_file_name() {
+        let c = db();
+        with_ready_video(&c, 1, 1);
+        let jobs = jobs_for_project(&c, 1).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].draft_id, jobs[0].ready_id, jobs[0].name.as_str()), (None, Some(1), "1.mp4"));
+        assert!(jobs_for_project(&c, 2).unwrap().is_empty(), "чужой проект ролик не видит");
+    }
+
+    #[test]
+    fn a_ready_video_takes_the_shared_text_and_then_joins_the_queue() {
+        let c = db();
+        with_ready_video(&c, 1, 1);
+        let (caption, tags) = good_text(0);
+        // два готовых финала проекта 1 (черновик 4 ещё не готов, черновик 3 — чужой проект) и готовый ролик
+        assert_eq!(apply_text(&c, 1, &caption, &tags).unwrap(), 3);
+        let job = jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.ready_id == Some(1)).unwrap();
+        assert_eq!(job.state, "ready");
+        assert_eq!(start_jobs(&c, 1).unwrap(), 3, "в очередь ушли и два финала, и готовый ролик");
+    }
+
+    #[test]
+    fn a_job_must_point_at_a_draft_or_a_ready_video() {
+        let c = db();
+        assert!(c.execute("INSERT INTO publish_jobs (state) VALUES ('ready')", []).is_err());
     }
 }

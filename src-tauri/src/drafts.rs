@@ -16,7 +16,7 @@ use crate::{
     assets_cmds::{load_asset, AssetDto},
     gameplay::{self, Clip, Slice},
     media,
-    render::{self, Encoder, MediaRef, Profile, RenderJob, Style, TopFit, Word},
+    render::{self, Decode, Encoder, MediaRef, Profile, RenderJob, Style, TopFit, Word},
     state::AppState,
 };
 
@@ -292,6 +292,7 @@ pub(crate) fn build_job(db: &Connection, draft_id: i64, profile: Profile, encode
         .collect();
 
     Ok(RenderJob {
+        decode: Default::default(),
         source: MediaRef { path: PathBuf::from(src_path), duration: src_duration, has_audio: has_audio != 0 },
         source_aspect: if src_h > 0.0 { src_w / src_h } else { 0.0 },
         start: d.start,
@@ -349,6 +350,14 @@ pub(crate) fn output_dir(db: &Connection) -> PathBuf {
     kv_get(db, "output_dir").map(PathBuf::from).unwrap_or_else(|| {
         crate::platform::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Videos").join("Автонарезка")
     })
+}
+
+/// Включено ли декодирование на видеокарте (NVDEC). По умолчанию выключено: замер на 1080p показал, что оно не быстрее
+/// процессора, потому что узкое место — фильтры на процессоре. Включается переменной `AVTO_RENDER_GPU=nvidia`
+/// или настройкой `render_gpu = nvidia`.
+pub(crate) fn gpu_decode_allowed(db: &Connection) -> bool {
+    let env_on = std::env::var("AVTO_RENDER_GPU").is_ok_and(|v| v.eq_ignore_ascii_case("nvidia"));
+    env_on || kv_get(db, "render_gpu").as_deref() == Some("nvidia")
 }
 
 /// Имя файла без символов, которые ломают пути.
@@ -437,6 +446,9 @@ async fn run_one(app: &AppHandle, draft_id: i64, kind: RenderKind, cancel: watch
     let state = app.state::<AppState>();
     let nvenc = *state.nvenc.get_or_init(|| async { media::check_env().await.nvenc }).await;
     let mut encoder = if nvenc { Encoder::Nvenc } else { Encoder::X264 };
+    let cuda = *state.cuda.get_or_init(|| async { media::check_env().await.cuda }).await;
+    // декодирование на видеокарте: только вместе с NVENC (значит, карта NVIDIA есть) и если не отключено
+    let mut decode = if nvenc && cuda && gpu_decode_allowed(&state.db.0.lock().unwrap()) { Decode::Nvidia } else { Decode::Cpu };
     let profile = if kind == RenderKind::Draft { Profile::Draft } else { Profile::Final };
 
     let (project_id, title, part) = {
@@ -457,7 +469,8 @@ async fn run_one(app: &AppHandle, draft_id: i64, kind: RenderKind, cancel: watch
     let work = state.data_dir.join("tmp");
     let fonts = state.fonts_dir();
     loop {
-        let job = build_job(&state.db.0.lock().unwrap(), draft_id, profile, encoder, out.clone()).map_err(|e| anyhow::anyhow!(e))?;
+        let mut job = build_job(&state.db.0.lock().unwrap(), draft_id, profile, encoder, out.clone()).map_err(|e| anyhow::anyhow!(e))?;
+        job.decode = decode;
         let (handle, mut last) = (app.clone(), 0.0f64);
         let res = render::render(&job, &work, Some(&fonts), cancel.clone(), move |f| {
             if f - last >= 0.02 || f >= 1.0 {
@@ -485,6 +498,11 @@ async fn run_one(app: &AppHandle, draft_id: i64, kind: RenderKind, cancel: watch
                 }
                 return Ok(());
             }
+            // NVDEC мог отказать (нет поддержки в сборке, драйвер): один раз декодируем на процессоре
+            Err(e) if decode == Decode::Nvidia && !*cancel.borrow() => {
+                tracing::warn!("NVDEC не справился ({e:#}), повторяю с декодированием на процессоре");
+                decode = Decode::Cpu;
+            }
             // NVENC мог отказать (занят, нет драйвера): один раз повторяем на процессоре
             Err(e) if encoder == Encoder::Nvenc && !*cancel.borrow() => {
                 tracing::warn!("NVENC не справился ({e:#}), повторяю на процессоре");
@@ -501,7 +519,11 @@ pub(crate) async fn render_pool_copy(app: &AppHandle, draft_id: i64, out: &Path,
     let state = app.state::<AppState>();
     let nvenc = *state.nvenc.get_or_init(|| async { media::check_env().await.nvenc }).await;
     let encoder = if nvenc { Encoder::Nvenc } else { Encoder::X264 };
+    let cuda = *state.cuda.get_or_init(|| async { media::check_env().await.cuda }).await;
     let mut job = build_job(&state.db.0.lock().unwrap(), draft_id, Profile::Final, encoder, out.to_path_buf()).map_err(|e| anyhow::anyhow!(e))?;
+    if nvenc && cuda && gpu_decode_allowed(&state.db.0.lock().unwrap()) {
+        job.decode = Decode::Nvidia;
+    }
     job.part = None;
     // отмены у этого рендера нет; сигнал держим живым, пока идёт рендер
     let (_cancel_tx, cancel) = watch::channel(false);
@@ -526,14 +548,20 @@ pub(crate) fn can_set_status(current: &str, new: &str) -> bool {
 
 /// `async`: команда идёт не в главном потоке окна, иначе пока она работает, интерфейс стоит.
 #[tauri::command(async)]
-pub fn drafts_generate(app: AppHandle, state: State<'_, AppState>, project_id: i64) -> CmdResult<usize> {
+pub fn drafts_generate(app: AppHandle, project_id: i64) -> CmdResult<usize> {
+    generate_and_render(&app, project_id)
+}
+
+/// Создаёт черновики из принятых моментов и ставит превью в рендер. Кнопка и пачка вызывают одно и то же.
+pub(crate) fn generate_and_render(app: &AppHandle, project_id: i64) -> CmdResult<usize> {
+    let state = app.state::<AppState>();
     let (created, ids): (usize, Vec<i64>) = {
         let db = state.db.0.lock().unwrap();
         let created = generate(&db, project_id)?;
         let ids = list(&db, project_id).map_err(err)?.into_iter().filter(|d| d.status == "queued").map(|d| d.id).collect();
         (created, ids)
     };
-    spawn_renders(&app, &ids, RenderKind::Draft);
+    spawn_renders(app, &ids, RenderKind::Draft);
     Ok(created)
 }
 
@@ -680,7 +708,13 @@ pub fn defaults_set(state: State<'_, AppState>, mut defaults: Defaults) -> CmdRe
 
 /// Запускает финальный рендер одобренных черновиков.
 #[tauri::command(async)]
-pub fn finals_start(app: AppHandle, state: State<'_, AppState>, project_id: i64) -> CmdResult<usize> {
+pub fn finals_start(app: AppHandle, project_id: i64) -> CmdResult<usize> {
+    start_finals(&app, project_id)
+}
+
+/// Ставит в финал одобренные черновики проекта (и упавшие финалы — повтор). Пачка вызывает то же самое.
+pub(crate) fn start_finals(app: &AppHandle, project_id: i64) -> CmdResult<usize> {
+    let state = app.state::<AppState>();
     let ids: Vec<i64> = {
         let db = state.db.0.lock().unwrap();
         let ids: Vec<i64> = list(&db, project_id).map_err(err)?.into_iter().filter(|d| d.status == "approved" || d.status == "final_failed").map(|d| d.id).collect();
@@ -694,7 +728,7 @@ pub fn finals_start(app: AppHandle, state: State<'_, AppState>, project_id: i64)
         tx.commit().map_err(err)?;
         ids
     };
-    spawn_renders(&app, &ids, RenderKind::Final);
+    spawn_renders(app, &ids, RenderKind::Final);
     Ok(ids.len())
 }
 

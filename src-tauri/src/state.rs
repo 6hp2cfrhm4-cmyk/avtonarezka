@@ -17,6 +17,8 @@ pub struct AppState {
     pub final_slots: Arc<Semaphore>,
     /// Есть ли рабочий NVENC; проверяется один раз.
     pub nvenc: OnceCell<bool>,
+    /// Есть ли CUDA в ffmpeg (декодирование NVDEC); проверяется один раз.
+    pub cuda: OnceCell<bool>,
     /// Ключи и токены TikTok: связка ключей системы или, если её нет, память.
     pub secrets: Secrets,
     /// Идущий вход в TikTok: сигнал отмены.
@@ -37,6 +39,8 @@ pub struct AppState {
     pub downloads: Mutex<HashMap<String, (String, watch::Sender<bool>)>>,
     /// Качаем одновременно два ролика, остальные ждут своей очереди.
     pub youtube_slots: Arc<Semaphore>,
+    /// Пачка ссылок и файлов: раннер и то, что он сейчас скачивает или анализирует.
+    pub batch: crate::batch::BatchState,
 }
 
 impl AppState {
