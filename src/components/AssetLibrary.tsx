@@ -1,7 +1,7 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { api, errText, fmtDuration, type Asset, type AssetKind, type Defaults } from "../lib/api";
+import { api, errText, fmtDuration, type Asset, type AssetKind, type Defaults, type GameplayTape } from "../lib/api";
 import { useMediaUrl } from "../lib/useMediaUrl";
 import { useUi } from "../store";
 import { Check, Trash, Upload } from "./icons";
@@ -11,7 +11,7 @@ export const AUDIO_EXT = ["mp3", "wav", "m4a", "aac", "ogg", "flac", "opus"];
 
 const COLUMNS: { kind: AssetKind; title: string; hint: string; ext: string[]; filter: string }[] = [
   { kind: "banner", title: "Баннер", hint: "Видео на зелёном фоне. Играет в самый интересный момент", ext: VIDEO_EXT, filter: "Видео" },
-  { kind: "background", title: "Фон", hint: "Геймплей для нижней половины. Для каждого ролика берётся случайный кусок", ext: VIDEO_EXT, filter: "Видео" },
+  { kind: "background", title: "Фон", hint: "Геймплей для нижней половины. Идёт по таймкодам видео, а остаток достаётся следующему. Несколько фонов проигрываются по порядку выбора", ext: VIDEO_EXT, filter: "Видео" },
   { kind: "music", title: "Музыка", hint: "Тихо играет под роликом", ext: AUDIO_EXT, filter: "Аудио" },
 ];
 
@@ -48,11 +48,24 @@ export async function addAssets(kind: AssetKind, paths: string[]) {
 export default function AssetLibrary({ hoverKind }: { hoverKind: AssetKind | null }) {
   const { assets, defaults, setDefaults, setAssets, notify } = useUi();
 
+  const [tape, setTape] = useState<GameplayTape | null>(null);
+
   // Экран открыт — читаем актуальные данные: файлы могли добавить из другого места.
   useEffect(() => {
     api.assetsList().then(setAssets).catch((e) => notify(errText(e), "error"));
     api.defaultsGet().then(setDefaults).catch((e) => notify(errText(e), "error"));
+    api.gameplayTape().then(setTape).catch(() => undefined);
   }, [setAssets, setDefaults, notify]);
+
+  const resetTape = async () => {
+    try {
+      await api.gameplayTapeReset();
+      setTape(null);
+      notify("Лента фона начнётся с начала для новых черновиков");
+    } catch (e) {
+      notify(errText(e), "error");
+    }
+  };
 
   const pick = async (kind: AssetKind, ext: string[], name: string) => {
     const sel = await open({ multiple: true, filters: [{ name, extensions: ext }] });
@@ -129,12 +142,27 @@ export default function AssetLibrary({ hoverKind }: { hoverKind: AssetKind | nul
                   </div>
                 )}
               </div>
+              {c.kind === "background" && tapeAsset(tape, items) && (
+                <div className="flex items-center justify-between gap-3 text-xs text-white/45">
+                  <span className="min-w-0 truncate">
+                    Лента дошла до {fmtDuration(tape!.pos)} в «{tapeAsset(tape, items)!.name}»
+                  </span>
+                  <button className="shrink-0 text-accent hover:underline" onClick={() => void resetTape()}>
+                    Начать заново
+                  </button>
+                </div>
+              )}
             </div>
           );
         })}
       </div>
     </section>
   );
+}
+
+/** Фон, на котором стоит лента, если он ещё в библиотеке. */
+function tapeAsset(tape: GameplayTape | null, items: Asset[]): Asset | undefined {
+  return tape ? items.find((a) => a.id === tape.assetId) : undefined;
 }
 
 function AssetRow({ a, selected, onToggle, onRemove }: { a: Asset; selected: boolean; onToggle: () => void; onRemove: () => void }) {

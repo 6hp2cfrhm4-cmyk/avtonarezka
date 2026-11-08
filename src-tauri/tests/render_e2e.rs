@@ -65,6 +65,7 @@ fn job(name: &str) -> RenderJob {
     let m = media();
     RenderJob {
         source: mref(&m.source, 12.0, true),
+        source_aspect: 1280.0 / 720.0,
         start: 2.0,
         end: 8.0,
         banner: Some(mref(&m.banner, 3.0, true)),
@@ -231,6 +232,88 @@ async fn subtitles_hide_during_banner_and_part_label_stays() {
     assert!(sub(&after) > 40, "нет субтитров после баннера (сдвиг на длину баннера): {}", sub(&after));
     for (f, name) in [(&before, "до"), (&during, "во время"), (&after, "после")] {
         assert!(label(f) > 40, "нет надписи «Часть 3» {name} баннера: {}", label(f));
+    }
+}
+
+/// 16:9 с красной меткой у левого края и синей у правого: видно, обрезаны ли края.
+fn edge_marked_source() -> &'static Path {
+    static P: OnceLock<PathBuf> = OnceLock::new();
+    P.get_or_init(|| {
+        let path = media().dir.join("edges.mp4");
+        ffmpeg(&[
+            "-f", "lavfi", "-i",
+            "color=c=0x808080:s=1280x720:r=30:d=12,drawbox=x=0:y=0:w=60:h=720:color=0xff0000:t=fill,drawbox=x=1220:y=0:w=60:h=720:color=0x0000ff:t=fill",
+            "-f", "lavfi", "-i", "sine=f=440:d=12",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", path.to_str().unwrap(),
+        ]);
+        path
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wide_source_is_fully_visible_by_default_and_cropped_only_when_asked() {
+    let red = |r: u8, g: u8, b: u8| r > 180 && g < 80 && b < 80;
+    let blue = |r: u8, g: u8, b: u8| b > 180 && r < 80 && g < 80;
+
+    let mut j = job("wide");
+    j.source = mref(edge_marked_source(), 12.0, true);
+    j.banner = None;
+    run(&j).await;
+    let f = frame(&j.out, 1.0, "wide");
+    // видео 16:9 в зоне 540×480 занимает y = 88..392 на всю ширину: метки у обоих краёв на месте
+    let (left, right) = (region(&f, 2, 200, 20, 280), region(&f, 520, 200, 538, 280));
+    assert!(count(&left, red) * 10 > left.len() * 9, "левый край обрезан: {} из {}", count(&left, red), left.len());
+    assert!(count(&right, blue) * 10 > right.len() * 9, "правый край обрезан: {} из {}", count(&right, blue), right.len());
+    // над и под видео — размытая копия кадра, а не чёрные поля
+    for (y0, y1) in [(10, 60), (420, 470)] {
+        let band = region(&f, 100, y0, 440, y1);
+        let mean = band.iter().map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32).sum::<u32>() / (band.len() as u32 * 3);
+        assert!(mean > 30, "чёрная полоса на y={y0}: яркость {mean}");
+    }
+
+    // «Заполнить кадр» по-прежнему режет края: проверка различает режимы
+    let mut fill = job("wide-fill");
+    fill.source = mref(edge_marked_source(), 12.0, true);
+    fill.banner = None;
+    fill.style.top_fit = TopFit::Fill;
+    run(&fill).await;
+    let cropped = region(&frame(&fill.out, 1.0, "wide-fill"), 2, 200, 20, 280);
+    assert_eq!(count(&cropped, red), 0, "в режиме «Заполнить» красная метка должна быть срезана");
+}
+
+/// Геймплей, где каждая секунда имеет свою яркость: по кадру видно, откуда взят кусок.
+fn steps_gameplay() -> &'static Path {
+    static P: OnceLock<PathBuf> = OnceLock::new();
+    P.get_or_init(|| {
+        let path = media().dir.join("steps.mp4");
+        ffmpeg(&[
+            "-f", "lavfi", "-i",
+            "color=c=black:s=270x480:r=30:d=6,geq=lum='if(lt(T,1),20,if(lt(T,2),60,if(lt(T,3),100,if(lt(T,4),140,if(lt(T,5),180,220)))))':cb=128:cr=128",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", path.to_str().unwrap(),
+        ]);
+        path
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gameplay_starts_at_its_offset_and_a_long_clip_wraps_to_the_file_start() {
+    let mut j = job("gp-offset");
+    j.banner = None;
+    j.gameplay = mref(steps_gameplay(), 6.0, false);
+    j.gameplay_offset = 3.0;
+    run(&j).await; // клип 6 с, фон с 3-й секунды
+
+    // яркость кадра фона, переведённая из студийного диапазона в 0..255
+    let level = |t: f64| {
+        let f = frame(&j.out, t, "gp");
+        let px = region(&f, 20, H_TOP + 40, W - 20, H - 40);
+        px.iter().map(|p| p[0] as f64).sum::<f64>() / px.len() as f64
+    };
+    let studio = |y: f64| (y - 16.0) * 255.0 / 219.0;
+    // секунды 3, 4, 5 файла, затем цикл возвращается в начало файла (а не в смещение)
+    for (t, y) in [(0.5, 140.0), (1.5, 180.0), (2.5, 220.0), (3.5, 20.0), (4.5, 60.0)] {
+        let got = level(t);
+        assert!((got - studio(y)).abs() < 10.0, "t={t}: яркость {got:.0}, ждали {:.0}", studio(y));
     }
 }
 

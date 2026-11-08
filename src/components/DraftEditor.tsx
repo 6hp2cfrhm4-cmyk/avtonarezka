@@ -128,7 +128,7 @@ export default function DraftEditor({ draft, onClose }: { draft: Draft; onClose:
 
               <Section title="Раскладка">
                 <Slide label="Верх занимает" value={style.split} min={0.4} max={0.7} fmt={pct} onChange={(v) => set((c) => void (c.style.split = v))} />
-                <Seg value={style.topFit} options={[{ v: "fill", l: "Заполнить кадр" }, { v: "contain", l: "Вписать с размытием" }]} onChange={(v) => set((c) => void (c.style.topFit = v))} />
+                <Seg value={style.topFit} options={[{ v: "auto", l: "Авто (16:9 целиком)" }, { v: "fill", l: "Заполнить кадр" }, { v: "contain", l: "Вписать с размытием" }]} onChange={(v) => set((c) => void (c.style.topFit = v))} />
                 <Slide label="Срезать снизу (вшитые субтитры исходника)" value={style.topCropBottom} min={0} max={0.4} step={0.01} fmt={pct} onChange={(v) => set((c) => void (c.style.topCropBottom = v))} />
                 <Row label="Геймплей замирает вместе с верхом" hint="Выключено: фон продолжает играть, пока показывается баннер" value={style.gameplayFreeze} onChange={(v) => set((c) => void (c.style.gameplayFreeze = v))} />
               </Section>
@@ -150,6 +150,9 @@ export default function DraftEditor({ draft, onClose }: { draft: Draft; onClose:
                 <Chips value={cfg.backgroundId} options={backgrounds.map((a) => ({ v: a.id as number | null, l: a.name }))} onChange={(v) => set((c) => void (c.backgroundId = v))} />
                 {bg && (
                   <>
+                    <div className="text-xs leading-snug text-white/40">
+                      Обычно фон идёт по таймкодам видео. Кнопка «Фон по таймкодам» на экране черновиков вернёт это после ручной правки.
+                    </div>
                     <Slide label="Начать с секунды" value={cfg.gameplayOffset} min={0} max={Math.max(0, bg.duration - 5)} step={0.5} fmt={fmtDuration} onChange={(v) => set((c) => void (c.gameplayOffset = v))} />
                     <button className="btn self-start !py-1.5 !text-xs" onClick={() => set((c) => void (c.gameplayOffset = Math.round(Math.random() * Math.max(0, bg.duration - outLen - 1) * 2) / 2))}>
                       Другой кусок

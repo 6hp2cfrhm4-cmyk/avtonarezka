@@ -5,12 +5,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum TopFit {
-    /// Заполнить область с обрезкой краёв.
+    /// Горизонтальный исходник (16:9 и подобные) вписывается целиком, остальные заполняют область.
     #[default]
+    Auto,
+    /// Заполнить область с обрезкой краёв.
     Fill,
     /// Вписать целиком, пустое место — размытая копия кадра.
     Contain,
 }
+
+/// Начиная с какого отношения ширины к высоте исходник считается горизонтальным и показывается целиком.
+/// Область под верх уже 16:9 (1080×960 — это 1,125), поэтому 1,2 отделяет «широкие» кадры от вертикальных и квадратных.
+pub const WIDE_ASPECT: f64 = 1.2;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -151,6 +157,7 @@ pub struct Style {
     pub top_fit: TopFit,
     /// Какую долю высоты исходника срезать снизу до вписывания в кадр. Прячет субтитры, вшитые в само видео:
     /// при баннере верх замирает, и вшитые субтитры остались бы на замороженном кадре.
+    /// По умолчанию 0: кадр виден целиком.
     pub top_crop_bottom: f64,
     /// Замирает ли геймплей, пока играет баннер.
     pub gameplay_freeze: bool,
@@ -164,8 +171,8 @@ impl Default for Style {
     fn default() -> Self {
         Self {
             split: 0.5,
-            top_fit: TopFit::Fill,
-            top_crop_bottom: 0.2,
+            top_fit: TopFit::Auto,
+            top_crop_bottom: 0.0,
             gameplay_freeze: false,
             banner: BannerStyle::default(),
             subtitles: SubtitleStyle::default(),
@@ -220,6 +227,9 @@ pub struct Word {
 #[serde(rename_all = "camelCase")]
 pub struct RenderJob {
     pub source: MediaRef,
+    /// Ширина исходника, делённая на высоту; 0 — неизвестно.
+    #[serde(default)]
+    pub source_aspect: f64,
     pub start: f64,
     pub end: f64,
     pub banner: Option<MediaRef>,
@@ -240,6 +250,17 @@ pub struct RenderJob {
 impl RenderJob {
     pub fn clip_len(&self) -> f64 {
         (self.end - self.start).max(0.1)
+    }
+
+    /// Как верх ложится в свою область. `Auto` решает по форме кадра, который останется после среза снизу.
+    pub fn top_fit(&self) -> TopFit {
+        match self.style.top_fit {
+            TopFit::Auto => {
+                let kept = 1.0 - self.style.top_crop_bottom.clamp(0.0, 0.4);
+                if self.source_aspect / kept >= WIDE_ASPECT { TopFit::Contain } else { TopFit::Fill }
+            }
+            fixed => fixed,
+        }
     }
 
     /// Параметры заморозки `(tb, D)`, если баннер реально будет показан.

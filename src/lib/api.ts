@@ -105,7 +105,8 @@ export interface Asset {
   thumb: string | null;
 }
 
-export type TopFit = "fill" | "contain";
+/** `auto`: горизонтальный исходник (16:9) виден целиком, вертикальный заполняет область. */
+export type TopFit = "auto" | "fill" | "contain";
 export type BannerAnim = "none" | "fade" | "slideUp" | "pop";
 
 export interface BannerStyle {
@@ -172,8 +173,16 @@ export interface DraftConfig {
 export interface Defaults {
   style: Style;
   bannerId: number | null;
+  /** Фоны по порядку: лента геймплея идёт по ним, потом по кругу. */
   backgroundIds: number[];
   musicId: number | null;
+  /** Версия раскладки умолчаний; ведёт и обновляет сам бэкенд. */
+  layoutV?: number;
+}
+/** Докуда дошла лента геймплея: фон и секунда в нём. */
+export interface GameplayTape {
+  assetId: number;
+  pos: number;
 }
 export type DraftStatus =
   | "queued" | "rendering" | "ready" | "approved" | "rejected" | "failed"
@@ -216,8 +225,8 @@ export interface RenderFailedEvent {
 
 export const defaultStyle: Style = {
   split: 0.5,
-  topFit: "fill",
-  topCropBottom: 0.2,
+  topFit: "auto",
+  topCropBottom: 0,
   gameplayFreeze: false,
   banner: { enabled: true, keyColor: "00ff00", similarity: 0.18, blend: 0.08, despill: true, widthPct: 0.72, offsetX: 0, offsetY: 0, anim: "pop", maxSeconds: null },
   subtitles: { enabled: true, font: "Montserrat ExtraBold", size: 84, color: "ffffff", highlight: "b6ff3c", outlineColor: "000000", outline: 7, uppercase: true, wordsPerLine: 3, highlightScale: 112, yPct: null },
@@ -397,6 +406,10 @@ const real = {
   draftUpdate: (id: number, config: DraftConfig, bounds?: { start: number; end: number; climax: number }) =>
     invoke<Moment>("draft_update", { id, config, bounds }),
   draftRerender: (id: number) => invoke<void>("draft_rerender", { id }),
+  /** Переставляет фон по таймкодам у черновиков, которые ещё не одобрены; возвращает, сколько изменено. */
+  draftsRealignGameplay: (projectId: number) => invoke<number>("drafts_realign_gameplay", { projectId }),
+  gameplayTape: () => invoke<GameplayTape | null>("gameplay_tape"),
+  gameplayTapeReset: () => invoke<void>("gameplay_tape_reset"),
   draftCancel: (id: number) => invoke<void>("draft_cancel", { id }),
   defaultsGet: () => invoke<Defaults>("defaults_get"),
   defaultsSet: (defaults: Defaults) => invoke<void>("defaults_set", { defaults }),
@@ -483,6 +496,7 @@ const demoYoutube = (link: string): YoutubeInfo => {
 const demoTimers = new Map<string, ReturnType<typeof setInterval>>();
 let demoJobSeq = 0;
 let demoDefaults: Defaults = { style: defaultStyle, bannerId: 1, backgroundIds: [2, 3], musicId: 4 };
+let demoTape: GameplayTape | null = { assetId: 2, pos: 654 };
 const demoDrafts: Draft[] = [];
 // Для просмотра экрана «Финал» в браузере: пока черновики не собраны, показываем пару готовых роликов.
 const demoFinals: Draft[] = [0, 1].map((i) => ({
@@ -565,6 +579,9 @@ const mock: typeof real = {
     return demoMoments.find((m) => m.id === d.momentId)!;
   },
   draftRerender: async () => {},
+  draftsRealignGameplay: async () => 0,
+  gameplayTape: async () => demoTape,
+  gameplayTapeReset: async () => void (demoTape = null),
   draftCancel: async () => {},
   defaultsGet: async () => demoDefaults,
   defaultsSet: async (d) => void (demoDefaults = d),
