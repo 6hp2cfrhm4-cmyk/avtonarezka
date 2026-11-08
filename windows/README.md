@@ -11,7 +11,7 @@ Linux-версия от этого не меняется.
 | Файл | Зачем |
 | --- | --- |
 | `Автонарезка_0.2.0_x64-setup.exe` | установщик NSIS без прав администратора: программа, воркер языковой модели, ffmpeg, ffprobe, yt-dlp, Deno |
-| `fetch-models.ps1` | скачивает три модели (~3 ГБ) в `%LOCALAPPDATA%\app.avtonarezka.desktop\models`, проверяя SHA256 |
+| `fetch-models.ps1` | скачивает три модели (~3 ГБ) в `%LOCALAPPDATA%\app.avtonarezka.desktop\models`, проверяя размер файлов |
 | `ИНСТРУКЦИЯ.txt` | короткая инструкция для того, кто будет ставить |
 | `SHA256SUMS` | контрольные суммы |
 
