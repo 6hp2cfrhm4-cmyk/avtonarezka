@@ -20,7 +20,7 @@
   <img src="docs/layout-light.svg" width="720" alt="Diagram: a 16:9 video turns into a vertical 1080×1920 clip with gameplay at the bottom and a banner on the split line">
 </picture>
 
-**1** top of the frame: the video; at the most interesting moment the frame freezes · **2** green-screen banner on the split line · **3** gameplay at the bottom
+**1** top of the frame: the whole 16:9 video over a blurred copy of itself; at the most interesting moment the frame freezes · **2** green-screen banner on the split line · **3** gameplay at the bottom
 
 </div>
 
@@ -54,6 +54,11 @@ worth showing. You pick the moments, edit the drafts and publish.
 - **Three cutting modes:** manual, automatic, or fixed chunks of N seconds.
 - **"Video is already cut".** If nothing needs to be removed, the whole video is cut into consecutive clips with no gaps,
   with boundaries placed in pauses between sentences and at scene changes.
+- **16:9 video stays fully visible.** It takes the full width of the frame and a blurred copy of it fills the space above and below.
+  Vertical sources still fill the top half.
+- **Gameplay follows the timecodes.** The background is cut at the same seconds as the main video: the clip at 10:00 gets the
+  background from 10:00. Whatever is left of the gameplay goes to the next video and is used up to the end; several backgrounds
+  play in order, then loop.
 - **Word-level subtitles** (Whisper large-v3-turbo). If the source has big burned-in subtitles, you can crop them off the bottom.
 - **Asset library:** backgrounds, banners and fonts. Montserrat is bundled with the app.
 - **YouTube downloads** via yt-dlp: paste a link, Ctrl+V does the rest, 1080p by default.
@@ -67,7 +72,7 @@ Ready-made packages are on the [Releases](https://github.com/6hp2cfrhm4-cmyk/avt
 ### Arch Linux
 
 ```bash
-sudo pacman -U avtonarezka-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U avtonarezka-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
 pacman installs the dependencies: `ffmpeg`, `webkit2gtk-4.1`, `libsecret`, `vulkan-icd-loader`, `yt-dlp`, `deno`.
@@ -76,7 +81,7 @@ You also need an `ffmpeg` build with `h264_nvenc` and `libass`, and a Vulkan dri
 
 ### Windows 11
 
-1. Download `avtonarezka-0.1.0-windows-x64-setup.exe` and run it. No administrator rights are needed.
+1. Download `avtonarezka-0.1.1-windows-x64-setup.exe` and run it. No administrator rights are needed.
 2. SmartScreen will warn about an unknown publisher. The installer is not signed yet: click **More info → Run anyway**.
 3. Download the models (see below) with `fetch-models.ps1` from the Releases page.
 
@@ -161,7 +166,7 @@ Development: `npm run tauri dev`. Tests: `cd src-tauri && cargo test` (heavy che
 
 ## Status
 
-Version 0.1.0 is the first release. The Arch package is built and in use. The Windows installer is built on Linux and
+Version 0.1.1. The Arch package is built and in use. The Windows installer is built on Linux and
 tested under Wine, but it has not yet been run on a real Windows 11 machine. Found a problem? Open an [issue](https://github.com/6hp2cfrhm4-cmyk/avtonarezka/issues).
 
 ## License
