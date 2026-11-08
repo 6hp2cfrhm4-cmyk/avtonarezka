@@ -1,0 +1,32 @@
+# Пакет из уже собранных файлов (ничего не компилируется): его запускает scripts/make-arch-package.sh,
+# который задаёт PROJECT_DIR. Для обычной сборки из исходников этот файл не предназначен.
+pkgname=avtonarezka
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Вертикальные рекламные ролики из длинного видео, всё считается локально'
+arch=('x86_64')
+license=('custom')
+depends=('webkit2gtk-4.1' 'gtk3' 'ffmpeg' 'libsecret' 'vulkan-icd-loader' 'xdg-utils' 'yt-dlp' 'deno')
+optdepends=(
+  'chromium: заливка в TikTok через браузер'
+  'gnome-keyring: хранилище ключей и входа TikTok'
+  'vulkan-driver: ускорение анализа на видеокарте'
+)
+# бинарники уже собраны в release-режиме и очищены
+options=('!strip' '!debug' '!lto')
+source=()
+
+package() {
+  : "${PROJECT_DIR:?задай PROJECT_DIR (корень проекта)}"
+  local rel="$PROJECT_DIR/src-tauri/target/release"
+  install -Dm755 "$rel/avtonarezka" "$pkgdir/usr/bin/avtonarezka"
+  # воркер языковой модели ищется рядом с программой
+  install -Dm755 "$rel/llm-worker" "$pkgdir/usr/bin/llm-worker"
+  install -Dm644 "$PROJECT_DIR/src-tauri/packaging/avtonarezka.desktop" "$pkgdir/usr/share/applications/avtonarezka.desktop"
+  local icons="$PROJECT_DIR/src-tauri/icons"
+  install -Dm644 "$icons/32x32.png"   "$pkgdir/usr/share/icons/hicolor/32x32/apps/avtonarezka.png"
+  install -Dm644 "$icons/128x128.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/avtonarezka.png"
+  install -Dm644 "$icons/icon.png"    "$pkgdir/usr/share/icons/hicolor/512x512/apps/avtonarezka.png"
+  install -Dm644 "$PROJECT_DIR/assets/fonts/OFL.txt" "$pkgdir/usr/share/licenses/$pkgname/OFL-Montserrat.txt"
+  install -Dm755 "$PROJECT_DIR/scripts/fetch-models.sh" "$pkgdir/usr/share/$pkgname/fetch-models.sh"
+}

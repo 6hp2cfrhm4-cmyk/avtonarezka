@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Автонарезка
+GenericName=Нарезка видео для TikTok
+Comment=Вертикальные рекламные ролики из длинного видео
+Exec=avtonarezka
+Icon=avtonarezka
+Terminal=false
+Categories=AudioVideo;Video;
+StartupWMClass=avtonarezka

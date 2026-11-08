@@ -1,0 +1,19 @@
+[package]
+name = "llm-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Отдельный процесс с llama.cpp: у whisper.cpp и llama.cpp свои копии ggml, в одном бинарнике они конфликтуют"
+
+[dependencies]
+llama-cpp-2 = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[features]
+# LLM на видеокарте (нужны vulkan-headers, spirv-headers и glslc). Без неё — только процессор.
+default = ["vulkan"]
+vulkan = ["llama-cpp-2/vulkan"]

@@ -1,0 +1,256 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource/unbounded/400.css";
+@import "@fontsource/unbounded/600.css";
+@import "@fontsource/unbounded/800.css";
+
+:root {
+  --accent: #b6ff3c;
+  --accent-ink: #0a0f02;
+  --violet: #8b6cff;
+  --danger: #ff4d6d;
+}
+
+@theme inline {
+  --font-display: "Unbounded", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --color-ink-950: #06060b;
+  --color-ink-900: #0b0b13;
+  --color-ink-800: #12121d;
+  --color-ink-700: #1b1b2b;
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-violet: var(--violet);
+  --color-danger: var(--danger);
+}
+
+@property --spin {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: #ecebf5;
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01";
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+/* Стекло */
+.glass {
+  background: linear-gradient(160deg, rgba(34, 34, 54, 0.82), rgba(14, 14, 24, 0.78));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 24px 60px -24px rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+}
+
+.glass-lite {
+  background: rgba(14, 14, 24, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+/* Кнопки */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 0.7rem 1.15rem;
+  border-radius: 0.85rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  letter-spacing: 0.01em;
+  color: #ecebf5;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
+}
+.btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn-primary {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: transparent;
+  box-shadow: 0 8px 30px -8px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.btn-primary:hover {
+  background: color-mix(in srgb, var(--accent) 88%, white);
+  box-shadow: 0 10px 40px -6px color-mix(in srgb, var(--accent) 85%, transparent);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.28rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: rgba(236, 235, 245, 0.78);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.kbd {
+  display: inline-block;
+  min-width: 1.5rem;
+  padding: 0.1rem 0.4rem;
+  text-align: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  border-radius: 0.4rem;
+  background: rgba(255, 255, 255, 0.1);
+  border-bottom: 2px solid rgba(255, 255, 255, 0.18);
+}
+
+/* Вращающаяся рамка у зоны загрузки: градиент рисуется фоном самой карточки,
+   без отдельного слоя с маской — в WebKitGTK маска внутри preserve-3d уезжает. */
+.glass-spin {
+  border: 1.5px solid transparent;
+  background:
+    linear-gradient(160deg, #1d1d31, #0f0f19) padding-box,
+    conic-gradient(
+        from var(--spin),
+        rgba(255, 255, 255, 0.1) 0 55%,
+        var(--accent) 78%,
+        var(--violet) 90%,
+        rgba(255, 255, 255, 0.1) 100%
+      )
+      border-box;
+  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.7);
+  animation: border-spin 5s linear infinite;
+}
+@keyframes border-spin {
+  to {
+    --spin: 360deg;
+  }
+}
+
+/* Заглушка, пока читаются сведения о видео. Имена анимаций с префиксом yt-: у Tailwind v4 свой `spin`. */
+.yt-shimmer {
+  background: linear-gradient(100deg, rgba(255, 255, 255, 0.05) 30%, rgba(255, 255, 255, 0.14) 50%, rgba(255, 255, 255, 0.05) 70%);
+  background-size: 200% 100%;
+  animation: yt-shimmer 1.4s linear infinite;
+}
+@keyframes yt-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.lite *,
+.lite *::before,
+.lite *::after {
+  animation-duration: 0s !important;
+}
+.lite .glass {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(14, 14, 24, 0.86);
+}
+
+/* Ползунок */
+.range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  outline: none;
+  cursor: pointer;
+}
+.range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3px solid #0b0b13;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 70%, transparent);
+  transition: transform 0.15s;
+}
+.range::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+.range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3px solid #0b0b13;
+}
+.range:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* Длинные списки: браузер не рисует то, что за экраном (размер до первой отрисовки задан приблизительно).
+   Включается только в «плотном» режиме, см. src/lib/dense.ts. */
+.cv-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 40px;
+}
+/* Поля вокруг карточки оставляют место для наклона и подъёма при наведении: `content-visibility` обрезает всё, что выходит за блок. */
+.cv-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 400px;
+  padding: 10px;
+  margin: -10px;
+}
+
+/* Появление карточки: только прозрачность и сдвиг, задержка растёт у первых восьми (`--i` — номер карточки).
+   `backwards`, а не `both`: после показа прозрачность снова задаёт сам класс (например, у отклонённых). */
+.dr-in {
+  animation: dr-in 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+  animation-delay: calc(min(var(--i, 0), 8) * 45ms);
+}
+@keyframes dr-in {
+  from {
+    opacity: 0;
+    transform: translateY(26px) scale(0.97);
+  }
+}
+
+/* Наклон карточки под курсором, см. components/Tilt.tsx. Без наведения transform нет вовсе: у карточки нет отдельного 3D-слоя. */
+.tilt {
+  transition: transform 0.16s ease-out;
+}
+.tilt:hover {
+  transform: perspective(900px) rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg)) scale(1.04);
+  will-change: transform;
+}

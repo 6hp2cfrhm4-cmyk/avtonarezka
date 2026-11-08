@@ -1,0 +1,29 @@
+dist
+.DS_Store
+*.log
+node_modules
+release
+src-tauri/binaries
+src-tauri/gen
+src-tauri/target
+windows/.cache
+windows/vendor
+
+# готовые бинарники и пакеты: они уходят в GitHub Releases, а не в репозиторий
+*.exe
+*.dll
+*.zip
+*.deb
+*.AppImage
+*.pkg.tar.zst
+
+# секреты и локальные настройки
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.sqlite
+.claude/settings.local.json
