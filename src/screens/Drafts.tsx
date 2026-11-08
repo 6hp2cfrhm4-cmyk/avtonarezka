@@ -94,6 +94,18 @@ export default function DraftsScreen() {
     }
   };
 
+  // фон у ещё не одобренных черновиков переставляется на те же секунды, что и клип в исходном видео
+  const realignGameplay = async () => {
+    if (!project) return;
+    try {
+      const n = await api.draftsRealignGameplay(project.id);
+      notify(n ? `Фон переставлен по таймкодам: роликов — ${n}, превью собираются заново` : "Фон уже стоит по таймкодам");
+      await reload();
+    } catch (e) {
+      notify(errText(e), "error");
+    }
+  };
+
   const startFinals = async () => {
     if (!project) return;
     try {
@@ -159,6 +171,15 @@ export default function DraftsScreen() {
               {count(["failed"]) > 0 && (
                 <button className="btn" onClick={() => void retryFailed()}>
                   Повторить упавшие ({count(["failed"])})
+                </button>
+              )}
+              {count(["ready", "failed", "rejected"]) > 0 && (
+                <button
+                  className="btn"
+                  onClick={() => void realignGameplay()}
+                  title="Фон берётся с тех же секунд, что и клип в исходном видео. У не одобренных черновиков ручной выбор фона и секунды сбросится"
+                >
+                  Фон по таймкодам
                 </button>
               )}
               {missing > 0 && (
