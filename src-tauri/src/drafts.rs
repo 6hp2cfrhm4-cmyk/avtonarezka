@@ -495,6 +495,21 @@ async fn run_one(app: &AppHandle, draft_id: i64, kind: RenderKind, cancel: watch
     }
 }
 
+/// Финал без надписи «Часть N» для выкладки через пул аккаунтов. Это отдельный файл, обычный финал не меняется.
+/// Надпись рисуется только при номере части, поэтому у копии номер просто не передаётся.
+pub(crate) async fn render_pool_copy(app: &AppHandle, draft_id: i64, out: &Path, on_progress: impl FnMut(f64)) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    let nvenc = *state.nvenc.get_or_init(|| async { media::check_env().await.nvenc }).await;
+    let encoder = if nvenc { Encoder::Nvenc } else { Encoder::X264 };
+    let mut job = build_job(&state.db.0.lock().unwrap(), draft_id, Profile::Final, encoder, out.to_path_buf()).map_err(|e| anyhow::anyhow!(e))?;
+    job.part = None;
+    // отмены у этого рендера нет; сигнал держим живым, пока идёт рендер
+    let (_cancel_tx, cancel) = watch::channel(false);
+    let work = state.data_dir.join("tmp");
+    let fonts = state.fonts_dir();
+    render::render(&job, &work, Some(&fonts), cancel, on_progress).await
+}
+
 /// Что менять в моменте вместе с настройками ролика.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

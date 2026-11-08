@@ -1,6 +1,6 @@
 [package]
 name = "avtonarezka"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Автонарезка: локальная нарезка видео в вертикальные рекламные ролики"
 
@@ -33,6 +33,8 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 anyhow = "1"
 thiserror = "2"
 rand = "0.9"
+# местное время для окна публикации и суточного лимита
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
 hex = "0.4"
 tracing = "0.1"

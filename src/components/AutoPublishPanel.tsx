@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { api, errText, type JobResolve, type JobState, type PublishJob, type QueueState } from "../lib/api";
 import { captionLen, parseTags } from "../lib/caption";
 import { useUi } from "../store";
+import { Switch } from "./Controls";
 
 export const STATE_LABEL: Record<JobState, string> = {
   drafting: "Пишу описание",
@@ -37,6 +38,18 @@ export const fmtWait = (sec: number) => {
 const card = "rounded-2xl border border-white/10 bg-white/[0.04]";
 const field = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none transition focus:border-accent/60";
 
+/** «10:30» → 630 минут от полуночи; неверный ввод — null. */
+const parseHHMM = (v: string): number | null => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(v.trim());
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+};
+
+/** 630 → «10:30». Конец суток (1440) показываем как 00:00: при «до 00:00» окно идёт до полуночи. */
+const fmtHHMM = (min: number) => {
+  const t = min % 1440;
+  return `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
+};
+
 /** Автовыкладка: каждому готовому ролику своё описание от модели, дальше очередь с паузой и суточным лимитом. */
 export default function AutoPublishPanel() {
   const project = useUi((s) => s.project);
@@ -50,6 +63,8 @@ export default function AutoPublishPanel() {
   const [listOpen, setListOpen] = useState(true);
   const [pause, setPause] = useState("");
   const [limit, setLimit] = useState("");
+  const [winFrom, setWinFrom] = useState("");
+  const [winTo, setWinTo] = useState("");
   const [now, setNow] = useState(() => Date.now() / 1000);
 
   useEffect(() => {
@@ -62,6 +77,8 @@ export default function AutoPublishPanel() {
     if (queue && pause === "" && limit === "") {
       setPause(String(queue.settings.pauseMin));
       setLimit(String(queue.settings.dailyLimit));
+      setWinFrom(fmtHHMM(queue.settings.windowStart));
+      setWinTo(fmtHHMM(queue.settings.windowEnd));
     }
   }, [queue, pause, limit]);
 
@@ -89,14 +106,20 @@ export default function AutoPublishPanel() {
   const saveSettings = () => {
     const p = Math.round(Number(pause));
     const l = Math.round(Number(limit));
-    if (!(p >= 1) || !(l >= 1)) {
-      notify("Пауза и лимит — числа не меньше 1", "error");
+    const from = parseHHMM(winFrom);
+    const parsedTo = parseHHMM(winTo);
+    // «до 00:00» — это до полуночи, то есть конец суток (1440), а не начало
+    const to = parsedTo === 0 ? 1440 : parsedTo;
+    if (!(p >= 1) || !(l >= 1) || from === null || to === null) {
+      notify("Пауза и лимит — числа не меньше 1, окно — время в формате ЧЧ:ММ", "error");
       setPause(String(queue.settings.pauseMin));
       setLimit(String(queue.settings.dailyLimit));
+      setWinFrom(fmtHHMM(queue.settings.windowStart));
+      setWinTo(fmtHHMM(queue.settings.windowEnd));
       return;
     }
-    if (p === queue.settings.pauseMin && l === queue.settings.dailyLimit) return;
-    void run(api.queueSettingsSet(p, l).then(reload));
+    if (p === queue.settings.pauseMin && l === queue.settings.dailyLimit && from === queue.settings.windowStart && to === queue.settings.windowEnd) return;
+    void run(api.queueSettingsSet(p, l, from, to).then(reload));
   };
 
   const waitLeft = queue.nextAt ? queue.nextAt - now : null;
@@ -107,7 +130,7 @@ export default function AutoPublishPanel() {
         <div>
           <div className="font-display text-lg font-extrabold">Автовыкладка в TikTok</div>
           <p className="mt-1 max-w-2xl text-sm text-white/55">
-            Модель пишет для каждого ролика свой длинный текст и до {queue.maxTags} хэштегов ({queue.windowMin}–{queue.windowMax} знаков вместе с хэштегами), либо вы задаёте один свой текст на все ролики. Потом ролики выходят по одному через браузер.
+            Модель пишет для каждого ролика свой длинный текст и до {queue.maxTags} хэштегов ({queue.windowMin}–{queue.windowMax} знаков вместе с хэштегами), либо вы задаёте один свой текст на все ролики. Потом ролики выходят по одному через браузер: по кругу с аккаунтов пула и только в окне публикации.
           </p>
         </div>
         <span className={`chip ${queue.running ? "!border-accent/50 !text-accent" : ""}`}>
@@ -115,16 +138,32 @@ export default function AutoPublishPanel() {
         </span>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 sm:max-w-md">
-        <label className="text-xs text-white/55">
-          Пауза между роликами, мин
-          <input className={`${field} mt-1`} inputMode="numeric" value={pause} onChange={(e) => setPause(e.target.value)} onBlur={saveSettings} />
-        </label>
-        <label className="text-xs text-white/55">
-          Не больше за сутки
-          <input className={`${field} mt-1`} inputMode="numeric" value={limit} onChange={(e) => setLimit(e.target.value)} onBlur={saveSettings} />
-        </label>
+      <div className="flex flex-col gap-2">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <label className="text-xs text-white/55">
+            Пауза между роликами, мин
+            <input className={`${field} mt-1`} inputMode="numeric" value={pause} onChange={(e) => setPause(e.target.value)} onBlur={() => saveSettings()} />
+          </label>
+          <label className="text-xs text-white/55">
+            В сутки на аккаунт, не больше
+            <input className={`${field} mt-1`} inputMode="numeric" value={limit} onChange={(e) => setLimit(e.target.value)} onBlur={() => saveSettings()} />
+          </label>
+          <label className="text-xs text-white/55">
+            Выкладывать с
+            <input type="time" className={`${field} mt-1`} value={winFrom} onChange={(e) => setWinFrom(e.target.value)} onBlur={() => saveSettings()} />
+          </label>
+          <label className="text-xs text-white/55">
+            до
+            <input type="time" className={`${field} mt-1`} value={winTo} onChange={(e) => setWinTo(e.target.value)} onBlur={() => saveSettings()} />
+          </label>
+        </div>
+        <p className="text-xs text-white/40">
+          Время местное. Одинаковые «с» и «до» — весь день. «До 00:00» — до полуночи; «с 22:00 до 06:00» — окно через ночь.
+        </p>
       </div>
+
+      <AccountsPool queue={queue} onChanged={reload} />
+
 
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -155,7 +194,7 @@ export default function AutoPublishPanel() {
 
       <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm text-white/65">
         <span>
-          За сутки: <b className="text-white">{queue.sentToday}</b> из {queue.settings.dailyLimit}
+          Сегодня выложено: <b className="text-white">{queue.sentToday}</b>
         </span>
         <span>Выложено: {count(["done"])}</span>
         <span>В очереди: {count(["queued", "sending"])}</span>
@@ -199,6 +238,99 @@ export default function AutoPublishPanel() {
 
       <AnimatePresence>{confirm && <StartDialog queue={queue} count={startable} onClose={() => setConfirm(false)} onStart={() => run(api.queueStart(project.id, true).then(reload)).then(() => setConfirm(false))} />}</AnimatePresence>
     </section>
+  );
+}
+
+/** Пул аккаунтов: список вставляется пачкой, у каждого аккаунта свой вход в браузере. Ролики идут по кругу. */
+function AccountsPool({ queue, onChanged }: { queue: QueueState; onChanged: () => Promise<unknown> }) {
+  const notify = useUi((s) => s.notify);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const enabled = queue.accounts.filter((a) => a.enabled).length;
+
+  const act = (p: Promise<unknown>) => p.then(() => onChanged()).catch((e) => notify(errText(e), "error"));
+
+  const addAll = async () => {
+    const labels = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (labels.length === 0) return;
+    setBusy(true);
+    try {
+      const n = await api.accountsAdd(labels);
+      setText("");
+      notify(n > 0 ? `Добавлено аккаунтов: ${n}. Для каждого откройте окно входа и войдите в TikTok` : "Такие аккаунты уже в списке");
+      await onChanged();
+    } catch (e) {
+      notify(errText(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openLogin = (id: number) =>
+    void api
+      .accountsOpenLogin(id)
+      .then(() => notify("Войди в TikTok в открывшемся окне. Потом окно можно закрыть: вход сохранится"))
+      .catch((e) => notify(errText(e), "error"));
+
+  return (
+    <div className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-black/20 p-4">
+      <div>
+        <div className="font-display text-sm font-extrabold">Аккаунты для выкладки</div>
+        <p className="mt-1 text-xs leading-relaxed text-white/50">
+          Вставь список, по одному аккаунту в строке, или загрузи .txt. Каждому нужен один вход в TikTok в своём окне браузера: кнопка «Войти». Пароли программа не сохраняет. Ролики выходят по кругу: первый аккаунт, второй, потом снова первый.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        {queue.accounts.map((a) => (
+          <div key={a.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold">
+                {a.label}
+                {a.main && <span className="ml-2 text-xs font-normal text-white/40">основной</span>}
+              </div>
+              <div className="text-xs text-white/50">Сегодня выложено: {a.sentToday} из {queue.settings.dailyLimit}</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button className="btn !py-1.5 !text-xs" onClick={() => openLogin(a.id)}>Войти</button>
+              <Switch checked={a.enabled} onChange={(v) => void act(api.accountsSetEnabled(a.id, v))} />
+              <button className="btn !py-1.5 !text-xs" disabled={queue.running} onClick={() => void act(api.accountsRemove(a.id))}>Убрать</button>
+            </div>
+          </div>
+        ))}
+        {queue.accounts.length === 0 && <div className="text-xs text-white/50">Пока ни одного аккаунта.</div>}
+      </div>
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
+        <textarea className={`${field} h-24 flex-1 resize-y font-mono text-xs`} placeholder={"anna\nboris\nclara"} value={text} onChange={(e) => setText(e.target.value)} />
+        <div className="flex gap-2 sm:flex-col">
+          <button className="btn btn-primary !text-xs" disabled={busy || !text.trim()} onClick={() => void addAll()}>
+            {busy ? "Добавляю…" : "Добавить"}
+          </button>
+          <label className="btn cursor-pointer !text-xs">
+            Из .txt
+            <input
+              type="file"
+              accept=".txt,text/plain"
+              className="hidden"
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (file) setText(await file.text());
+                e.target.value = "";
+              }}
+            />
+          </label>
+        </div>
+      </div>
+
+      <div className="text-xs text-white/50">
+        {enabled > 1
+          ? `В кругу аккаунтов: ${enabled}. Ролики идут по кругу, и на них не ставится надпись «Часть N».`
+          : enabled === 1
+            ? "Включён один аккаунт: круга нет, надпись «Часть N» остаётся."
+            : "Ни один аккаунт не включён: очередь не запустится."}
+      </div>
+    </div>
   );
 }
 
@@ -302,7 +434,13 @@ function StartDialog({ queue, count, onClose, onStart }: { queue: QueueState; co
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const first = Math.min(count, queue.settings.dailyLimit - queue.sentToday);
+  const enabled = queue.accounts.filter((a) => a.enabled);
+  // сколько уйдёт сразу: остаток на сутки по каждому включённому аккаунту
+  const free = enabled.reduce((sum, a) => sum + Math.max(0, queue.settings.dailyLimit - a.sentToday), 0);
+  const first = Math.min(count, free);
+  // как на бэкенде: равные границы или весь сутки (0–1440) — без ограничения
+  const { windowStart: ws, windowEnd: we } = queue.settings;
+  const whole = ws === we || (ws === 0 && we >= 1440);
   return createPortal(
     <div className="fixed inset-0 z-50 grid place-items-center p-6" style={{ perspective: 1600 }}>
       <motion.div className="absolute inset-0 bg-black/70" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} />
@@ -316,7 +454,19 @@ function StartDialog({ queue, count, onClose, onStart }: { queue: QueueState; co
         <div className="font-display text-xl font-extrabold">Запустить автовыкладку?</div>
         <ul className="flex list-disc flex-col gap-2 pl-5 text-sm leading-relaxed text-white/75">
           <li>Роликов в очереди: <b className="text-white">{count}</b>. Каждый выйдет со своим описанием и хэштегами.</li>
-          <li>Пауза между роликами: {queue.settings.pauseMin} мин, не больше {queue.settings.dailyLimit} за сутки. Сегодня уже выложено: {queue.sentToday}. Сразу уйдёт: {Math.max(first, 0)}, остальные позже.</li>
+          <li>
+            Аккаунтов в кругу: <b className="text-white">{enabled.length}</b>.{" "}
+            {queue.pool ? "Ролики идут по кругу, и на них не ставится надпись «Часть N»." : "Один аккаунт: ролики идут с него же, надпись «Часть N» остаётся."}
+          </li>
+          <li>
+            Пауза между роликами: {queue.settings.pauseMin} мин, не больше {queue.settings.dailyLimit} в сутки на аккаунт. Сегодня уже выложено: {queue.sentToday}. Сразу уйдёт: {Math.max(first, 0)}, остальные позже.
+          </li>
+          {!whole && (
+            <li>
+              Выкладка только с {fmtHHMM(queue.settings.windowStart)} до {fmtHHMM(queue.settings.windowEnd)} по местному времени. Вне окна очередь ждёт.
+            </li>
+          )}
+          <li>У каждого аккаунта должен быть вход в своём окне браузера: кнопка «Войти» в списке аккаунтов.</li>
           <li>Программа откроет окно Chromium со страницей загрузки TikTok и <b className="text-white">сама нажмёт «Опубликовать»</b>. Видимость берётся из настроек аккаунта в TikTok Studio: проверь её заранее.</li>
           <li>Приложение должно оставаться открытым, пока идёт очередь. Если ноутбук уснёт, очередь продолжится по часам.</li>
           <li>Если TikTok попросит войти или пройти проверку (капчу), очередь встанет на паузу. Реши это сам в окне браузера и запусти очередь снова.</li>

@@ -327,16 +327,33 @@ export interface PublishJob {
 }
 export interface QueueSettings {
   pauseMin: number;
+  /** Не больше роликов в местные сутки на каждый аккаунт. */
   dailyLimit: number;
+  /** Окно публикации: минуты от местной полуночи. Равные начало и конец — без ограничения; начало больше конца — через полночь. */
+  windowStart: number;
+  windowEnd: number;
+}
+export interface AccountInfo {
+  id: number;
+  label: string;
+  enabled: boolean;
+  /** Основной аккаунт: им выкладываются ручные публикации и всё, что ушло до пула. */
+  main: boolean;
+  /** Выложено сегодня (по местным суткам). */
+  sentToday: number;
 }
 export interface QueueState {
   jobs: PublishJob[];
   settings: QueueSettings;
+  /** Пул аккаунтов: круг, по которому идут ролики. */
+  accounts: AccountInfo[];
+  /** Два и больше включённых аккаунта: ролики выходят без надписи «Часть N». */
+  pool: boolean;
   /** Очередь идёт (цикл запущен). */
   running: boolean;
   /** Модель пишет описания. */
   generating: boolean;
-  /** Выложено за последние 24 часа. */
+  /** Выложено сегодня по всем аккаунтам (местные сутки). */
   sentToday: number;
   /** Когда уйдёт следующий ролик (unix), если очередь ждёт. */
   nextAt: number | null;
@@ -480,7 +497,12 @@ const real = {
   queueApplyText: (projectId: number, caption: string, hashtags: string[]) => invoke<number>("queue_apply_text", { projectId, caption, hashtags }),
   queueJobUpdate: (id: number, caption: string, hashtags: string[]) => invoke<PublishJob>("queue_job_update", { id, caption, hashtags }),
   queueJobResolve: (id: number, action: JobResolve) => invoke<void>("queue_job_resolve", { id, action }),
-  queueSettingsSet: (pauseMin: number, dailyLimit: number) => invoke<QueueSettings>("queue_settings_set", { pauseMin, dailyLimit }),
+  queueSettingsSet: (pauseMin: number, dailyLimit: number, windowStart: number, windowEnd: number) =>
+    invoke<QueueSettings>("queue_settings_set", { pauseMin, dailyLimit, windowStart, windowEnd }),
+  accountsAdd: (labels: string[]) => invoke<number>("accounts_add", { labels }),
+  accountsSetEnabled: (id: number, enabled: boolean) => invoke<void>("accounts_set_enabled", { id, enabled }),
+  accountsRemove: (id: number) => invoke<void>("accounts_remove", { id }),
+  accountsOpenLogin: (id: number) => invoke<void>("accounts_open_login", { id }),
   queueStart: (projectId: number, confirmed: boolean) => invoke<void>("queue_start", { projectId, confirmed }),
   queuePause: () => invoke<void>("queue_pause"),
   queueStop: (projectId: number) => invoke<void>("queue_stop", { projectId }),
@@ -575,7 +597,8 @@ let demoJobs: PublishJob[] = [];
 let demoGenerating = false;
 let demoRunning = false;
 let demoNextAt: number | null = null;
-let demoQueueSettings: QueueSettings = { pauseMin: 45, dailyLimit: 5 };
+let demoQueueSettings: QueueSettings = { pauseMin: 45, dailyLimit: 5, windowStart: 0, windowEnd: 1440 };
+let demoAccounts: AccountInfo[] = [{ id: 1, label: "Основной", enabled: true, main: true, sentToday: 0 }];
 const demoLongText = (n: number) => {
   const base = "Он вернулся домой и не поверил своим глазам: на столе лежало то, чего он совсем не ждал. ";
   let s = "";
@@ -585,6 +608,8 @@ const demoLongText = (n: number) => {
 const demoQueueState = (): QueueState => ({
   jobs: demoJobs.map((j) => ({ ...j })),
   settings: demoQueueSettings,
+  accounts: demoAccounts.map((a) => ({ ...a })),
+  pool: demoAccounts.filter((a) => a.enabled).length > 1,
   running: demoRunning,
   generating: demoGenerating,
   sentToday: demoJobs.filter((j) => j.state === "done").length,
@@ -758,7 +783,31 @@ const mock: typeof real = {
     if (action === "remove") demoJobs = demoJobs.filter((x) => x.id !== id);
     else Object.assign(j, { state: action === "retry" ? "queued" : "done", error: null });
   },
-  queueSettingsSet: async (pauseMin, dailyLimit) => (demoQueueSettings = { pauseMin: Math.max(1, pauseMin), dailyLimit: Math.max(1, dailyLimit) }),
+  queueSettingsSet: async (pauseMin, dailyLimit, windowStart, windowEnd) =>
+    (demoQueueSettings = {
+      pauseMin: Math.max(1, pauseMin),
+      dailyLimit: Math.max(1, dailyLimit),
+      windowStart: Math.min(1440, Math.max(0, windowStart)),
+      windowEnd: Math.min(1440, Math.max(0, windowEnd)),
+    }),
+  accountsAdd: async (labels) => {
+    let added = 0;
+    for (const raw of labels) {
+      const label = raw.trim();
+      if (!label || demoAccounts.some((a) => a.label.toLowerCase() === label.toLowerCase())) continue;
+      demoAccounts.push({ id: Math.max(0, ...demoAccounts.map((a) => a.id)) + 1, label, enabled: true, main: false, sentToday: 0 });
+      added++;
+    }
+    return added;
+  },
+  accountsSetEnabled: async (id, enabled) => {
+    const a = demoAccounts.find((x) => x.id === id);
+    if (a) a.enabled = enabled;
+  },
+  accountsRemove: async (id) => {
+    demoAccounts = demoAccounts.filter((x) => x.id !== id);
+  },
+  accountsOpenLogin: async () => {},
   queueStart: async (projectId, confirmed) => {
     if (!confirmed) throw "Нужно подтверждение запуска";
     demoJobs.filter((j) => j.state === "ready").forEach((j) => (j.state = "queued"));

@@ -295,6 +295,11 @@ pub(crate) fn finish_post(db: &Connection, id: i64, result: &Result<(String, Opt
     };
 }
 
+/// Ролик ушёл с аккаунта: время выкладки и аккаунт попадают в суточный лимит. `None` — основной аккаунт.
+pub(crate) fn mark_sent(db: &Connection, id: i64, account: Option<i64>) {
+    let _ = db.execute("UPDATE posts SET sent_at = unixepoch(), account_id = COALESCE(?2, account_id) WHERE id = ?1", params![id, account]);
+}
+
 /// Последняя отправка каждого ролика проекта.
 pub(crate) fn latest_posts(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<PostDto>> {
     let mut st = db.prepare(

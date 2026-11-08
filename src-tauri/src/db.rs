@@ -121,6 +121,27 @@ CREATE TABLE publish_jobs (
 CREATE INDEX publish_jobs_by_state ON publish_jobs(state, id);
 "#;
 
+/// Пул аккаунтов TikTok для автовыкладки. У каждого свой профиль браузера; первый (`position` 0) — основной,
+/// он унаследовал прежний вход. Выкладки помнят свой аккаунт и время выхода: по ним считается суточный лимит.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE accounts (
+    id         INTEGER PRIMARY KEY,
+    label      TEXT NOT NULL,
+    profile    TEXT NOT NULL DEFAULT '',
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    position   INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+INSERT INTO accounts (label, profile, enabled, position) VALUES ('Основной', 'tiktok-browser', 1, 0);
+ALTER TABLE publish_jobs ADD COLUMN account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL;
+ALTER TABLE posts ADD COLUMN account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL;
+ALTER TABLE posts ADD COLUMN sent_at INTEGER;
+-- выкладки, которые уже прошли до пула, тоже считаются в суточном лимите основного аккаунта
+UPDATE posts SET sent_at = updated_at
+ WHERE status = 'done' AND (detail LIKE 'Опубликовано%' OR detail LIKE 'Нажата кнопка%' OR detail LIKE 'Выложено%');
+CREATE INDEX posts_by_sent ON posts(sent_at);
+"#;
+
 pub fn open(path: &Path) -> anyhow::Result<Db> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
@@ -153,6 +174,10 @@ pub(crate) fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version < 6 {
         conn.execute_batch(SCHEMA_V6)?;
         conn.pragma_update(None, "user_version", 6)?;
+    }
+    if version < 7 {
+        conn.execute_batch(SCHEMA_V7)?;
+        conn.pragma_update(None, "user_version", 7)?;
     }
     Ok(())
 }

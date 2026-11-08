@@ -172,6 +172,36 @@ mod tests {
         assert_eq!(color("zzz"), "&H00FFFFFF");
     }
 
+    fn label_job(part: Option<u32>) -> RenderJob {
+        use crate::render::{Encoder, MediaRef, Profile, RenderJob, Style};
+        let media = |name: &str| MediaRef { path: std::path::PathBuf::from(name), duration: 60.0, has_audio: true };
+        RenderJob {
+            source: media("/v/src.mp4"),
+            source_aspect: 16.0 / 9.0,
+            start: 0.0,
+            end: 20.0,
+            banner: None,
+            banner_at: None,
+            gameplay: media("/v/gp.mp4"),
+            gameplay_offset: 0.0,
+            music: None,
+            music_offset: 0.0,
+            words: vec![],
+            part,
+            style: Style::default(),
+            profile: Profile::Final,
+            encoder: Encoder::X264,
+            out: std::path::PathBuf::from("/o/out.mp4"),
+        }
+    }
+
+    /// Надпись рисуется только при номере части: пульный вариант собирается без номера и без надписи.
+    #[test]
+    fn the_part_label_needs_a_part_number() {
+        assert!(build(&label_job(Some(2))).contains("Часть 2"));
+        assert!(!build(&label_job(None)).contains("Часть"));
+    }
+
     #[test]
     fn timestamps() {
         assert_eq!(ts(0.0), "0:00:00.00");

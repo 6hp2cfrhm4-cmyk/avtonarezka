@@ -162,7 +162,9 @@ pub fn queue_apply_text(app: &AppHandle, project_id: i64, q: &std::collections::
 
 pub fn queue_settings(app: &AppHandle, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
     let get = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok()).ok_or_else(|| format!("нужен ?{k}=<число>"));
-    let s = crate::publish_queue::queue_settings_set(app.state(), get("pause")?, get("limit")?)?;
+    // окно необязательно: без него публикация идёт весь день
+    let opt = |k: &str, default: i64| q.get(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(default);
+    let s = crate::publish_queue::queue_settings_set(app.state(), get("pause")?, get("limit")?, opt("from", 0), opt("to", 1440))?;
     serde_json::to_string(&s).map_err(|e| e.to_string())
 }
 

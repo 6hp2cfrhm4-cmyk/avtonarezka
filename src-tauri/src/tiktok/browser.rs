@@ -19,10 +19,11 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::{
+    accounts,
     drafts::get as get_draft,
     state::AppState,
     tiktok::api::make_caption,
-    tiktok_cmds::{finish_post, begin_post, PostDone, PostFailed, PostProgress, PublishArgs, PublishStart},
+    tiktok_cmds::{finish_post, begin_post, mark_sent, PostDone, PostFailed, PostProgress, PublishArgs, PublishStart},
 };
 
 pub const UPLOAD_URL: &str = "https://www.tiktok.com/tiktokstudio/upload";
@@ -475,6 +476,16 @@ pub(crate) struct BrowserPost {
     /// Дождаться подтверждения публикации от TikTok. Для очереди обязательно.
     pub require_confirmation: bool,
     pub close_on_success: bool,
+    /// Профиль Chromium аккаунта, с которого идёт выкладка: в нём лежит вход в TikTok.
+    pub profile: PathBuf,
+}
+
+/// Окно Chromium с профилем аккаунта на странице загрузки, чтобы человек вошёл в TikTok. Не ждёт входа:
+/// окно остаётся открытым, а очередь потом пользуется тем же профилем.
+pub(crate) async fn open_login_window(chromium: &Path, profile: &Path) -> anyhow::Result<()> {
+    let port = ensure_browser(chromium, profile, false, "about:blank").await?;
+    open_tab(port, &upload_url()).await?;
+    Ok(())
 }
 
 fn upload_url() -> String {
@@ -491,6 +502,9 @@ fn upload_url() -> String {
 /// Один ролик через браузер, с событиями хода `post-progress`. Записей в журнал не делает: это забота вызывающего.
 pub(crate) async fn run_browser_post(app: &AppHandle, draft_id: i64, p: BrowserPost) -> anyhow::Result<DriveOutcome> {
     let chromium = find_chromium().ok_or_else(|| anyhow!("Не найден Chromium. Установи пакет chromium или Google Chrome"))?;
+    // по одной выкладке за раз: очередь и ручной диалог не пишут в браузер одновременно
+    let state = app.state::<AppState>();
+    let _turn = state.browser_gate.lock().await;
     #[allow(unused_mut)] // в release подмен нет
     let mut selectors = Selectors::default();
     #[cfg(debug_assertions)]
@@ -507,7 +521,7 @@ pub(crate) async fn run_browser_post(app: &AppHandle, draft_id: i64, p: BrowserP
     let headless = cfg!(debug_assertions) && std::env::var("AVTO_TIKTOK_HEADLESS").is_ok_and(|v| v == "1");
     let cfg = DriveConfig {
         chromium,
-        profile: app.state::<AppState>().data_dir.join("tiktok-browser"),
+        profile: p.profile,
         headless,
         upload_url: upload_url(),
         file: p.file,
@@ -529,7 +543,8 @@ pub(crate) async fn run_browser_post(app: &AppHandle, draft_id: i64, p: BrowserP
 
 pub(crate) async fn start(app: AppHandle, state: State<'_, AppState>, args: PublishArgs, file: PathBuf, auto_publish: bool) -> Result<PublishStart, String> {
     find_chromium().ok_or("Не найден Chromium. Установи пакет chromium или выбери способ «через API»")?;
-    let (post_id, caption) = {
+    // ручной диалог выкладывает с основного аккаунта: его вход лежит в его профиле
+    let (post_id, caption, account, profile) = {
         let db = state.db.0.lock().unwrap();
         let d = get_draft(&db, args.draft_id)?;
         db.execute(
@@ -537,13 +552,15 @@ pub(crate) async fn start(app: AppHandle, state: State<'_, AppState>, args: Publ
             rusqlite::params![d.moment_id, args.caption.trim(), serde_json::to_string(&crate::tiktok::api::normalize_hashtags(&args.hashtags)).unwrap_or_else(|_| "[]".into())],
         )
         .map_err(|e| e.to_string())?;
-        (begin_post(&db, args.draft_id, "browser", "browser").map_err(|e| e.to_string())?, make_caption(&args.caption, &args.hashtags, CAPTION_LIMIT))
+        let account = accounts::main_id(&db);
+        let profile = accounts::profile_dir(&db, &state.data_dir, account)?;
+        (begin_post(&db, args.draft_id, "browser", "browser").map_err(|e| e.to_string())?, make_caption(&args.caption, &args.hashtags, CAPTION_LIMIT), account, profile)
     };
     state.posting.lock().unwrap().insert(args.draft_id);
     let draft_id = args.draft_id;
 
     tauri::async_runtime::spawn(async move {
-        let result = run_browser_post(&app, draft_id, BrowserPost { file, caption, auto_publish, require_confirmation: false, close_on_success: false }).await;
+        let result = run_browser_post(&app, draft_id, BrowserPost { file, caption, auto_publish, require_confirmation: false, close_on_success: false, profile }).await;
 
         let state = app.state::<AppState>();
         state.posting.lock().unwrap().remove(&draft_id);
@@ -552,7 +569,13 @@ pub(crate) async fn start(app: AppHandle, state: State<'_, AppState>, args: Publ
             Ok(_) => Ok(("Файл и подпись внесены в окне TikTok. Осталось проверить и нажать «Опубликовать».".to_string(), None)),
             Err(e) => Err(format!("{e:#}")),
         };
-        finish_post(&state.db.0.lock().unwrap(), post_id, &stored);
+        {
+            let db = state.db.0.lock().unwrap();
+            finish_post(&db, post_id, &stored);
+            if matches!(&result, Ok(o) if o.clicked_post) {
+                mark_sent(&db, post_id, account);
+            }
+        }
         let _ = match stored {
             Ok((detail, _)) => app.emit("post-done", PostDone { draft_id, detail }),
             Err(message) => app.emit("post-error", PostFailed { draft_id, message }),

@@ -23,6 +23,8 @@ pub struct AppState {
     pub login: Mutex<Option<watch::Sender<bool>>>,
     /// Ролики, которые прямо сейчас уходят в TikTok.
     pub posting: Mutex<HashSet<i64>>,
+    /// Браузер выкладывает по одному ролику за раз: очередь и ручной диалог ждут друг друга.
+    pub browser_gate: tokio::sync::Mutex<()>,
     /// Идущая очередь автовыкладки: сигнал остановки. `Some` — очередь работает.
     pub publisher: Mutex<Option<watch::Sender<bool>>>,
     /// Идущее написание описаний: сигнал отмены.

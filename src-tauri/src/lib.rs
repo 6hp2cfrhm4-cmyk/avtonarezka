@@ -1,3 +1,4 @@
+mod accounts;
 mod analysis_cmds;
 mod assets_cmds;
 mod commands;
@@ -63,6 +64,7 @@ pub fn run() {
                 secrets: tiktok::secrets::Secrets::detect(),
                 login: Default::default(),
                 posting: Default::default(),
+                browser_gate: Default::default(),
                 publisher: Default::default(),
                 drafting: Default::default(),
                 queue_note: Default::default(),
@@ -124,6 +126,10 @@ pub fn run() {
             publish_queue::queue_start,
             publish_queue::queue_pause,
             publish_queue::queue_stop,
+            accounts::accounts_add,
+            accounts::accounts_set_enabled,
+            accounts::accounts_remove,
+            accounts::accounts_open_login,
             youtube_cmds::youtube_analyze,
             youtube_cmds::youtube_download,
             youtube_cmds::youtube_cancel,

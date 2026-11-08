@@ -4,27 +4,29 @@
 //! Очередь живёт в базе (`publish_jobs`), а работает, пока открыто приложение. После перезапуска очередь не стартует сама:
 //! выкладка без присмотра начинается только по новому согласию человека.
 
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{collections::HashSet, path::{Path, PathBuf}, time::Duration};
 
+use chrono::{Local, TimeZone};
 use rusqlite::{params, Connection, Row};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::{
+    accounts,
     analyze::{
         describe::{self, MAX_LEN, MAX_TAGS, MIN_LEN},
         llm::{self, LlmClient},
         pipeline::Options,
     },
-    drafts::{get as get_draft, kv_get, kv_set},
+    drafts::{get as get_draft, kv_get, kv_set, render_pool_copy},
     models::ModelPaths,
     state::AppState,
     tiktok::{
         api::{len_utf16, make_caption, normalize_hashtags, now_unix},
         browser::{find_chromium, run_browser_post, AfterClick, BrowserPost, CAPTION_LIMIT},
     },
-    tiktok_cmds::{begin_post, finish_post, latest_posts, PostDone, PostDto, PostFailed},
+    tiktok_cmds::{begin_post, finish_post, latest_posts, mark_sent, PostDone, PostDto, PostFailed, PostProgress},
 };
 
 type CmdResult<T> = Result<T, String>;
@@ -35,7 +37,11 @@ fn err(e: impl std::fmt::Display) -> String {
 
 const K_PAUSE: &str = "pub_pause_min";
 const K_LIMIT: &str = "pub_daily_limit";
+const K_WINDOW_START: &str = "pub_window_start";
+const K_WINDOW_END: &str = "pub_window_end";
 const DAY: i64 = 86_400;
+/// Минут в сутках: верхняя граница окна публикации.
+const DAY_MIN: i64 = 1440;
 
 // ---------------------------------------------------------------- настройки
 
@@ -44,14 +50,19 @@ const DAY: i64 = 86_400;
 pub struct QueueSettings {
     /// Пауза между роликами, минут.
     pub pause_min: i64,
-    /// Сколько роликов не больше за скользящие 24 часа.
+    /// Сколько роликов не больше в местные сутки на каждый аккаунт.
     pub daily_limit: i64,
+    /// Окно публикации: минуты от местной полуночи. Одинаковые начало и конец — без ограничения; начало больше конца — через полночь.
+    pub window_start: i64,
+    pub window_end: i64,
 }
 
 pub(crate) fn load_settings(db: &Connection) -> QueueSettings {
     QueueSettings {
         pause_min: kv_get(db, K_PAUSE).and_then(|v| v.parse().ok()).map_or(45, |v: i64| v.clamp(1, 1440)),
         daily_limit: kv_get(db, K_LIMIT).and_then(|v| v.parse().ok()).map_or(5, |v: i64| v.clamp(1, 50)),
+        window_start: kv_get(db, K_WINDOW_START).and_then(|v| v.parse().ok()).map_or(0, |v: i64| v.clamp(0, DAY_MIN)),
+        window_end: kv_get(db, K_WINDOW_END).and_then(|v| v.parse().ok()).map_or(DAY_MIN, |v: i64| v.clamp(0, DAY_MIN)),
     }
 }
 
@@ -232,9 +243,12 @@ pub(crate) fn resolve_job(db: &Connection, id: i64, action: &str) -> Result<(), 
         }
         "mark_done" if ["failed", "needs_check"].contains(&job.state.as_str()) => {
             db.execute("UPDATE publish_jobs SET state = 'done', sent_at = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![id, now_unix()]).map_err(err)?;
+            let account: Option<i64> = db.query_row("SELECT account_id FROM publish_jobs WHERE id = ?1", [id], |r| r.get(0)).ok().flatten();
             // чтобы на карточке ролика было видно, что он выложен, и повторный запуск его не тронул
             if let Ok(post) = begin_post(db, job.draft_id, "browser", "browser") {
                 finish_post(db, post, &Ok(("Выложено (отмечено вручную)".to_string(), None)));
+                // «он вышел» тоже входит в суточный лимит того аккаунта, с которого шла выкладка
+                mark_sent(db, post, account);
             }
         }
         "remove" if job.state != "sending" => {
@@ -253,7 +267,8 @@ pub(crate) fn start_jobs(db: &Connection, project_id: i64) -> Result<usize, Stri
         validate_job(&j.caption, &j.hashtags).map_err(|e| format!("Описание ролика {} не подходит: {e}. Исправь его перед запуском", j.draft_id))?;
     }
     db.execute(
-        "UPDATE publish_jobs SET state = 'queued', not_before = 0, error = NULL, updated_at = unixepoch()
+        // паузу после прошлой выкладки не сбрасываем: иначе «стоп → старт» выпускает следующий ролик сразу
+        "UPDATE publish_jobs SET state = 'queued', error = NULL, updated_at = unixepoch()
          WHERE state = 'ready' AND draft_id IN (SELECT d.id FROM drafts d JOIN moments m ON m.id = d.moment_id WHERE m.project_id = ?1)",
         [project_id],
     )
@@ -281,14 +296,18 @@ pub(crate) fn recover_interrupted_jobs(db: &Connection) {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Выложить эту задачу прямо сейчас.
-    Send(i64),
+    /// Выложить эту задачу с этого аккаунта прямо сейчас.
+    Send { job: i64, account: i64 },
     /// Первая в очереди ждёт паузы до этого времени (unix).
     WaitUntil(i64),
-    /// Суточный лимит выбран; место освободится в это время.
+    /// Сейчас вне окна публикации: ждём, когда окно откроется (unix).
+    OutsideWindow(i64),
+    /// У каждого аккаунта выбран суточный лимит: ждём полуночи (unix).
     LimitReached(i64),
     /// В очереди пусто.
     Idle,
+    /// Ни одного включённого аккаунта: выкладывать не с чего.
+    NoAccounts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,23 +316,119 @@ pub struct QueuedJob {
     pub not_before: i64,
 }
 
-/// Что делать очереди сейчас. Вся логика времени здесь: `now` приходит снаружи, поэтому тесты не ждут по-настоящему,
-/// а после сна компьютера очередь просто видит новое время и идёт дальше.
-/// `queued` — задачи в порядке выкладки; `sent` — времена выкладок (старше суток функция отбрасывает сама).
-pub fn next_action(now: i64, queued: &[QueuedJob], sent: &[i64], daily_limit: i64) -> Action {
-    let Some(first) = queued.first() else { return Action::Idle };
-    let mut recent: Vec<i64> = sent.iter().copied().filter(|t| *t > now - DAY).collect();
-    recent.sort_unstable();
-    let limit = daily_limit.max(1) as usize;
-    if recent.len() >= limit {
-        // место появится, когда из окна в сутки выйдет самая старая из «лишних» выкладок
-        let free_at = recent[recent.len() - limit] + DAY;
-        return Action::LimitReached(free_at.max(first.not_before));
+/// Аккаунт в круге и его выкладки за текущие местные сутки (более ранние в счёт не идут).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub id: i64,
+    pub sent: Vec<i64>,
+}
+
+/// Всё, что нужно планировщику в этот момент. Время и часовой пояс приходят снаружи, поэтому тесты не ждут
+/// и не зависят от часов машины; после сна компьютера очередь просто видит новое время.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    /// Сейчас, unix-секунды.
+    pub now: i64,
+    /// Смещение местного времени от UTC, секунды.
+    pub offset: i64,
+    /// Окно публикации, минуты от местной полуночи.
+    pub window_start: i64,
+    pub window_end: i64,
+    pub daily_limit: i64,
+    /// Включённые аккаунты в порядке круга.
+    pub accounts: Vec<Turn>,
+    /// Аккаунт последней выкладки: следующим идёт тот, что стоит после него.
+    pub last: Option<i64>,
+}
+
+impl Plan {
+    /// Начало местных суток (unix).
+    fn day_start(&self) -> i64 {
+        day_start(self.now, self.offset)
     }
-    if first.not_before > now {
+
+    /// Местная минута суток.
+    fn minute(&self) -> i64 {
+        (self.now + self.offset).rem_euclid(DAY) / 60
+    }
+
+    fn in_window(&self) -> bool {
+        let (start, end, minute) = (self.window_start, self.window_end, self.minute());
+        if start == end {
+            true
+        } else if start < end {
+            (start..end).contains(&minute)
+        } else {
+            minute >= start || minute < end
+        }
+    }
+}
+
+/// Начало местных суток (unix) для момента `now` при смещении `offset`.
+fn day_start(now: i64, offset: i64) -> i64 {
+    now - (now + offset).rem_euclid(DAY)
+}
+
+/// Смещение местного времени от UTC на момент `now`, секунды.
+fn local_offset(now: i64) -> i64 {
+    Local.timestamp_opt(now, 0).single().map_or(0, |t| t.offset().local_minus_utc() as i64)
+}
+
+/// Что делать очереди сейчас. `queued` — задачи в порядке выкладки. Сначала окно публикации, потом аккаунт, потом пауза.
+/// Аккаунт не занят, пока у него не выбран суточный лимит; за выбор аккаунта отвечает `pick_account`.
+pub fn next_action(plan: &Plan, queued: &[QueuedJob]) -> Action {
+    let Some(first) = queued.first() else { return Action::Idle };
+    if plan.accounts.is_empty() {
+        return Action::NoAccounts;
+    }
+    if !plan.in_window() {
+        return Action::OutsideWindow(next_open(plan));
+    }
+    let Some(account) = pick_account(plan) else {
+        return Action::LimitReached((plan.day_start() + DAY).max(first.not_before));
+    };
+    if first.not_before > plan.now {
         return Action::WaitUntil(first.not_before);
     }
-    Action::Send(first.id)
+    Action::Send { job: first.id, account }
+}
+
+/// Когда окно откроется в следующий раз: сегодня или завтра.
+fn next_open(plan: &Plan) -> i64 {
+    let at = plan.day_start() + plan.window_start * 60;
+    if at > plan.now { at } else { at + DAY }
+}
+
+/// Аккаунт для следующей выкладки: по кругу после выложившего последним, пропуская тех, у кого лимит на сутки выбран.
+fn pick_account(plan: &Plan) -> Option<i64> {
+    let n = plan.accounts.len();
+    let first = plan.last.and_then(|last| plan.accounts.iter().position(|a| a.id == last)).map_or(0, |i| i + 1);
+    let (day, limit) = (plan.day_start(), plan.daily_limit.max(1) as usize);
+    (0..n)
+        .map(|k| &plan.accounts[(first + k) % n])
+        .find(|a| a.sent.iter().filter(|t| **t >= day).count() < limit)
+        .map(|a| a.id)
+}
+
+/// Состояние для планировщика: настройки, включённые аккаунты с выкладками за сутки и аккаунт последней выкладки.
+pub(crate) fn make_plan(db: &Connection, now: i64) -> Plan {
+    let settings = load_settings(db);
+    let offset = local_offset(now);
+    let mut accounts: Vec<Turn> = accounts::enabled_ids(db).unwrap_or_default().into_iter().map(|id| Turn { id, sent: vec![] }).collect();
+    for (account, at) in accounts::sent_since(db, day_start(now, offset)).unwrap_or_default() {
+        if let Some(turn) = accounts.iter_mut().find(|t| t.id == account) {
+            turn.sent.push(at);
+        }
+    }
+    Plan {
+        now,
+        offset,
+        window_start: settings.window_start,
+        window_end: settings.window_end,
+        daily_limit: settings.daily_limit,
+        accounts,
+        last: accounts::last_sender(db),
+    }
 }
 
 fn queued_jobs(db: &Connection, project_id: i64) -> Vec<QueuedJob> {
@@ -324,12 +439,6 @@ fn queued_jobs(db: &Connection, project_id: i64) -> Vec<QueuedJob> {
         return vec![];
     };
     st.query_map([project_id], |r| Ok(QueuedJob { id: r.get(0)?, not_before: r.get(1)? })).map(|r| r.flatten().collect()).unwrap_or_default()
-}
-
-/// Времена выкладок за последние сутки по всем проектам: лимит относится к аккаунту, а не к проекту.
-fn sent_times(db: &Connection, now: i64) -> Vec<i64> {
-    let Ok(mut st) = db.prepare("SELECT sent_at FROM publish_jobs WHERE sent_at IS NOT NULL AND sent_at > ?1") else { return vec![] };
-    st.query_map([now - DAY], |r| r.get(0)).map(|r| r.flatten().collect()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- события
@@ -511,10 +620,30 @@ fn fail_job(db: &Connection, job_id: i64, message: String) -> String {
     message
 }
 
-/// Выкладывает одну задачу. `Err` — очередь надо остановить; текст ошибки идёт в панель.
-async fn send_job(app: &AppHandle, job_id: i64) -> Result<(), String> {
+/// Файл для пула: копия финала без надписи «Часть N». Собирается заново, только если финал новее копии.
+async fn pool_file(app: &AppHandle, draft_id: i64, final_file: &Path) -> anyhow::Result<PathBuf> {
     let state = app.state::<AppState>();
-    let (draft_id, project_id, file, caption, post_id) = {
+    let out = state.data_dir.join("pool").join(format!("draft_{draft_id}.mp4"));
+    if !(out.is_file() && is_newer(&out, final_file)) {
+        let reporter = app.clone();
+        render_pool_copy(app, draft_id, &out, move |fraction| {
+            let _ = reporter.emit("post-progress", PostProgress { draft_id, fraction, message: "Готовлю ролик без надписи «Часть» для пула".into() });
+        })
+        .await?;
+    }
+    Ok(out)
+}
+
+/// `a` записан не раньше `b`. Если времени не узнать, считаем, что не новее.
+fn is_newer(a: &Path, b: &Path) -> bool {
+    let at = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    matches!((at(a), at(b)), (Some(x), Some(y)) if x >= y)
+}
+
+/// Выкладывает одну задачу с выбранного аккаунта. `Err` — очередь надо остановить; текст ошибки идёт в панель.
+async fn send_job(app: &AppHandle, job_id: i64, account: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (draft_id, project_id, file, caption, post_id, profile, pool) = {
         let db = state.db.0.lock().unwrap();
         let (draft_id, caption, tags_json): (i64, String, String) = db
             .query_row("SELECT draft_id, caption, hashtags FROM publish_jobs WHERE id = ?1 AND state = 'queued'", [job_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -534,14 +663,21 @@ async fn send_job(app: &AppHandle, job_id: i64) -> Result<(), String> {
         if state.posting.lock().unwrap().contains(&draft_id) {
             return Err(fail_job(&db, job_id, "Этот ролик уже отправляется другим способом".into()));
         }
-        db.execute("UPDATE publish_jobs SET state = 'sending', attempts = attempts + 1, error = NULL, updated_at = unixepoch() WHERE id = ?1", [job_id]).map_err(err)?;
+        let profile = accounts::profile_dir(&db, &state.data_dir, Some(account)).map_err(|e| fail_job(&db, job_id, e))?;
+        // два и больше включённых аккаунта — пул: ролик выходит без надписи «Часть N»
+        let pool = accounts::enabled_ids(&db).map_err(err)?.len() > 1;
+        db.execute("UPDATE publish_jobs SET state = 'sending', attempts = attempts + 1, account_id = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![job_id, account]).map_err(err)?;
         let post_id = begin_post(&db, draft_id, "browser", "browser").map_err(err)?;
-        (draft_id, d.project_id, file, make_caption(&caption, &tags, CAPTION_LIMIT), post_id)
+        (draft_id, d.project_id, file, make_caption(&caption, &tags, CAPTION_LIMIT), post_id, profile, pool)
     };
     state.posting.lock().unwrap().insert(draft_id);
     changed(app, project_id);
 
-    let result = run_browser_post(app, draft_id, BrowserPost { file, caption, auto_publish: true, require_confirmation: true, close_on_success: true }).await;
+    let result = async {
+        let file = if pool { pool_file(app, draft_id, &file).await.map_err(|e| e.context("не собрался ролик без надписи «Часть» для пула"))? } else { file };
+        run_browser_post(app, draft_id, BrowserPost { file, caption, auto_publish: true, require_confirmation: true, close_on_success: true, profile }).await
+    }
+    .await;
     state.posting.lock().unwrap().remove(&draft_id);
 
     match result {
@@ -551,6 +687,7 @@ async fn send_job(app: &AppHandle, job_id: i64) -> Result<(), String> {
                 let db = state.db.0.lock().unwrap();
                 let now = now_unix();
                 finish_post(&db, post_id, &Ok((detail.clone(), None)));
+                mark_sent(&db, post_id, Some(account));
                 let _ = db.execute("UPDATE publish_jobs SET state = 'done', sent_at = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![job_id, now]);
                 // пауза отсчитывается от выхода этого ролика и сдвигает остальных
                 let _ = db.execute("UPDATE publish_jobs SET not_before = ?1 WHERE state = 'queued'", [now + load_settings(&db).pause_min * 60]);
@@ -587,16 +724,17 @@ async fn run_queue(app: AppHandle, project_id: i64, mut stop: watch::Receiver<bo
         let now = now_unix();
         let action = {
             let db = state.db.0.lock().unwrap();
-            next_action(now, &queued_jobs(&db, project_id), &sent_times(&db, now), load_settings(&db).daily_limit)
+            next_action(&make_plan(&db, now), &queued_jobs(&db, project_id))
         };
         match action {
             Action::Idle => break None,
-            Action::Send(id) => {
-                if let Err(message) = send_job(&app, id).await {
+            Action::NoAccounts => break Some("Нет включённых аккаунтов: включи хотя бы один в списке аккаунтов".into()),
+            Action::Send { job, account } => {
+                if let Err(message) = send_job(&app, job, account).await {
                     break Some(format!("Очередь остановлена: {message}"));
                 }
             }
-            Action::WaitUntil(ts) | Action::LimitReached(ts) => {
+            Action::WaitUntil(ts) | Action::OutsideWindow(ts) | Action::LimitReached(ts) => {
                 changed(&app, project_id);
                 // просыпаемся не реже чем раз в 30 с: часы могли уйти вперёд (сон компьютера), а настройки — измениться
                 let secs = (ts - now).clamp(1, 30) as u64;
@@ -623,6 +761,10 @@ async fn run_queue(app: AppHandle, project_id: i64, mut stop: watch::Receiver<bo
 pub struct QueueDto {
     jobs: Vec<JobDto>,
     settings: QueueSettings,
+    /// Пул аккаунтов: круг, выкладки за сутки и основной аккаунт.
+    accounts: Vec<accounts::AccountDto>,
+    /// Два и больше включённых аккаунта: тогда ролики выходят без надписи «Часть N».
+    pool: bool,
     running: bool,
     generating: bool,
     sent_today: i64,
@@ -643,15 +785,19 @@ fn build_state(state: &AppState, project_id: i64) -> CmdResult<QueueDto> {
     let db = state.db.0.lock().unwrap();
     let settings = load_settings(&db);
     let jobs = jobs_for_project(&db, project_id).map_err(err)?;
-    let sent = sent_times(&db, now);
-    let action = next_action(now, &queued_jobs(&db, project_id), &sent, settings.daily_limit);
+    let plan = make_plan(&db, now);
+    let action = next_action(&plan, &queued_jobs(&db, project_id));
     let (next_at, limit_note) = match action {
         Action::WaitUntil(t) => (Some(t), None),
-        Action::LimitReached(t) => (Some(t), Some(format!("Суточный лимит ({}) выбран: следующий ролик выйдет, когда освободится место.", settings.daily_limit))),
+        Action::OutsideWindow(t) => (Some(t), Some("Сейчас вне окна публикации: очередь ждёт, когда окно откроется.".to_string())),
+        Action::LimitReached(t) => (Some(t), Some(format!("Суточный лимит на аккаунт ({}) выбран: очередь продолжится с полуночи.", settings.daily_limit))),
         _ => (None, None),
     };
+    let pool_accounts = accounts::list(&db, plan.day_start()).map_err(err)?;
     Ok(QueueDto {
-        sent_today: sent.iter().filter(|t| **t > now - DAY).count() as i64,
+        sent_today: pool_accounts.iter().map(|a| a.sent_today).sum(),
+        pool: plan.accounts.len() > 1,
+        accounts: pool_accounts,
         jobs,
         settings,
         running,
@@ -695,10 +841,12 @@ pub fn queue_job_resolve(app: AppHandle, state: State<'_, AppState>, id: i64, ac
 }
 
 #[tauri::command]
-pub fn queue_settings_set(state: State<'_, AppState>, pause_min: i64, daily_limit: i64) -> CmdResult<QueueSettings> {
+pub fn queue_settings_set(state: State<'_, AppState>, pause_min: i64, daily_limit: i64, window_start: i64, window_end: i64) -> CmdResult<QueueSettings> {
     let db = state.db.0.lock().unwrap();
     kv_set(&db, K_PAUSE, &pause_min.clamp(1, 1440).to_string()).map_err(err)?;
     kv_set(&db, K_LIMIT, &daily_limit.clamp(1, 50).to_string()).map_err(err)?;
+    kv_set(&db, K_WINDOW_START, &window_start.clamp(0, DAY_MIN).to_string()).map_err(err)?;
+    kv_set(&db, K_WINDOW_END, &window_end.clamp(0, DAY_MIN).to_string()).map_err(err)?;
     Ok(load_settings(&db))
 }
 
@@ -716,6 +864,10 @@ pub fn queue_start(app: AppHandle, state: State<'_, AppState>, project_id: i64, 
     }
     if state.publisher.lock().unwrap().is_some() {
         return Err("Очередь уже идёт".into());
+    }
+    let has_accounts = !accounts::enabled_ids(&state.db.0.lock().unwrap()).map_err(err)?.is_empty();
+    if !has_accounts {
+        return Err("Нет включённых аккаунтов: включи хотя бы один в списке аккаунтов".into());
     }
     start_jobs(&state.db.0.lock().unwrap(), project_id)?;
     let (tx, rx) = watch::channel(false);
@@ -760,44 +912,115 @@ mod tests {
         QueuedJob { id, not_before }
     }
 
+    /// План без окна и с часовым поясом UTC. `accounts` — круг: (аккаунт, его выкладки).
+    fn plan(now: i64, accounts: Vec<(i64, Vec<i64>)>, last: Option<i64>, limit: i64) -> Plan {
+        Plan {
+            now,
+            offset: 0,
+            window_start: 0,
+            window_end: DAY_MIN,
+            daily_limit: limit,
+            accounts: accounts.into_iter().map(|(id, sent)| Turn { id, sent }).collect(),
+            last,
+        }
+    }
+
+    /// То же окно, что и `plan`, но с заданными границами (минуты от полуночи).
+    fn windowed(now: i64, start: i64, end: i64) -> Plan {
+        Plan { window_start: start, window_end: end, ..plan(now, vec![(1, vec![])], None, 5) }
+    }
+
     #[test]
-    fn an_empty_queue_is_idle_and_a_free_one_sends_the_first_job() {
-        assert_eq!(next_action(1000, &[], &[], 5), Action::Idle);
-        assert_eq!(next_action(1000, &[q(7, 0), q(8, 0)], &[], 5), Action::Send(7));
-        assert_eq!(next_action(1000, &[q(7, 1000)], &[], 5), Action::Send(7), "ровно в срок — уже можно");
+    fn an_empty_queue_is_idle_and_no_accounts_is_its_own_answer() {
+        assert_eq!(next_action(&plan(1000, vec![(1, vec![])], None, 5), &[]), Action::Idle);
+        assert_eq!(next_action(&plan(1000, vec![], None, 5), &[q(7, 0)]), Action::NoAccounts);
+    }
+
+    #[test]
+    fn a_free_account_sends_the_first_job_in_time() {
+        let p = plan(1000, vec![(1, vec![])], None, 5);
+        assert_eq!(next_action(&p, &[q(7, 0), q(8, 0)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(next_action(&p, &[q(7, 1000)]), Action::Send { job: 7, account: 1 }, "ровно в срок — уже можно");
     }
 
     #[test]
     fn the_pause_between_videos_is_waited_out() {
-        assert_eq!(next_action(1000, &[q(7, 1900), q(8, 0)], &[900], 5), Action::WaitUntil(1900));
-        assert_eq!(next_action(1900, &[q(7, 1900)], &[900], 5), Action::Send(7));
+        assert_eq!(next_action(&plan(1000, vec![(1, vec![])], Some(2), 5), &[q(7, 1900), q(8, 0)]), Action::WaitUntil(1900));
+        assert_eq!(next_action(&plan(1900, vec![(1, vec![])], Some(2), 5), &[q(7, 1900)]), Action::Send { job: 7, account: 1 });
     }
 
     #[test]
-    fn the_daily_limit_blocks_until_the_oldest_post_leaves_the_window() {
-        let now = 10 * DAY;
-        // за сутки выложено три при лимите три: ждём, пока самая старая выйдет за 24 часа
-        let sent = [now - 3000, now - 2000, now - 1000];
-        assert_eq!(next_action(now, &[q(1, 0)], &sent, 3), Action::LimitReached(now - 3000 + DAY));
-        // а старше суток в счёт не идёт
-        assert_eq!(next_action(now, &[q(1, 0)], &[now - DAY - 1, now - 2000, now - 1000], 3), Action::Send(1));
-        // пауза позже освобождения места — ждём паузу
-        assert_eq!(next_action(now, &[q(1, now + 2 * DAY)], &sent, 3), Action::LimitReached(now + 2 * DAY));
+    fn the_videos_go_round_the_pool_and_skip_an_account_at_its_limit() {
+        let now = 10 * DAY + 3600;
+        // после аккаунта 1 идёт 2
+        assert_eq!(next_action(&plan(now, vec![(1, vec![]), (2, vec![]), (3, vec![])], Some(1), 1), &[q(7, 0)]), Action::Send { job: 7, account: 2 });
+        // у 2 лимит выбран, очередь переходит к 3
+        assert_eq!(next_action(&plan(now, vec![(1, vec![]), (2, vec![now - 60]), (3, vec![])], Some(1), 1), &[q(7, 0)]), Action::Send { job: 7, account: 3 });
+        // за последним идёт первый
+        assert_eq!(next_action(&plan(now, vec![(1, vec![]), (2, vec![])], Some(2), 1), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        // без истории, или если последний аккаунт уже не в круге, начинаем с первого
+        assert_eq!(next_action(&plan(now, vec![(4, vec![]), (5, vec![])], None, 1), &[q(7, 0)]), Action::Send { job: 7, account: 4 });
+        assert_eq!(next_action(&plan(now, vec![(4, vec![]), (5, vec![])], Some(99), 1), &[q(7, 0)]), Action::Send { job: 7, account: 4 });
     }
 
     #[test]
-    fn a_lowered_limit_waits_for_enough_old_posts_to_expire() {
-        let now = 10 * DAY;
-        let sent = [now - 5000, now - 4000, now - 3000, now - 2000];
-        // выложено 4, лимит 2: нужно, чтобы вышли две самые старые, значит ждём третью по возрасту
-        assert_eq!(next_action(now, &[q(1, 0)], &sent, 2), Action::LimitReached(now - 3000 + DAY));
+    fn the_daily_limit_is_per_account_and_waits_for_midnight_when_everyone_is_at_it() {
+        let now = 10 * DAY + 12 * 3600;
+        let midnight = 11 * DAY;
+        assert_eq!(next_action(&plan(now, vec![(1, vec![now - 3000]), (2, vec![now - 2000])], None, 1), &[q(7, 0)]), Action::LimitReached(midnight));
+        // лимит 2: у первого две выкладки, у второго одна — второй ещё может
+        let uneven = vec![(1, vec![now - 3000, now - 2500]), (2, vec![now - 2000])];
+        assert_eq!(next_action(&plan(now, uneven, None, 2), &[q(7, 0)]), Action::Send { job: 7, account: 2 });
+        // пауза позже полуночи: ждём её
+        assert_eq!(next_action(&plan(now, vec![(1, vec![now - 3000])], None, 1), &[q(7, now + 2 * DAY)]), Action::LimitReached(now + 2 * DAY));
+    }
+
+    #[test]
+    fn a_day_is_a_calendar_day_so_yesterdays_posts_do_not_count() {
+        let now = 10 * DAY + 60;
+        // вчера в 23:59 — не в счёт, хотя с той выкладки прошло меньше суток
+        assert_eq!(next_action(&plan(now, vec![(1, vec![10 * DAY - 60])], None, 1), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        // сегодня в 00:00:30 — в счёт
+        assert_eq!(next_action(&plan(now, vec![(1, vec![10 * DAY + 30])], None, 1), &[q(7, 0)]), Action::LimitReached(11 * DAY));
+    }
+
+    #[test]
+    fn midnight_is_the_users_local_midnight() {
+        // Москва, UTC+3: местная полночь 10-го дня наступает раньше, чем в UTC
+        let offset = 3 * 3600;
+        let now = 10 * DAY - offset + 1800; // 00:30 по местному времени
+        let p = Plan { now, offset, ..plan(now, vec![(1, vec![10 * DAY - offset - 1800])], None, 1) };
+        assert_eq!(next_action(&p, &[q(7, 0)]), Action::Send { job: 7, account: 1 }, "23:30 вчера по местному — не сегодня");
+        let p = Plan { accounts: vec![Turn { id: 1, sent: vec![now - 10] }], ..p };
+        assert_eq!(next_action(&p, &[q(7, 0)]), Action::LimitReached(11 * DAY - offset), "следующая местная полночь");
+    }
+
+    #[test]
+    fn the_window_holds_the_queue_outside_it_and_opens_it_on_time() {
+        let at = |h: i64| 10 * DAY + h * 3600;
+        // окно 10:00–22:00
+        assert_eq!(next_action(&windowed(at(12), 600, 1320), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(next_action(&windowed(at(10), 600, 1320), &[q(7, 0)]), Action::Send { job: 7, account: 1 }, "ровно в начало — уже можно");
+        assert_eq!(next_action(&windowed(at(9), 600, 1320), &[q(7, 0)]), Action::OutsideWindow(at(10)), "до открытия — сегодняшнее открытие");
+        assert_eq!(next_action(&windowed(at(22), 600, 1320), &[q(7, 0)]), Action::OutsideWindow(11 * DAY + 10 * 3600), "после закрытия — завтрашнее");
+        // одинаковые начало и конец — без ограничения
+        assert_eq!(next_action(&windowed(at(3), 600, 600), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+    }
+
+    #[test]
+    fn a_window_past_midnight_covers_the_night() {
+        let at = |h: i64| 10 * DAY + h * 3600;
+        // окно 22:00–06:00
+        assert_eq!(next_action(&windowed(at(23), 1320, 360), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(next_action(&windowed(at(3), 1320, 360), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(next_action(&windowed(at(12), 1320, 360), &[q(7, 0)]), Action::OutsideWindow(at(22)));
     }
 
     #[test]
     fn after_the_computer_sleeps_the_queue_just_sees_the_new_time() {
         let jobs = [q(1, 5000)];
-        assert_eq!(next_action(1000, &jobs, &[], 5), Action::WaitUntil(5000));
-        assert_eq!(next_action(900_000, &jobs, &[], 5), Action::Send(1));
+        assert_eq!(next_action(&plan(1000, vec![(1, vec![])], None, 5), &jobs), Action::WaitUntil(5000));
+        assert_eq!(next_action(&plan(900_000, vec![(1, vec![])], None, 5), &jobs), Action::Send { job: 1, account: 1 });
     }
 
     fn db() -> Connection {
@@ -1000,7 +1223,7 @@ mod tests {
 
         resolve_job(&c, ids[1], "mark_done").unwrap();
         assert_eq!(job_by_id(&c, ids[1]).unwrap().state, "done");
-        assert_eq!(sent_times(&c, now_unix()).len(), 1, "«он вышел» входит в суточный счёт");
+        assert_eq!(make_plan(&c, now_unix()).accounts[0].sent.len(), 1, "«он вышел» входит в суточный счёт основного аккаунта");
         let posts = latest_posts(&c, 1).unwrap();
         assert!(posts.iter().any(|p| p.draft_id == 1 && p.status == "done" && was_published(p)), "{posts:?}");
 
@@ -1048,10 +1271,12 @@ mod tests {
     #[test]
     fn settings_default_to_a_cautious_pace_and_clamp_garbage() {
         let c = db();
-        assert_eq!(load_settings(&c), QueueSettings { pause_min: 45, daily_limit: 5 });
+        assert_eq!(load_settings(&c), QueueSettings { pause_min: 45, daily_limit: 5, window_start: 0, window_end: DAY_MIN });
         kv_set(&c, K_PAUSE, "0").unwrap();
         kv_set(&c, K_LIMIT, "9999").unwrap();
-        assert_eq!(load_settings(&c), QueueSettings { pause_min: 1, daily_limit: 50 });
+        kv_set(&c, K_WINDOW_START, "-5").unwrap();
+        kv_set(&c, K_WINDOW_END, "99999").unwrap();
+        assert_eq!(load_settings(&c), QueueSettings { pause_min: 1, daily_limit: 50, window_start: 0, window_end: DAY_MIN });
         kv_set(&c, K_PAUSE, "не число").unwrap();
         assert_eq!(load_settings(&c).pause_min, 45);
     }
