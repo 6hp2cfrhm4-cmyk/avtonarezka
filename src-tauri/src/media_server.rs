@@ -70,6 +70,12 @@ impl MediaServer {
             .route("/dev/tiktok_login", get(dev_tt_login))
             .route("/dev/tiktok_publish", get(dev_tt_publish))
             .route("/dev/tiktok_reset", get(dev_tt_reset))
+            .route("/dev/queue_state", get(dev_queue_state))
+            .route("/dev/queue_prepare", get(dev_queue_prepare))
+            .route("/dev/queue_start", get(dev_queue_start))
+            .route("/dev/queue_stop", get(dev_queue_stop))
+            .route("/dev/queue_apply", get(dev_queue_apply))
+            .route("/dev/queue_settings", get(dev_queue_settings))
             .route("/dev/yt_analyze", get(dev_yt_analyze))
             .route("/dev/yt_download", get(dev_yt_download))
             .route("/dev/yt_cancel", get(dev_yt_cancel))
@@ -203,6 +209,39 @@ async fn dev_rerender(State(st): State<Shared>, Query(q): Query<HashMap<String, 
 #[cfg(debug_assertions)]
 async fn dev_finals(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
     reply(project_id(&q).and_then(|id| crate::dev_tools::finals(&st.app, id)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_state(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_state(&st.app, id)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_prepare(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    match project_id(&q) {
+        Ok(id) => reply(crate::dev_tools::queue_prepare(&st.app, id).await),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_start(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_start(&st.app, id)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_stop(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_stop(&st.app, id)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_apply(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_apply_text(&st.app, id, &q)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_settings(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(crate::dev_tools::queue_settings(&st.app, &q))
 }
 
 #[cfg(debug_assertions)]

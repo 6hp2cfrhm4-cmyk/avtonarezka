@@ -8,6 +8,7 @@ import { Arrow, Check } from "../components/icons";
 import Tilt from "../components/Tilt";
 import TikTokPanel from "../components/TikTokPanel";
 import PublishDialog from "../components/PublishDialog";
+import AutoPublishPanel, { STATE_LABEL as JOB_LABEL } from "../components/AutoPublishPanel";
 
 const FINAL: DraftStatus[] = ["approved", "final_queued", "final_rendering", "final_done", "final_failed"];
 const LABEL: Partial<Record<DraftStatus, string>> = {
@@ -106,6 +107,8 @@ export default function FinalScreen() {
         </AnimatePresence>
       </div>
 
+      {count(["final_done"]) > 0 && <AutoPublishPanel />}
+
       {finals.length === 0 ? (
         <motion.div initial={{ opacity: 0, rotateX: 15, y: 30 }} animate={{ opacity: 1, rotateX: 0, y: 0 }} className="glass grid place-items-center gap-5 rounded-[28px] p-14 text-center">
           <div className="grid h-16 w-16 place-items-center rounded-2xl bg-white/10 text-white/60"><Check size={30} /></div>
@@ -146,6 +149,7 @@ const FinalCard = memo(function FinalCard({
   const notify = useUi((s) => s.notify);
   const post = useUi((s) => s.posts[d.id]);
   const sending = useUi((s) => s.postProgress[d.id]);
+  const job = useUi((s) => s.queueJobs[d.id]);
   const poster = useMediaUrl(d.posterPath, d.updatedAt);
   const busy = d.status === "final_queued" || d.status === "final_rendering";
   const done = d.status === "final_done";
@@ -204,6 +208,11 @@ const FinalCard = memo(function FinalCard({
                 ) : post?.status === "failed" ? (
                   <span className="line-clamp-2 text-[#ff8da1]">TikTok: {post.error}</span>
                 ) : null}
+              </div>
+            )}
+            {done && job && job.state !== "done" && (
+              <div className={`text-[11px] leading-snug ${job.state === "failed" || job.state === "needs_check" ? "text-[#ffb020]" : "text-white/70"}`} title={job.error ?? undefined}>
+                Автовыкладка: {JOB_LABEL[job.state]}
               </div>
             )}
             <div className="flex gap-1.5">

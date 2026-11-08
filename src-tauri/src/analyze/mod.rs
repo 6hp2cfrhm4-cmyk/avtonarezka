@@ -1,6 +1,7 @@
 //! Поиск интересных моментов: сигналы звука и картинки → кривая интереса → кандидаты.
 
 pub mod audio;
+pub mod describe;
 pub mod events;
 pub mod gpu;
 pub mod llm;

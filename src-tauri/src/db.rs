@@ -103,6 +103,24 @@ const SCHEMA_V5: &str = r#"
 ALTER TABLE projects ADD COLUMN tight INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Автовыкладка: на каждый готовый ролик одна задача с его описанием и хэштегами.
+const SCHEMA_V6: &str = r#"
+CREATE TABLE publish_jobs (
+    id         INTEGER PRIMARY KEY,
+    draft_id   INTEGER NOT NULL UNIQUE REFERENCES drafts(id) ON DELETE CASCADE,
+    caption    TEXT NOT NULL DEFAULT '',
+    hashtags   TEXT NOT NULL DEFAULT '[]',
+    state      TEXT NOT NULL DEFAULT 'drafting',
+    error      TEXT,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    not_before INTEGER NOT NULL DEFAULT 0,
+    sent_at    INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX publish_jobs_by_state ON publish_jobs(state, id);
+"#;
+
 pub fn open(path: &Path) -> anyhow::Result<Db> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
@@ -131,6 +149,10 @@ pub(crate) fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version < 5 {
         conn.execute_batch(SCHEMA_V5)?;
         conn.pragma_update(None, "user_version", 5)?;
+    }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6)?;
+        conn.pragma_update(None, "user_version", 6)?;
     }
     Ok(())
 }

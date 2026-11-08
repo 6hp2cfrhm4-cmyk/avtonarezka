@@ -15,6 +15,7 @@ mod media_server;
 pub mod models;
 pub mod platform;
 mod state;
+mod publish_queue;
 mod tiktok_cmds;
 pub mod vulkan_loader;
 mod youtube_cmds;
@@ -49,6 +50,7 @@ pub fn run() {
             install_fonts(&data_dir.join("fonts"))?;
             drafts::recover_interrupted(&db.0.lock().unwrap());
             tiktok_cmds::recover_interrupted_posts(&db.0.lock().unwrap());
+            publish_queue::recover_interrupted_jobs(&db.0.lock().unwrap());
             app.manage(state::AppState {
                 db,
                 media,
@@ -61,6 +63,9 @@ pub fn run() {
                 secrets: tiktok::secrets::Secrets::detect(),
                 login: Default::default(),
                 posting: Default::default(),
+                publisher: Default::default(),
+                drafting: Default::default(),
+                queue_note: Default::default(),
                 downloads: Default::default(),
                 youtube_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             });
@@ -109,6 +114,16 @@ pub fn run() {
             tiktok_cmds::tiktok_logout,
             tiktok_cmds::tiktok_publish,
             tiktok_cmds::posts_list,
+            publish_queue::queue_state,
+            publish_queue::queue_prepare,
+            publish_queue::queue_prepare_cancel,
+            publish_queue::queue_apply_text,
+            publish_queue::queue_job_update,
+            publish_queue::queue_job_resolve,
+            publish_queue::queue_settings_set,
+            publish_queue::queue_start,
+            publish_queue::queue_pause,
+            publish_queue::queue_stop,
             youtube_cmds::youtube_analyze,
             youtube_cmds::youtube_download,
             youtube_cmds::youtube_cancel,

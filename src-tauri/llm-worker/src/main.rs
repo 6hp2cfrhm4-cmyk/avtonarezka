@@ -1,6 +1,7 @@
 //! Воркер LLM. Протокол: по строке JSON на запрос в stdin, по строке JSON на ответ в stdout.
 //!
 //!   → {"id":1,"prompt":"<|im_start|>…","grammar":"root ::= …","maxTokens":300,"temperature":0.2}
+//!     (необязательно: "seed":42, "repeatPenalty":1.15)
 //!   ← {"id":1,"text":"{…}","promptTokens":812,"generated":97}
 //!   ← {"id":2,"error":"…"}            (воркер при этом продолжает жить)
 //!
@@ -37,6 +38,12 @@ struct Request {
     max_tokens: u32,
     #[serde(default)]
     temperature: f32,
+    /// Зерно выбора слов. Без него — 1234, как раньше: прежние запросы дают прежние ответы.
+    #[serde(default)]
+    seed: Option<u32>,
+    /// Штраф за повтор слов (1.0 и меньше — выключен). Нужен длинным текстам: без него маленькая модель ходит по кругу.
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
 }
 
 #[derive(Serialize, Default)]
@@ -120,8 +127,12 @@ fn generate(backend: &LlamaBackend, model: &LlamaModel, s: &Settings, req: &Requ
     if let Some(g) = &req.grammar {
         chain.push(LlamaSampler::grammar(model, g, "root").context("неверная грамматика")?);
     }
+    if let Some(p) = req.repeat_penalty.filter(|p| *p > 1.0) {
+        // смотрим назад на 256 токенов: хватает, чтобы не повторять недавние фразы, и не душит обычные слова
+        chain.push(LlamaSampler::penalties(model.n_vocab(), 256, p, 0.0, 0.0));
+    }
     if req.temperature > 0.0 {
-        chain.extend([LlamaSampler::top_k(20), LlamaSampler::temp(req.temperature), LlamaSampler::dist(1234)]);
+        chain.extend([LlamaSampler::top_k(20), LlamaSampler::temp(req.temperature), LlamaSampler::dist(req.seed.unwrap_or(1234))]);
     } else {
         chain.push(LlamaSampler::greedy());
     }

@@ -137,6 +137,35 @@ pub async fn tiktok_publish(app: &AppHandle, q: &std::collections::HashMap<Strin
     serde_json::to_string(&r).map_err(|e| e.to_string())
 }
 
+/// Очередь автовыкладки: состояние, написание описаний, запуск (с согласием, как кнопка в диалоге), остановка.
+pub fn queue_state(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    let q = crate::publish_queue::queue_state(app.state(), project_id)?;
+    serde_json::to_string(&q).map_err(|e| e.to_string())
+}
+
+pub async fn queue_prepare(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    crate::publish_queue::queue_prepare(app.clone(), app.state(), project_id).await.map(|_| "описания пишутся".into())
+}
+
+pub fn queue_start(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    crate::publish_queue::queue_start(app.clone(), app.state(), project_id, true).map(|_| "очередь запущена".into())
+}
+
+pub fn queue_stop(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    crate::publish_queue::queue_stop(app.clone(), app.state(), project_id).map(|_| "очередь остановлена".into())
+}
+
+pub fn queue_apply_text(app: &AppHandle, project_id: i64, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
+    let tags = q.get("tags").map(|t| t.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+    crate::publish_queue::queue_apply_text(app.clone(), app.state(), project_id, q.get("text").cloned().unwrap_or_default(), tags).map(|n| format!("текст назначен роликам: {n}"))
+}
+
+pub fn queue_settings(app: &AppHandle, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
+    let get = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok()).ok_or_else(|| format!("нужен ?{k}=<число>"));
+    let s = crate::publish_queue::queue_settings_set(app.state(), get("pause")?, get("limit")?)?;
+    serde_json::to_string(&s).map_err(|e| e.to_string())
+}
+
 /// Убирает все следы проверки: секрет из связки ключей, вход и настройки TikTok.
 pub async fn tiktok_reset(app: &AppHandle) -> Result<String, String> {
     let st = app.state::<crate::state::AppState>();

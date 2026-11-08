@@ -2,12 +2,11 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "motion/react";
 import { api, errText, type Draft, type Privacy } from "../lib/api";
+import { composeCaption, parseTags } from "../lib/caption";
 import { useUi } from "../store";
 import { privacyLabel } from "./TikTokPanel";
 import { Row, Seg } from "./StyleControls";
 
-const parseTags = (t: string) => t.split(/[\s,]+/).map((x) => x.replace(/^#+/, "")).filter(Boolean);
-const joinCaption = (caption: string, tags: string[]) => [caption.trim(), ...tags.map((t) => `#${t}`)].filter(Boolean).join(" ");
 const basename = (p: string | null) => p?.split(/[\\/]/).pop() ?? "";
 
 /** Подтверждение перед отправкой в TikTok: что именно уйдёт и куда. Без клика «Отправить» ничего не происходит. */
@@ -33,7 +32,7 @@ export default function PublishDialog({ draft, onClose, onOpenSettings }: { draf
   const direct = viaApi && tiktok.mode === "direct";
   const inbox = viaApi && tiktok.mode === "inbox";
   const notReady = viaApi ? !tiktok.connected : !tiktok.chromium;
-  const full = joinCaption(caption, parseTags(tags));
+  const full = composeCaption(caption, parseTags(tags));
 
   const copy = () => navigator.clipboard?.writeText(full).then(() => notify("Подпись скопирована")).catch(() => notify("Не удалось скопировать", "error"));
 
@@ -97,7 +96,7 @@ export default function PublishDialog({ draft, onClose, onOpenSettings }: { draf
               <textarea
                 className="mt-1.5 h-24 w-full resize-none rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-accent/60"
                 value={caption}
-                maxLength={2000}
+                maxLength={viaApi ? 2000 : 4000}
                 onChange={(e) => setCaption(e.target.value)}
                 placeholder="Текст под роликом"
               />

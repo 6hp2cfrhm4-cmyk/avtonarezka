@@ -273,16 +273,39 @@ pub fn make_title(caption: &str, hashtags: &[String]) -> String {
             s.push_str(t);
         }
     }
+    cut_utf16(&s, 2200)
+}
+
+/// Не длиннее `limit` единиц UTF-16: так TikTok считает длину подписи.
+pub fn cut_utf16(s: &str, limit: usize) -> String {
     let mut units = 0;
     let mut out = String::new();
     for c in s.chars() {
         units += c.len_utf16();
-        if units > 2200 {
+        if units > limit {
             break;
         }
         out.push(c);
     }
     out
+}
+
+/// Длина в единицах UTF-16.
+pub fn len_utf16(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Подпись для страницы загрузки в браузере: текст, с новой строки хэштеги. Лимит задаёт вызывающий:
+/// у страницы он 4000, у API (`make_title`) 2200. Одна функция для сборки и для подсчёта длины, чтобы они не разошлись.
+pub fn make_caption(caption: &str, hashtags: &[String], limit: usize) -> String {
+    let tags = normalize_hashtags(hashtags).join(" ");
+    let body = caption.trim();
+    let s = match (body.is_empty(), tags.is_empty()) {
+        (_, true) => body.to_string(),
+        (true, false) => tags,
+        (false, false) => format!("{body}\n{tags}"),
+    };
+    cut_utf16(&s, limit)
 }
 
 // ---------------------------------------------------------------- клиент

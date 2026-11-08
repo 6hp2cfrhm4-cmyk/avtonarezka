@@ -134,6 +134,30 @@ you can only publish with "Only me" visibility, and at most 5 drafts per day.
 **Through the browser.** The app opens Chromium or Edge with a separate profile and fills in the upload page. You sign in
 to your account yourself in that window. This depends on TikTok's page layout and can break after a TikTok update.
 
+### Auto-posting every clip
+
+The Final screen has an "Auto-posting to TikTok" panel. It works through the browser only: a long description does not
+fit the API (its caption is limited to 2200 characters).
+
+1. **"Write descriptions"**: the local model writes a separate text for every finished clip from its transcript, plus up to
+   5 hashtags. Together with the hashtags it is exactly 3990–3999 characters. You can edit any description, and the counter
+   shows whether it still fits the window.
+2. **"Start posting"**: after you confirm, the clips go out one at a time. There is a pause between them (45 minutes by
+   default) and at most N clips per rolling 24 hours (5 by default). The app clicks "Post" itself and waits for TikTok to
+   confirm the publication.
+
+Good to know:
+
+- The app has to stay open while the queue runs. After a restart the queue does not start by itself; start it again. If the
+  computer sleeps, the queue carries on by the clock.
+- If TikTok asks you to sign in or pass a check ("I'm not a robot"), the queue pauses. You pass the check yourself in the
+  browser window; the app does not get around it.
+- If there is no confirmation after the "Post" click, the clip is marked "Check in TikTok": it may have gone out. The queue
+  will not send it again until you decide: "It went out", "Send again" or "Remove".
+- The visibility of a clip comes from your account settings in TikTok Studio. Check it before you start.
+- Automating the website is not allowed by TikTok's rules, so your account may get restricted. That is why the default limit
+  is small.
+
 ## Data
 
 Everything lives in `~/.local/share/app.avtonarezka.desktop/` (Windows: `%LOCALAPPDATA%\app.avtonarezka.desktop\`):

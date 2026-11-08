@@ -23,6 +23,12 @@ pub struct AppState {
     pub login: Mutex<Option<watch::Sender<bool>>>,
     /// Ролики, которые прямо сейчас уходят в TikTok.
     pub posting: Mutex<HashSet<i64>>,
+    /// Идущая очередь автовыкладки: сигнал остановки. `Some` — очередь работает.
+    pub publisher: Mutex<Option<watch::Sender<bool>>>,
+    /// Идущее написание описаний: сигнал отмены.
+    pub drafting: Mutex<Option<watch::Sender<bool>>>,
+    /// Почему очередь остановилась в последний раз (капча, сбой): показывается в панели, пока человек не запустит её снова.
+    pub queue_note: Mutex<Option<String>>,
     /// Идущие и ожидающие загрузки с YouTube: id задачи → (id видео, сигнал отмены).
     pub downloads: Mutex<HashMap<String, (String, watch::Sender<bool>)>>,
     /// Качаем одновременно два ролика, остальные ждут своей очереди.

@@ -12,7 +12,7 @@ import DraftsScreen from "./screens/Drafts";
 import FinalScreen from "./screens/Final";
 import { onEvent } from "./lib/events";
 import { listen } from "@tauri-apps/api/event";
-import { api, errText, inTauri, type DoneEvent, type ErrorEvent, type ProgressEvent, type LoginEvent, type PostDoneEvent, type PostFailedEvent, type PostProgressEvent, type RenderDoneEvent, type RenderFailedEvent, type RenderProgressEvent, type YoutubeDoneEvent, type YoutubeErrorEvent, type YoutubeProgressEvent } from "./lib/api";
+import { api, errText, inTauri, type DoneEvent, type ErrorEvent, type ProgressEvent, type LoginEvent, type PostDoneEvent, type PostFailedEvent, type PostProgressEvent, type QueueTextEvent, type RenderDoneEvent, type RenderFailedEvent, type RenderProgressEvent, type YoutubeDoneEvent, type YoutubeErrorEvent, type YoutubeProgressEvent } from "./lib/api";
 import { SCREENS, useUi, type ScreenId } from "./store";
 
 /** Экраны с сеткой карточек. Их не крутим в 3D: целый прокручиваемый экран в 3D-слое с перспективой для композитора лишняя нагрузка. */
@@ -131,6 +131,27 @@ export default function App() {
       }),
     ];
     return () => offs.forEach((f) => f());
+  }, []);
+
+  // Очередь автовыкладки: любое изменение — перечитываем состояние (оно небольшое), ход написания описаний — в карточки.
+  useEffect(() => {
+    const ui = () => useUi.getState();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const reload = () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const p = ui().project;
+        if (p) ui().setQueue(await api.queueState(p.id).catch(() => ui().queue));
+      }, 120);
+    };
+    const offs = [
+      onEvent<{ projectId?: number }>("queue-update", reload),
+      onEvent<QueueTextEvent>("queue-text", (e) => ui().setQueueText(e.draftId, e.message)),
+    ];
+    return () => {
+      clearTimeout(timer);
+      offs.forEach((f) => f());
+    };
   }, []);
 
   // События загрузки с YouTube: ход, готово, ошибка или остановка.

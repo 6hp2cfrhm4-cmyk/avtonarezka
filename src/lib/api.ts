@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { captionLen, composeCaption, normalizeTags } from "./caption";
 import { extractYoutubeLink } from "./youtube";
 
 export interface EnvReport {
@@ -308,6 +309,53 @@ export interface PostFailedEvent {
   message: string;
 }
 
+/** `drafting` — пишется описание, `ready` — готово и ждёт запуска, `needs_check` — неясно, вышел ли ролик: проверь в TikTok. */
+export type JobState = "drafting" | "ready" | "queued" | "sending" | "done" | "failed" | "needs_check";
+export interface PublishJob {
+  id: number;
+  draftId: number;
+  caption: string;
+  hashtags: string[];
+  state: JobState;
+  error: string | null;
+  attempts: number;
+  /** Не раньше этого времени (unix, секунды); 0 — можно сразу. */
+  notBefore: number;
+  /** Длина подписи вместе с хэштегами, как её соберёт бэкенд. */
+  len: number;
+  updatedAt: number;
+}
+export interface QueueSettings {
+  pauseMin: number;
+  dailyLimit: number;
+}
+export interface QueueState {
+  jobs: PublishJob[];
+  settings: QueueSettings;
+  /** Очередь идёт (цикл запущен). */
+  running: boolean;
+  /** Модель пишет описания. */
+  generating: boolean;
+  /** Выложено за последние 24 часа. */
+  sentToday: number;
+  /** Когда уйдёт следующий ролик (unix), если очередь ждёт. */
+  nextAt: number | null;
+  /** Почему очередь стоит или ждёт. */
+  note: string | null;
+  /** Окно длины подписи и предел хэштегов: решает бэкенд, интерфейс только показывает. */
+  windowMin: number;
+  windowMax: number;
+  maxTags: number;
+  /** Сколько знаков принимает страница TikTok (вместе с хэштегами): потолок для любого текста, своего или от модели. */
+  captionLimit: number;
+  chromium: boolean;
+}
+export type JobResolve = "retry" | "mark_done" | "remove";
+export interface QueueTextEvent {
+  draftId: number;
+  message: string;
+}
+
 export interface YoutubePreset {
   /** "720" | "1080" | "1440" | "2160" | "best" */
   key: string;
@@ -426,6 +474,16 @@ const real = {
   tiktokLogout: () => invoke<TikTokStatus>("tiktok_logout"),
   tiktokPublish: (args: PublishArgs) => invoke<PublishStart>("tiktok_publish", { args }),
   postsList: (projectId: number) => invoke<Post[]>("posts_list", { projectId }),
+  queueState: (projectId: number) => invoke<QueueState>("queue_state", { projectId }),
+  queuePrepare: (projectId: number) => invoke<void>("queue_prepare", { projectId }),
+  queuePrepareCancel: () => invoke<void>("queue_prepare_cancel"),
+  queueApplyText: (projectId: number, caption: string, hashtags: string[]) => invoke<number>("queue_apply_text", { projectId, caption, hashtags }),
+  queueJobUpdate: (id: number, caption: string, hashtags: string[]) => invoke<PublishJob>("queue_job_update", { id, caption, hashtags }),
+  queueJobResolve: (id: number, action: JobResolve) => invoke<void>("queue_job_resolve", { id, action }),
+  queueSettingsSet: (pauseMin: number, dailyLimit: number) => invoke<QueueSettings>("queue_settings_set", { pauseMin, dailyLimit }),
+  queueStart: (projectId: number, confirmed: boolean) => invoke<void>("queue_start", { projectId, confirmed }),
+  queuePause: () => invoke<void>("queue_pause"),
+  queueStop: (projectId: number) => invoke<void>("queue_stop", { projectId }),
   youtubeAnalyze: (url: string) => invoke<YoutubeInfo>("youtube_analyze", { url }),
   youtubeDownload: (args: YoutubeStart) => invoke<string>("youtube_download", { args }),
   youtubeCancel: (jobId: string) => invoke<void>("youtube_cancel", { jobId }),
@@ -510,6 +568,34 @@ let demoTikTok: TikTokStatus = {
   redirectUri: "http://127.0.0.1:38475/callback/", connected: false, refreshExpiresAt: null, scope: "", secretsBackend: "keyring",
   chromium: true, loginInProgress: false,
 };
+
+// Очередь автовыкладки для просмотра экрана «Финал» в браузере.
+const nowSec = () => Math.floor(Date.now() / 1000);
+let demoJobs: PublishJob[] = [];
+let demoGenerating = false;
+let demoRunning = false;
+let demoNextAt: number | null = null;
+let demoQueueSettings: QueueSettings = { pauseMin: 45, dailyLimit: 5 };
+const demoLongText = (n: number) => {
+  const base = "Он вернулся домой и не поверил своим глазам: на столе лежало то, чего он совсем не ждал. ";
+  let s = "";
+  while (s.length < n) s += base;
+  return `${s.slice(0, n - 1).trimEnd()}.`.padEnd(n, ".").slice(0, n);
+};
+const demoQueueState = (): QueueState => ({
+  jobs: demoJobs.map((j) => ({ ...j })),
+  settings: demoQueueSettings,
+  running: demoRunning,
+  generating: demoGenerating,
+  sentToday: demoJobs.filter((j) => j.state === "done").length,
+  nextAt: demoNextAt,
+  note: null,
+  windowMin: 3990,
+  windowMax: 3999,
+  maxTags: 5,
+  captionLimit: 4000,
+  chromium: true,
+});
 
 const mock: typeof real = {
   appInfo: async () => ({
@@ -617,6 +703,95 @@ const mock: typeof real = {
     return { postId: 1, alreadySent: null };
   },
   postsList: async () => [],
+  queueState: async () => demoQueueState(),
+  queuePrepare: async (projectId) => {
+    demoGenerating = true;
+    demoJobs = demoFinals.map((d, i) => ({ id: 300 + i, draftId: d.id, caption: "", hashtags: [], state: "drafting" as JobState, error: null, attempts: 0, notBefore: 0, len: 0, updatedAt: nowSec() }));
+    mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
+    demoJobs.forEach((j, i) => {
+      for (const [k, message] of ["Подбираю хэштеги", "Пишу описание, часть 2 из 4", "Пишу описание, часть 4 из 4"].entries()) {
+        setTimeout(() => mockBus.dispatchEvent(new CustomEvent("queue-text", { detail: { draftId: j.draftId, message } })), 500 + i * 1800 + k * 500);
+      }
+      setTimeout(() => {
+        const tags = ["юмор", "сериал", "тикток", "момент", "смех"];
+        j.caption = demoLongText(3990 - composeCaption("", tags).length - 1 + (i % 3) * 3);
+        j.hashtags = tags.map((t) => `#${t}`);
+        j.len = captionLen(j.caption, j.hashtags);
+        j.state = "ready";
+        demoGenerating = demoJobs.some((x) => x.state === "drafting");
+        mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
+      }, 2200 + i * 1800);
+    });
+  },
+  queuePrepareCancel: async () => {
+    demoGenerating = false;
+  },
+  queueApplyText: async (projectId, caption, hashtags) => {
+    const tags = normalizeTags(hashtags);
+    const len = captionLen(caption, tags);
+    if (!caption.trim()) throw "Описание пустое";
+    if (tags.length < 1 || tags.length > 5) throw "Хэштегов должно быть от 1 до 5";
+    if (len > 4000) throw `Подпись с хэштегами ${len} знаков, а страница TikTok принимает не больше 4000`;
+    const busy: JobState[] = ["drafting", "queued", "sending", "done", "needs_check"];
+    const eligible = demoFinals.filter((d) => !demoJobs.some((j) => j.draftId === d.id && busy.includes(j.state)));
+    if (eligible.length === 0) throw "Нет роликов, которым можно назначить текст: все уже в очереди, выложены или ждут проверки";
+    for (const d of eligible) {
+      const fields = { caption: caption.trim(), hashtags: tags, len, state: "ready" as JobState, error: null };
+      const old = demoJobs.find((j) => j.draftId === d.id);
+      if (old) Object.assign(old, fields);
+      else demoJobs.push({ id: 300 + demoJobs.length + 1, draftId: d.id, attempts: 0, notBefore: 0, updatedAt: nowSec(), ...fields });
+    }
+    mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
+    return eligible.length;
+  },
+  queueJobUpdate: async (id, caption, hashtags) => {
+    const j = demoJobs.find((x) => x.id === id);
+    if (!j) throw "Задача не найдена";
+    const len = captionLen(caption, hashtags);
+    if (len > 4000) throw `Подпись с хэштегами ${len} знаков, а страница TikTok принимает не больше 4000`;
+    Object.assign(j, { caption: caption.trim(), hashtags: normalizeTags(hashtags), len, state: "ready" });
+    return j;
+  },
+  queueJobResolve: async (id, action) => {
+    const j = demoJobs.find((x) => x.id === id);
+    if (!j) return;
+    if (action === "remove") demoJobs = demoJobs.filter((x) => x.id !== id);
+    else Object.assign(j, { state: action === "retry" ? "queued" : "done", error: null });
+  },
+  queueSettingsSet: async (pauseMin, dailyLimit) => (demoQueueSettings = { pauseMin: Math.max(1, pauseMin), dailyLimit: Math.max(1, dailyLimit) }),
+  queueStart: async (projectId, confirmed) => {
+    if (!confirmed) throw "Нужно подтверждение запуска";
+    demoJobs.filter((j) => j.state === "ready").forEach((j) => (j.state = "queued"));
+    demoRunning = true;
+    const step = () => {
+      const next = demoJobs.find((j) => j.state === "queued");
+      if (!demoRunning || !next) {
+        demoRunning = false;
+        demoNextAt = null;
+        mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
+        return;
+      }
+      next.state = "sending";
+      demoNextAt = null;
+      mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
+      setTimeout(() => {
+        next.state = "done";
+        demoNextAt = nowSec() + 20;
+        mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
+        setTimeout(step, 20000);
+      }, 2500);
+    };
+    step();
+  },
+  queuePause: async () => {
+    demoRunning = false;
+    demoNextAt = null;
+  },
+  queueStop: async () => {
+    demoRunning = false;
+    demoNextAt = null;
+    demoJobs.filter((j) => j.state === "queued").forEach((j) => (j.state = "ready"));
+  },
   youtubeAnalyze: async (text) => {
     await new Promise((r) => setTimeout(r, 700));
     const link = extractYoutubeLink(text) ?? text.trim();
