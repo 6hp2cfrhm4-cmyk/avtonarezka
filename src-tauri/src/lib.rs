@@ -3,6 +3,7 @@ mod assets_cmds;
 mod commands;
 mod db;
 mod drafts;
+mod gameplay;
 pub mod analyze;
 pub mod render;
 pub mod tiktok;
@@ -83,12 +84,15 @@ pub fn run() {
             assets_cmds::assets_list,
             assets_cmds::asset_add,
             assets_cmds::asset_delete,
+            gameplay::gameplay_tape,
+            gameplay::gameplay_tape_reset,
             drafts::drafts_generate,
             drafts::drafts_list,
             drafts::draft_set_status,
             drafts::drafts_approve_ready,
             drafts::draft_update,
             drafts::draft_rerender,
+            drafts::drafts_realign_gameplay,
             drafts::draft_cancel,
             drafts::defaults_get,
             drafts::defaults_set,

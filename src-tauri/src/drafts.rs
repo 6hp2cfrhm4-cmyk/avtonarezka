@@ -3,7 +3,7 @@
 //! Жизнь черновика: `queued` → `rendering` → `ready` → `approved` | `rejected`.
 //! Финал: `approved` → `final_queued` → `final_rendering` → `final_done`. Сбой — `failed`.
 
-use std::{collections::HashSet, path::{Path, PathBuf}};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}};
 
 use rand::Rng;
 use rusqlite::{params, Connection};
@@ -14,8 +14,9 @@ use tokio::sync::watch;
 use crate::{
     analysis_cmds::{update_moment, MomentDto},
     assets_cmds::{load_asset, AssetDto},
+    gameplay::{self, Clip, Slice},
     media,
-    render::{self, Encoder, MediaRef, Profile, RenderJob, Style, Word},
+    render::{self, Encoder, MediaRef, Profile, RenderJob, Style, TopFit, Word},
     state::AppState,
 };
 
@@ -38,15 +39,30 @@ pub struct DraftConfig {
     pub music_offset: f64,
 }
 
+/// Версия раскладки умолчаний. 1: верх 16:9 виден целиком (`Auto`), срез снизу выключен.
+const LAYOUT_V: u32 = 1;
+
 /// Настройки, с которых начинаются новые черновики.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Defaults {
     pub style: Style,
     pub banner_id: Option<i64>,
-    /// Из этих фонов случайно выбирается свой для каждого ролика.
+    /// Фоны по порядку: лента геймплея идёт по ним, а когда они кончаются — по кругу (см. `gameplay`).
     pub background_ids: Vec<i64>,
     pub music_id: Option<i64>,
+    /// Версия раскладки, с которой умолчания сохранены (см. `LAYOUT_V`).
+    pub layout_v: u32,
+}
+
+/// Старые умолчания раскладки (`Fill` и срез снизу 20 %) заменяются новыми. Выбранное вручную не трогается.
+fn upgrade_layout(style: &mut Style) -> bool {
+    let old = style.top_fit == TopFit::Fill && (style.top_crop_bottom - 0.2).abs() < 1e-6;
+    if old {
+        style.top_fit = TopFit::Auto;
+        style.top_crop_bottom = 0.0;
+    }
+    old
 }
 
 pub(crate) fn kv_get(db: &Connection, key: &str) -> Option<String> {
@@ -59,7 +75,18 @@ pub(crate) fn kv_set(db: &Connection, key: &str, value: &str) -> rusqlite::Resul
 }
 
 pub(crate) fn load_defaults(db: &Connection) -> Defaults {
-    kv_get(db, "draft_defaults").and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+    let saved = kv_get(db, "draft_defaults");
+    let mut d: Defaults = saved.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    if d.layout_v < LAYOUT_V {
+        upgrade_layout(&mut d.style);
+        d.layout_v = LAYOUT_V;
+        if saved.is_some() {
+            if let Ok(json) = serde_json::to_string(&d) {
+                let _ = kv_set(db, "draft_defaults", &json);
+            }
+        }
+    }
+    d
 }
 
 /// С какой секунды фона по умолчанию начинается геймплей (не 0: нулевой кадр у некоторых роликов чёрный).
@@ -90,30 +117,44 @@ impl DefaultAssets {
     }
 }
 
-fn new_config(a: &DefaultAssets, d: &Defaults, clip_len: f64, rng: &mut impl Rng) -> DraftConfig {
-    let need = clip_len + a.banner.as_ref().map_or(0.0, |b| b.meta.duration);
-    let bg = (!a.backgrounds.is_empty()).then(|| &a.backgrounds[rng.random_range(0..a.backgrounds.len())]);
+impl DefaultAssets {
+    /// Сколько секунд фона нужно ролику: клип плюс время, пока играет баннер.
+    fn need(&self, clip_len: f64) -> f64 {
+        clip_len + self.banner.as_ref().map_or(0.0, |b| b.meta.duration)
+    }
 
+    /// Фон для каждого принятого момента проекта по таймкодам (см. `gameplay`): `moment_id → место на ленте`.
+    /// Считается по всем принятым моментам сразу, поэтому места не зависят от того, для каких уже есть черновики.
+    fn gameplay_slices(&self, db: &Connection, project_id: i64, accepted: &[(i64, f64, f64)]) -> HashMap<i64, Slice> {
+        let tape: Vec<(i64, f64)> = self.backgrounds.iter().map(|b| (b.id, b.meta.duration)).collect();
+        let clips: Vec<Clip> = accepted.iter().map(|&(id, start, end)| Clip { id, start, need: self.need(end - start) }).collect();
+        gameplay::allocate(db, project_id, &tape, &clips).into_iter().map(|s| (s.clip, s)).collect()
+    }
+}
+
+fn new_config(a: &DefaultAssets, d: &Defaults, clip_len: f64, slice: Option<&Slice>, rng: &mut impl Rng) -> DraftConfig {
     DraftConfig {
         style: d.style.clone(),
         banner_id: a.banner.as_ref().map(|b| b.id),
-        background_id: bg.map(|b| b.id),
-        gameplay_offset: if bg.is_some() { GAMEPLAY_START } else { 0.0 },
+        background_id: slice.map(|s| s.asset),
+        gameplay_offset: slice.map_or(0.0, |s| s.offset),
         music_id: a.music.as_ref().map(|m| m.id),
-        music_offset: a.music.as_ref().map_or(0.0, |m| pick_offset(rng, m.meta.duration, need)),
+        music_offset: a.music.as_ref().map_or(0.0, |m| pick_offset(rng, m.meta.duration, a.need(clip_len))),
     }
+}
+
+/// Принятые моменты проекта по порядку в видео: `(id, начало, конец)`.
+fn accepted_moments(db: &Connection, project_id: i64) -> CmdResult<Vec<(i64, f64, f64)>> {
+    let mut st = db
+        .prepare("SELECT id, start, \"end\" FROM moments WHERE project_id = ?1 AND status = 'accepted' ORDER BY start")
+        .map_err(err)?;
+    let rows = st.query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(err)?;
+    rows.collect::<Result<_, _>>().map_err(err)
 }
 
 /// Создаёт черновики для принятых моментов, у которых их ещё нет, и заново нумерует части по порядку в видео.
 pub(crate) fn generate(db: &Connection, project_id: i64) -> CmdResult<usize> {
-    let mut st = db
-        .prepare("SELECT id, start, \"end\" FROM moments WHERE project_id = ?1 AND status = 'accepted' ORDER BY start")
-        .map_err(err)?;
-    let accepted: Vec<(i64, f64, f64)> = st
-        .query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .map_err(err)?
-        .collect::<Result<_, _>>()
-        .map_err(err)?;
+    let accepted = accepted_moments(db, project_id)?;
     if accepted.is_empty() {
         return Err("Сначала отбери хотя бы один момент".into());
     }
@@ -127,6 +168,7 @@ pub(crate) fn generate(db: &Connection, project_id: i64) -> CmdResult<usize> {
 
     let defaults = load_defaults(db);
     let assets = DefaultAssets::load(db, &defaults);
+    let slices = assets.gameplay_slices(db, project_id, &accepted);
     let mut rng = rand::rng();
     let mut created = 0;
     // одна транзакция: сотни отдельных коммитов (каждый с fsync) подвешивали окно
@@ -140,7 +182,7 @@ pub(crate) fn generate(db: &Connection, project_id: i64) -> CmdResult<usize> {
                 renumber.execute(params![moment_id, part]).map_err(err)?;
                 continue;
             }
-            let cfg = new_config(&assets, &defaults, end - start, &mut rng);
+            let cfg = new_config(&assets, &defaults, end - start, slices.get(moment_id), &mut rng);
             insert.execute(params![moment_id, part, serde_json::to_string(&cfg).map_err(err)?]).map_err(err)?;
             created += 1;
         }
@@ -220,8 +262,10 @@ fn set_status(db: &Connection, id: i64, status: &str, error: Option<&str>) {
 /// только проверяет, что они на месте.
 pub(crate) fn build_job(db: &Connection, draft_id: i64, profile: Profile, encoder: Encoder, out: PathBuf) -> CmdResult<RenderJob> {
     let d = get(db, draft_id)?;
-    let (src_path, src_duration, has_audio): (String, f64, i64) = db
-        .query_row("SELECT path, duration, has_audio FROM projects WHERE id = ?1", [d.project_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    let (src_path, src_duration, has_audio, src_w, src_h): (String, f64, i64, f64, f64) = db
+        .query_row("SELECT path, duration, has_audio, width, height FROM projects WHERE id = ?1", [d.project_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .map_err(err)?;
     if !Path::new(&src_path).is_file() {
         return Err(format!("Исходное видео не найдено: {src_path}"));
@@ -249,6 +293,7 @@ pub(crate) fn build_job(db: &Connection, draft_id: i64, profile: Profile, encode
 
     Ok(RenderJob {
         source: MediaRef { path: PathBuf::from(src_path), duration: src_duration, has_audio: has_audio != 0 },
+        source_aspect: if src_h > 0.0 { src_w / src_h } else { 0.0 },
         start: d.start,
         end: d.end,
         banner_at: banner.as_ref().map(|_| (d.climax - d.start).max(0.0)),
@@ -536,9 +581,10 @@ pub(crate) fn fill_missing_assets(db: &Connection, id: i64) -> CmdResult<bool> {
     if assets.backgrounds.is_empty() {
         return Ok(false);
     }
-    let bg = &assets.backgrounds[rand::rng().random_range(0..assets.backgrounds.len())];
-    d.config.background_id = Some(bg.id);
-    d.config.gameplay_offset = GAMEPLAY_START;
+    let slices = assets.gameplay_slices(db, d.project_id, &accepted_moments(db, d.project_id)?);
+    let Some(place) = slices.get(&d.moment_id) else { return Ok(false) };
+    d.config.background_id = Some(place.asset);
+    d.config.gameplay_offset = place.offset;
     if d.config.banner_id.is_none() {
         d.config.banner_id = assets.banner.as_ref().map(|b| b.id);
     }
@@ -558,6 +604,46 @@ pub fn draft_rerender(app: AppHandle, state: State<'_, AppState>, id: i64) {
     spawn_render(app, id, RenderKind::Draft);
 }
 
+/// Переставляет фон по таймкодам у черновиков, которые ещё можно менять (готовы, упали или отклонены), и приводит их
+/// раскладку к новым умолчаниям, если стояли старые. Одобренные и ушедшие в финал не трогаются.
+/// Ручной выбор фона и секунды у этих черновиков сбрасывается. Возвращает id изменённых, они уже в очереди.
+pub(crate) fn realign_gameplay(db: &Connection, project_id: i64) -> CmdResult<Vec<i64>> {
+    let defaults = load_defaults(db);
+    let assets = DefaultAssets::load(db, &defaults);
+    if assets.backgrounds.is_empty() {
+        return Err("Сначала отметь фон в библиотеке на шаге «Импорт»".into());
+    }
+    let slices = assets.gameplay_slices(db, project_id, &accepted_moments(db, project_id)?);
+
+    let mut changed = Vec::new();
+    for d in list(db, project_id).map_err(err)? {
+        if !matches!(d.status.as_str(), "ready" | "failed" | "rejected") {
+            continue;
+        }
+        let Some(place) = slices.get(&d.moment_id) else { continue };
+        let mut cfg = d.config.clone();
+        cfg.background_id = Some(place.asset);
+        cfg.gameplay_offset = place.offset;
+        upgrade_layout(&mut cfg.style);
+
+        let (before, after) = (serde_json::to_string(&d.config).map_err(err)?, serde_json::to_string(&cfg).map_err(err)?);
+        if before == after {
+            continue;
+        }
+        db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![d.id, after]).map_err(err)?;
+        set_status(db, d.id, "queued", None);
+        changed.push(d.id);
+    }
+    Ok(changed)
+}
+
+#[tauri::command(async)]
+pub fn drafts_realign_gameplay(app: AppHandle, state: State<'_, AppState>, project_id: i64) -> CmdResult<usize> {
+    let ids = realign_gameplay(&state.db.0.lock().unwrap(), project_id)?;
+    spawn_renders(&app, &ids, RenderKind::Draft);
+    Ok(ids.len())
+}
+
 #[tauri::command]
 pub fn draft_cancel(state: State<'_, AppState>, id: i64) {
     if let Some(tx) = state.renders.lock().unwrap().get(&id) {
@@ -571,7 +657,9 @@ pub fn defaults_get(state: State<'_, AppState>) -> Defaults {
 }
 
 #[tauri::command]
-pub fn defaults_set(state: State<'_, AppState>, defaults: Defaults) -> CmdResult<()> {
+pub fn defaults_set(state: State<'_, AppState>, mut defaults: Defaults) -> CmdResult<()> {
+    // то, что сохраняет пользователь, уже новой раскладки: старые умолчания второй раз не «обновляются»
+    defaults.layout_v = LAYOUT_V;
     kv_set(&state.db.0.lock().unwrap(), "draft_defaults", &serde_json::to_string(&defaults).map_err(err)?).map_err(err)
 }
 
@@ -726,9 +814,9 @@ mod tests {
         for d in &drafts {
             assert_eq!(d.config.banner_id, Some(1));
             assert_eq!(d.config.music_id, Some(4));
-            assert!(matches!(d.config.background_id, Some(2) | Some(3)));
-            // геймплей всегда начинается с 0,01 с, а не со случайного места
-            assert_eq!(d.config.gameplay_offset, GAMEPLAY_START);
+            // фон нарезан по тем же таймкодам, что и основное видео (клипы 100, 300 и 600 с — все в первом фоне)
+            assert_eq!(d.config.background_id, Some(2));
+            assert_eq!(d.config.gameplay_offset, d.start);
         }
         let st: String = e.db.query_row("SELECT status FROM projects WHERE id = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(st, "drafts");
@@ -745,9 +833,130 @@ mod tests {
         set_defaults(&e, &full_defaults());
         assert!(fill_missing_assets(&e.db, id).unwrap());
         let c = get(&e.db, id).unwrap().config;
-        assert!(matches!(c.background_id, Some(2) | Some(3)));
-        assert_eq!((c.banner_id, c.music_id, c.gameplay_offset), (Some(1), Some(4), GAMEPLAY_START));
+        // момент 100..140: фон берётся с той же секунды
+        assert_eq!((c.background_id, c.gameplay_offset), (Some(2), 100.0));
+        assert_eq!((c.banner_id, c.music_id), (Some(1), Some(4)));
         assert!(!fill_missing_assets(&e.db, id).unwrap(), "выбранное не перезаписывается");
+    }
+
+    fn add_project(e: &Env, id: i64, moments: &[(f64, f64)]) {
+        e.db.execute(
+            "INSERT INTO projects (id, path, hash, title, duration, width, height, fps, has_audio) VALUES (?1, ?2, ?3, 'Второе', 1800, 1280, 720, 30, 1)",
+            params![id, touch(&e.dir, &format!("source{id}.mp4")), format!("h{id}")],
+        )
+        .unwrap();
+        for (start, end) in moments {
+            e.db.execute("INSERT INTO moments (project_id, start, \"end\", title, status) VALUES (?1, ?2, ?3, 'м', 'accepted')", params![id, start, end]).unwrap();
+        }
+    }
+
+    fn gameplay_of(e: &Env, project_id: i64) -> Vec<(i64, Option<i64>, f64)> {
+        list(&e.db, project_id).unwrap().iter().map(|d| (d.part, d.config.background_id, d.config.gameplay_offset)).collect()
+    }
+
+    #[test]
+    fn the_next_video_continues_the_gameplay_where_the_previous_one_ended() {
+        let e = env("tape");
+        set_defaults(&e, &Defaults { banner_id: Some(1), background_ids: vec![2], ..Default::default() });
+        generate(&e.db, 1).unwrap();
+        // клипы 100..140, 300..340, 600..650 и баннер 4 с: лента дошла до 654-й секунды фона
+        assert_eq!(gameplay_of(&e, 1), vec![(1, Some(2), 100.0), (2, Some(2), 300.0), (3, Some(2), 600.0)]);
+
+        add_project(&e, 2, &[(50.0, 90.0), (120.0, 160.0)]);
+        generate(&e.db, 2).unwrap();
+        assert_eq!(gameplay_of(&e, 2), vec![(1, Some(2), 704.0), (2, Some(2), 774.0)]);
+
+        // повторный запуск и новые моменты в первом видео ленту второго не сдвигают
+        e.db.execute("INSERT INTO moments (project_id, start, \"end\", title, status) VALUES (1, 10, 30, 'раньше', 'accepted')", []).unwrap();
+        generate(&e.db, 1).unwrap();
+        generate(&e.db, 2).unwrap();
+        assert_eq!(gameplay_of(&e, 2), vec![(1, Some(2), 704.0), (2, Some(2), 774.0)]);
+
+        // третье видео идёт сразу за вторым (его последний клип кончается на 774 + 44 = 818-й секунде)
+        add_project(&e, 3, &[(0.0, 40.0)]);
+        generate(&e.db, 3).unwrap();
+        assert_eq!(gameplay_of(&e, 3), vec![(1, Some(2), 818.0)]);
+    }
+
+    #[test]
+    fn restarting_the_tape_begins_the_next_generation_from_the_start() {
+        let e = env("restart");
+        set_defaults(&e, &Defaults { background_ids: vec![2], ..Default::default() });
+        generate(&e.db, 1).unwrap();
+        gameplay::reset(&e.db);
+        add_project(&e, 2, &[(50.0, 90.0)]);
+        generate(&e.db, 2).unwrap();
+        assert_eq!(gameplay_of(&e, 2), vec![(1, Some(2), 50.0)]);
+    }
+
+    #[test]
+    fn realign_changes_only_drafts_that_can_still_change_and_upgrades_the_old_layout() {
+        let e = env("realign");
+        set_defaults(&e, &Defaults { banner_id: Some(1), background_ids: vec![2], ..Default::default() });
+        generate(&e.db, 1).unwrap();
+        let ids: Vec<i64> = list(&e.db, 1).unwrap().iter().map(|d| d.id).collect();
+
+        // как у черновиков, сделанных в 0.1.0: фон с 0,01 с, старая раскладка
+        for id in &ids {
+            let mut c = get(&e.db, *id).unwrap().config;
+            c.gameplay_offset = GAMEPLAY_START;
+            c.style.top_fit = TopFit::Fill;
+            c.style.top_crop_bottom = 0.2;
+            e.db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&c).unwrap()]).unwrap();
+        }
+        e.db.execute("UPDATE drafts SET status = 'ready' WHERE id = ?1", [ids[0]]).unwrap();
+        e.db.execute("UPDATE drafts SET status = 'approved' WHERE id = ?1", [ids[1]]).unwrap();
+        e.db.execute("UPDATE drafts SET status = 'failed' WHERE id = ?1", [ids[2]]).unwrap();
+        // у третьего раскладка настроена вручную: её не трогаем
+        let mut c = get(&e.db, ids[2]).unwrap().config;
+        c.style.top_crop_bottom = 0.3;
+        e.db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![ids[2], serde_json::to_string(&c).unwrap()]).unwrap();
+
+        let changed = realign_gameplay(&e.db, 1).unwrap();
+        assert_eq!(changed, vec![ids[0], ids[2]], "одобренный не меняется");
+
+        let first = get(&e.db, ids[0]).unwrap();
+        assert_eq!((first.config.gameplay_offset, first.config.style.top_fit, first.config.style.top_crop_bottom), (100.0, TopFit::Auto, 0.0));
+        assert_eq!(first.status, "queued");
+        let approved = get(&e.db, ids[1]).unwrap();
+        assert_eq!((approved.config.gameplay_offset, approved.status.as_str()), (GAMEPLAY_START, "approved"));
+        let third = get(&e.db, ids[2]).unwrap().config;
+        assert_eq!((third.gameplay_offset, third.style.top_fit, third.style.top_crop_bottom), (600.0, TopFit::Fill, 0.3));
+
+        assert!(realign_gameplay(&e.db, 1).unwrap().is_empty(), "повторный пересчёт ничего не меняет");
+    }
+
+    #[test]
+    fn realign_without_backgrounds_explains_what_to_do() {
+        let e = env("realign-none");
+        generate(&e.db, 1).unwrap();
+        assert!(realign_gameplay(&e.db, 1).unwrap_err().contains("фон"));
+    }
+
+    #[test]
+    fn saved_defaults_with_the_old_layout_are_upgraded_exactly_once() {
+        let e = env("layout");
+        let mut old = Defaults::default();
+        old.style.top_fit = TopFit::Fill;
+        old.style.top_crop_bottom = 0.2;
+        set_defaults(&e, &old);
+        let d = load_defaults(&e.db);
+        assert_eq!((d.style.top_fit, d.style.top_crop_bottom, d.layout_v), (TopFit::Auto, 0.0, LAYOUT_V));
+
+        // человек сам вернул «Заполнить» и срез: после обновления это его выбор
+        let mut mine = load_defaults(&e.db);
+        mine.style.top_fit = TopFit::Fill;
+        mine.style.top_crop_bottom = 0.2;
+        set_defaults(&e, &mine);
+        let again = load_defaults(&e.db);
+        assert_eq!((again.style.top_fit, again.style.top_crop_bottom), (TopFit::Fill, 0.2));
+
+        // ручная раскладка при обновлении не затирается
+        let mut custom = Defaults::default();
+        custom.style.top_fit = TopFit::Contain;
+        custom.style.top_crop_bottom = 0.1;
+        set_defaults(&e, &custom);
+        assert_eq!(load_defaults(&e.db).style.top_fit, TopFit::Contain);
     }
 
     #[test]
@@ -809,6 +1018,8 @@ mod tests {
         assert!(job.banner.as_ref().unwrap().has_audio);
         assert!(job.music.is_some() && !job.gameplay.has_audio);
         assert_eq!(job.source.duration, 3600.0);
+        assert!((job.source_aspect - 1920.0 / 1080.0).abs() < 1e-9, "форма кадра нужна, чтобы 16:9 показать целиком");
+        assert_eq!(job.gameplay_offset, 100.0, "фон идёт с того же таймкода, что и клип");
         assert!((job.out_len() - 44.0).abs() < 1e-9, "клип 40 с + баннер 4 с");
     }
 

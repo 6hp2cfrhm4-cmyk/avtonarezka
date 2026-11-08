@@ -58,15 +58,16 @@ fn freeze_video(g: &mut Vec<String>, inp: &str, out: &str, tb: f64, d: f64) {
 }
 
 /// Заливка кадра в область W×h: с обрезкой краёв или с размытой подложкой.
+/// `Auto` сюда не приходит: его раскрывает `RenderJob::top_fit`.
 fn fit(g: &mut Vec<String>, inp: &str, out: &str, w: u32, h: u32, mode: TopFit) {
     match mode {
-        TopFit::Fill => g.push(format!(
+        TopFit::Fill | TopFit::Auto => g.push(format!(
             "[{inp}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1[{out}]"
         )),
         TopFit::Contain => g.push(format!(
             "[{inp}]split=2[{inp}_bg][{inp}_fg];\
              [{inp}_bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=luma_radius=28:luma_power=2,eq=brightness=-0.12[{inp}_bgb];\
-             [{inp}_fg]scale={w}:{h}:force_original_aspect_ratio=decrease[{inp}_fgs];\
+             [{inp}_fg]scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2[{inp}_fgs];\
              [{inp}_bgb][{inp}_fgs]overlay=(W-w)/2:(H-h)/2,setsar=1[{out}]"
         )),
     }
@@ -118,7 +119,7 @@ pub fn build(job: &RenderJob, ass_path: Option<&Path>, fonts_dir: Option<&Path>)
     let crop = st.top_crop_bottom.clamp(0.0, 0.4);
     let cut = if crop > 0.001 { format!(",crop=iw:trunc(ih*{}/2)*2:0:0", f3(1.0 - crop)) } else { String::new() };
     g.push(format!("[{i_src}:v]fps={FPS},setpts=PTS-STARTPTS,setsar=1{cut}[src]"));
-    fit(&mut g, "src", "top0", w, h_top, st.top_fit);
+    fit(&mut g, "src", "top0", w, h_top, job.top_fit());
     match freeze {
         Some((tb, d)) => freeze_video(&mut g, "top0", "top", tb, d),
         None => g.push("[top0]null[top]".into()),
@@ -283,6 +284,7 @@ mod tests {
     fn job() -> RenderJob {
         RenderJob {
             source: media("/v/src.mp4", 600.0, true),
+            source_aspect: 16.0 / 9.0,
             start: 100.0,
             end: 130.0,
             banner: Some(media("/v/banner.mp4", 4.0, true)),
@@ -308,12 +310,48 @@ mod tests {
     }
 
     #[test]
-    fn source_bottom_is_cut_before_fitting_to_hide_burned_in_subtitles() {
-        let p = build(&job(), None, None);
-        assert!(p.filter.contains("setsar=1,crop=iw:trunc(ih*0.800/2)*2:0:0[src]"), "{}", p.filter);
+    fn source_bottom_is_cut_before_fitting_only_when_asked() {
         let mut j = job();
-        j.style.top_crop_bottom = 0.0;
-        assert!(!build(&j, None, None).filter.contains("ih*"));
+        assert!(!build(&j, None, None).filter.contains("ih*"), "по умолчанию кадр виден целиком");
+        j.style.top_crop_bottom = 0.2;
+        let p = build(&j, None, None);
+        assert!(p.filter.contains("setsar=1,crop=iw:trunc(ih*0.800/2)*2:0:0[src]"), "{}", p.filter);
+    }
+
+    #[test]
+    fn wide_source_is_fitted_whole_over_a_blurred_copy_by_default() {
+        let f = build(&job(), None, None).filter;
+        assert!(f.contains("scale=1080:960:force_original_aspect_ratio=decrease:force_divisible_by=2"), "{f}");
+        assert!(f.contains("boxblur") && f.contains("overlay=(W-w)/2:(H-h)/2"), "{f}");
+    }
+
+    #[test]
+    fn vertical_square_and_unknown_sources_still_fill_the_zone() {
+        for aspect in [9.0 / 16.0, 1.0, 0.0] {
+            let mut j = job();
+            j.source_aspect = aspect;
+            assert_eq!(j.top_fit(), TopFit::Fill, "aspect {aspect}");
+            assert!(!build(&j, None, None).filter.contains("boxblur"), "aspect {aspect}");
+        }
+    }
+
+    #[test]
+    fn auto_looks_at_the_shape_left_after_the_bottom_cut() {
+        let mut j = job();
+        j.source_aspect = 1.0;
+        assert_eq!(j.top_fit(), TopFit::Fill);
+        j.style.top_crop_bottom = 0.2; // 1,0 / 0,8 = 1,25: теперь кадр широкий
+        assert_eq!(j.top_fit(), TopFit::Contain);
+    }
+
+    #[test]
+    fn explicit_fit_overrides_the_shape_of_the_source() {
+        let mut j = job();
+        j.style.top_fit = TopFit::Fill;
+        assert!(!build(&j, None, None).filter.contains("boxblur"));
+        j.source_aspect = 9.0 / 16.0;
+        j.style.top_fit = TopFit::Contain;
+        assert!(build(&j, None, None).filter.contains("boxblur"));
     }
 
     #[test]
@@ -341,7 +379,7 @@ mod tests {
         let p = build(&j, None, None);
         assert!((p.duration - 30.0).abs() < 1e-9);
         assert!(!p.filter.contains("tpad"));
-        assert!(!p.filter.contains("overlay"));
+        assert!(!p.filter.contains("overlay=x="), "наложения баннера нет");
         assert!(!p.filter.contains("chromakey"));
     }
 
