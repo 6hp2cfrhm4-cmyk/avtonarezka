@@ -30,6 +30,10 @@ pub struct ModelsStatus {
     yamnet: bool,
     llm: bool,
     worker: bool,
+    /// Все модели на месте (проверка по размеру).
+    ready: bool,
+    /// Сейчас качаются.
+    downloading: bool,
 }
 
 #[tauri::command]
@@ -41,6 +45,8 @@ pub fn models_status(state: State<'_, AppState>) -> ModelsStatus {
         yamnet: m.yamnet.is_file() && m.yamnet_classes.is_file(),
         llm: m.llm.is_file(),
         worker: llm::find_worker().is_some(),
+        ready: crate::model_download::ready(&state.models_dir()),
+        downloading: state.models_downloading.load(std::sync::atomic::Ordering::SeqCst),
     }
 }
 

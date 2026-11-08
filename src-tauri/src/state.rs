@@ -23,6 +23,8 @@ pub struct AppState {
     pub login: Mutex<Option<watch::Sender<bool>>>,
     /// Ролики, которые прямо сейчас уходят в TikTok.
     pub posting: Mutex<HashSet<i64>>,
+    /// Идёт загрузка моделей при запуске или по кнопке.
+    pub models_downloading: std::sync::atomic::AtomicBool,
     /// Браузер выкладывает по одному ролику за раз: очередь и ручной диалог ждут друг друга.
     pub browser_gate: tokio::sync::Mutex<()>,
     /// Идущая очередь автовыкладки: сигнал остановки. `Some` — очередь работает.

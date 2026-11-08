@@ -4,6 +4,7 @@ import Scene from "./scene/Scene";
 import Stepper from "./components/Stepper";
 import TopBar from "./components/TopBar";
 import Toasts from "./components/Toasts";
+import ModelsBanner from "./components/ModelsBanner";
 import ErrorBoundary from "./components/ErrorBoundary";
 import ImportScreen from "./screens/Import";
 import AnalysisScreen from "./screens/Analysis";
@@ -214,6 +215,7 @@ export default function App() {
       <Scene />
       <div className="relative z-10 flex h-full flex-col gap-6 p-7">
         <TopBar />
+        <ModelsBanner />
         <div className="flex min-h-0 flex-1 gap-8">
           <aside className="w-[230px] shrink-0 pt-2">
             <Stepper />

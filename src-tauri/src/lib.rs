@@ -13,6 +13,7 @@ pub mod youtube;
 mod dev_tools;
 mod media;
 mod media_server;
+mod model_download;
 pub mod models;
 pub mod platform;
 mod state;
@@ -65,12 +66,15 @@ pub fn run() {
                 login: Default::default(),
                 posting: Default::default(),
                 browser_gate: Default::default(),
+                models_downloading: Default::default(),
                 publisher: Default::default(),
                 drafting: Default::default(),
                 queue_note: Default::default(),
                 downloads: Default::default(),
                 youtube_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             });
+            // модели качаются сами, если их нет: без них анализ не запустится
+            model_download::start(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -81,6 +85,7 @@ pub fn run() {
             commands::delete_project,
             commands::project_set_tight,
             analysis_cmds::models_status,
+            model_download::models_download,
             analysis_cmds::analysis_start,
             analysis_cmds::analysis_cancel,
             analysis_cmds::analysis_notes,

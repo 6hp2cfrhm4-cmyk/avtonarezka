@@ -558,7 +558,7 @@ async fn generate_all(app: &AppHandle, project_id: i64, todo: Vec<Todo>, cancel:
 pub async fn queue_prepare(app: AppHandle, state: State<'_, AppState>, project_id: i64) -> CmdResult<()> {
     let models = ModelPaths::in_dir(&state.models_dir());
     if !models.llm.is_file() {
-        return Err(format!("Нет языковой модели ({}). Скачай её скриптом fetch-models, как для анализа", models.llm.display()));
+        return Err(format!("Языковая модель ещё не скачана ({}). Дождись загрузки моделей или нажми «Скачать модели»", models.llm.display()));
     }
     if llm::find_worker().is_none() {
         return Err("Не найден llm-worker рядом с программой".into());

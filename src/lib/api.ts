@@ -43,6 +43,19 @@ export interface ModelsStatus {
   yamnet: boolean;
   llm: boolean;
   worker: boolean;
+  /** Все модели на месте. */
+  ready: boolean;
+  /** Сейчас качаются. */
+  downloading: boolean;
+}
+export interface ModelsProgressEvent {
+  /** Путь файла внутри папки моделей, например `qwen3-4b-q4_k_m/Qwen3-4B-Q4_K_M.gguf`. */
+  name: string;
+  received: number;
+  total: number;
+}
+export interface ModelsErrorEvent {
+  message: string;
 }
 
 export interface AnalysisOptions {
@@ -450,6 +463,7 @@ const real = {
   deleteProject: (id: number) => invoke<void>("delete_project", { id }),
   projectSetTight: (id: number, tight: boolean) => invoke<Project>("project_set_tight", { id, tight }),
   modelsStatus: () => invoke<ModelsStatus>("models_status"),
+  modelsDownload: () => invoke<boolean>("models_download"),
   analysisStart: (projectId: number, options?: AnalysisOptions) =>
     invoke<void>("analysis_start", { projectId, options }),
   analysisCancel: (projectId: number) => invoke<void>("analysis_cancel", { projectId }),
@@ -637,7 +651,8 @@ const mock: typeof real = {
     p.tight = tight;
     return { ...p };
   },
-  modelsStatus: async () => ({ dir: "~/.local/share/…/models", whisper: true, yamnet: true, llm: true, worker: true }),
+  modelsStatus: async () => ({ dir: "~/.local/share/…/models", whisper: true, yamnet: true, llm: true, worker: true, ready: true, downloading: false }),
+  modelsDownload: async () => false,
   analysisStart: async (projectId) => {
     const stages: [string, string][] = [["audio", "Читаю звук"], ["events", "Ищу смех, крики и аплодисменты"], ["speech", "Распознаю речь"], ["video", "Считаю динамику кадра"], ["score", "Выбираю лучшие места"], ["llm", "Оцениваю моменты"]];
     let i = 0;
