@@ -162,18 +162,19 @@ pub(crate) enum Step {
     Wait,
     /// Есть одобренные черновики: запускаем финал.
     StartFinals,
-    /// Всё, что могло собраться, собрано. `failed` — сколько не собралось.
-    Finish { failed: i64 },
+    /// Все черновики собраны или отклонены.
+    Finish,
 }
 
-/// Одобрение запускает финал автоматически. Пока есть что рендерить или ждать, элемент не закрываем.
+/// Одобрение запускает финал автоматически. Элемент закрываем, только когда ни один черновик не ждёт,
+/// не рендерится и не упал: упавший ждёт, пока его починят («Повторить») или отклонят в «Черновиках».
 pub(crate) fn step_after(t: &Tally) -> Step {
     if t.approved > 0 {
         Step::StartFinals
-    } else if t.ready > 0 || t.busy > 0 {
+    } else if t.ready > 0 || t.busy > 0 || t.failed > 0 {
         Step::Wait
     } else {
-        Step::Finish { failed: t.failed }
+        Step::Finish
     }
 }
 
@@ -279,10 +280,7 @@ fn settle(app: &AppHandle) {
                 Ok(_) => update(app, id, RENDERING, None),
                 Err(e) => update(app, id, FAILED, Some(&e)),
             },
-            Step::Finish { failed } => {
-                let note = (failed > 0).then(|| format!("Не собрались: {failed}. Проверь в «Черновиках»"));
-                update(app, id, DONE, note.as_deref());
-            }
+            Step::Finish => update(app, id, DONE, None),
         }
     }
 }
@@ -562,9 +560,9 @@ mod tests {
     }
 
     #[test]
-    fn when_nothing_is_left_to_render_the_item_closes_and_says_how_many_failed() {
-        assert_eq!(step_after(&Tally::default()), Step::Finish { failed: 0 });
-        assert_eq!(step_after(&Tally { failed: 3, ..Default::default() }), Step::Finish { failed: 3 });
+    fn the_item_closes_only_when_no_draft_is_left_waiting_rendering_or_broken() {
+        assert_eq!(step_after(&Tally::default()), Step::Finish);
+        assert_eq!(step_after(&Tally { failed: 3, ..Default::default() }), Step::Wait, "упавшие ждут починки или отклонения");
     }
 
     #[test]

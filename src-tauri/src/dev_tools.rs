@@ -222,3 +222,25 @@ pub async fn snapshot(app: &AppHandle, path: PathBuf) -> Result<(), String> {
 pub async fn snapshot(_app: &AppHandle, _path: PathBuf) -> Result<(), String> {
     Err("снимок окна реализован только для Linux".into())
 }
+
+/// Пачка для проверки: один файл за вызов, как «Добавить файлы в пачку».
+pub fn batch_add(app: &AppHandle, path: String, precut: bool) -> Result<String, String> {
+    let item = crate::batch::NewItem { kind: "file".into(), source: path, title: String::new(), preset: "1080".into(), precut };
+    let n = crate::batch::batch_add(app.clone(), app.state(), vec![item])?;
+    Ok(format!("в пачке: {n}"))
+}
+
+/// Запуск пачки, как «Запустить пачку».
+pub fn batch_start(app: &AppHandle) {
+    crate::batch::batch_start(app.clone());
+}
+
+/// Одобрение готовых черновиков пачки, как «Одобрить готовые по пачке».
+pub fn batch_approve(app: &AppHandle) -> Result<String, String> {
+    let n = crate::batch::batch_approve_ready(app.clone(), app.state())?;
+    Ok(format!("одобрено: {n}"))
+}
+
+pub fn batch_list(app: &AppHandle) -> Result<String, String> {
+    serde_json::to_string(&crate::batch::batch_list(app.state())?).map_err(|e| e.to_string())
+}
