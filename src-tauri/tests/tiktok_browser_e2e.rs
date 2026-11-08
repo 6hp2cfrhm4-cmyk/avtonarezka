@@ -61,9 +61,11 @@ const STUDIO: &str = r#"<!doctype html><meta charset=utf-8><title>макет Stu
         for (const ch of ed.innerText) { if (!/\s/.test(ch)) { n++; if (n > limit) break; } out += ch; }
         if (out !== ed.innerText) ed.innerText = out;
       });
+      // как TikTok: при ошибке загрузки появляется окно, кнопка остаётся неактивной
+      if (Q.get('upload_fails')) { const m = document.createElement('div'); m.textContent = 'Не удалось загрузить видео. Повторите попытку позже'; document.body.append(m); }
       const b = document.createElement('button');
       b.setAttribute('data-e2e', 'post_video_button'); b.id = 'post'; b.textContent = 'Опубликовать';
-      b.disabled = true; setTimeout(() => b.disabled = false, 600);
+      b.disabled = true; if (!Q.get('upload_fails')) setTimeout(() => b.disabled = false, 600);
       b.addEventListener('click', () => {
         window.__clicks++;
         if (Q.get('captcha')) return showCaptcha();
@@ -311,6 +313,19 @@ async fn an_editor_that_truncates_the_caption_is_caught_before_the_button_is_cli
     assert!(err.downcast_ref::<AfterClick>().is_none(), "до клика это обычная ошибка, ролик точно не вышел");
     let s = inspect_at(&e, "/studio").await;
     assert_eq!((s["clicks"].as_i64(), s["posted"].as_i64()), (Some(0), Some(0)), "кнопку не нажимали");
+    close(&e).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_upload_is_reported_as_such_and_no_caption_or_click_follows() {
+    let Some(e) = env("q_upload_fail") else { return };
+    let base = serve().await;
+    let err = drive(&queue_cfg(&e, format!("{base}/studio?upload_fails=1"), "Подпись"), &mut |_, _| {}).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("не принял видео") && msg.contains("можно отправить снова"), "{msg}");
+    assert!(err.downcast_ref::<AfterClick>().is_none(), "до клика: ролик точно не вышел, его можно отправить снова");
+    let s = inspect_at(&e, "/studio").await;
+    assert_eq!(s["clicks"].as_i64(), Some(0), "кнопку не нажимали");
     close(&e).await;
 }
 

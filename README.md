@@ -71,7 +71,7 @@
 ### Arch Linux
 
 ```bash
-sudo pacman -U avtonarezka-0.2.5-1-x86_64.pkg.tar.zst
+sudo pacman -U avtonarezka-0.2.6-1-x86_64.pkg.tar.zst
 ```
 
 Зависимости pacman подтянет сам: `ffmpeg`, `webkit2gtk-4.1`, `libsecret`, `vulkan-icd-loader`, `yt-dlp`, `deno`.
@@ -79,7 +79,7 @@ sudo pacman -U avtonarezka-0.2.5-1-x86_64.pkg.tar.zst
 
 ### Windows 11
 
-1. Скачай `avtonarezka-0.2.5-windows-x64-setup.exe` и запусти. Права администратора не нужны.
+1. Скачай `avtonarezka-0.2.6-windows-x64-setup.exe` и запусти. Права администратора не нужны.
 2. SmartScreen предупредит о неизвестном издателе. Установщик пока не подписан: нажми **«Подробнее» → «Выполнить в любом случае»**.
 3. Скачай модели (см. ниже) скриптом `fetch-models.ps1` из Releases.
 
@@ -198,7 +198,7 @@ scripts/build-release.sh        # воркер языковой модели →
 
 ## Статус
 
-Версия 0.2.5. Пакет для Arch собран и работает. Установщик для Windows собран на Linux и проверен
+Версия 0.2.6. Пакет для Arch собран и работает. Установщик для Windows собран на Linux и проверен
 в Wine, но на настоящей Windows 11 ещё не запускался. Пул аккаунтов и окно публикации проверены тестами, но
 не на живом TikTok. Нашёл проблему? Напиши в [Issues](https://github.com/6hp2cfrhm4-cmyk/avtonarezka/issues).
 

@@ -320,6 +320,36 @@ async fn wait_for(cdp: &mut Cdp, expr: &str, timeout: Duration, what: &str, capt
     }
 }
 
+const UPLOAD_ERROR_TEXT: &str = "TikTok не принял видео: на странице появилась ошибка загрузки. Ролик не опубликован, его можно отправить снова";
+
+/// На странице TikTok написано, что загрузка сорвалась (во всплывающем окне или в списке загрузок).
+const UPLOAD_FAILED_EXPR: &str = r#"(() => { const t = document.body ? document.body.innerText : ''; return /Не удалось загрузить|Ошибка загрузки/.test(t); })()"#;
+
+/// Знаков без пробелов в том поле подписи, куда писали. -1, если поле уже не на странице.
+const READ_CAPTION_EXPR: &str = r#"(() => { const el = window.__avtoCaption; return el && el.isConnected ? [...(el.innerText || '')].filter(c => !/\s/.test(c)).length : -1; })()"#;
+
+/// Ждёт, пока TikTok примет ролик (кнопка «Опубликовать» готова). Ошибка загрузки на странице — сразу провал, а не таймаут.
+async fn wait_upload(cdp: &mut Cdp, ready: &str, timeout: Duration, captcha: Option<&str>) -> anyhow::Result<()> {
+    let end = tokio::time::Instant::now() + timeout;
+    loop {
+        if cdp.eval(ready).await?.as_bool() == Some(true) {
+            return Ok(());
+        }
+        if cdp.eval(UPLOAD_FAILED_EXPR).await?.as_bool() == Some(true) {
+            bail!(UPLOAD_ERROR_TEXT);
+        }
+        if let Some(c) = captcha {
+            if cdp.eval(c).await?.as_bool() == Some(true) {
+                return Err(anyhow::Error::new(NeedsHuman(CAPTCHA_TEXT.into())));
+            }
+        }
+        if tokio::time::Instant::now() >= end {
+            bail!("TikTok не закончил загрузку ролика за {} с", timeout.as_secs());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Идентификатор вкладки из адреса управления `ws://127.0.0.1:порт/devtools/page/<id>`.
 fn tab_id(ws: &str) -> Option<&str> {
     ws.rsplit('/').next().filter(|s| !s.is_empty())
@@ -366,9 +396,16 @@ pub async fn drive(cfg: &DriveConfig, on: &mut (dyn FnMut(f64, &str) + Send)) ->
     let has_caption = format!("!!document.querySelector({})", js(&sel.caption));
     wait_for(cdp, &has_caption, cfg.step_timeout, "TikTok не показал поле подписи. Возможно, изменилась вёрстка страницы", captcha.as_deref()).await?;
 
+    // Поле подписи появляется сразу после выбора файла, а загрузка идёт дальше. Подпись пишем, когда TikTok принял ролик:
+    // при ошибке загрузки страница перерисовывается и введённый текст пропадает.
+    let ready = format!("(() => {{ const b = document.querySelector({}); return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'; }})()", js(&sel.post_button));
+    on(0.6, "Жду, пока TikTok загрузит ролик");
+    wait_upload(cdp, &ready, cfg.step_timeout, captcha.as_deref()).await?;
+
     on(0.7, "Вставляю подпись");
+    // запоминаем именно это поле: проверка потом читает то же самое, а не первое подходящее на странице
     let focus = format!(
-        "(() => {{ const el = document.querySelector({}); if (!el) return false; el.focus(); document.execCommand('selectAll', false); document.execCommand('delete', false); return document.activeElement === el; }})()",
+        "(() => {{ const el = document.querySelector({}); if (!el) return false; window.__avtoCaption = el; el.focus(); document.execCommand('selectAll', false); document.execCommand('delete', false); return document.activeElement === el; }})()",
         js(&sel.caption)
     );
     if cdp.eval(&focus).await?.as_bool() != Some(true) {
@@ -379,14 +416,16 @@ pub async fn drive(cfg: &DriveConfig, on: &mut (dyn FnMut(f64, &str) + Send)) ->
         // Поле TikTok могло принять не всё (лимит, обработчик): сверяем, что в нём ровно наш текст, до клика, а не после.
         // Пробелы и переводы строк не считаем: редактор раскладывает их по абзацам по-своему.
         let expected = cfg.caption.chars().filter(|c| !c.is_whitespace()).count();
-        let read = format!("(() => {{ const el = document.querySelector({}); return el ? [...(el.innerText || '')].filter(c => !/\\s/.test(c)).length : -1; }})()", js(&sel.caption));
         let mut got = -1;
         for _ in 0..10 {
-            got = cdp.eval(&read).await?.as_i64().unwrap_or(-1);
+            got = cdp.eval(READ_CAPTION_EXPR).await?.as_i64().unwrap_or(-1);
             if got == expected as i64 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if got == -1 {
+            bail!("Поле подписи пропало со страницы после загрузки: TikTok перерисовал страницу. Ролик не опубликован");
         }
         if got != expected as i64 {
             bail!("Текст в поле подписи не совпал с отправленным: в поле {got} знаков без пробелов, а должно быть {expected}. TikTok мог обрезать подпись, поэтому ролик не опубликован");
@@ -399,7 +438,6 @@ pub async fn drive(cfg: &DriveConfig, on: &mut (dyn FnMut(f64, &str) + Send)) ->
     }
 
     on(0.85, "Жду, когда станет доступна кнопка «Опубликовать»");
-    let ready = format!("(() => {{ const b = document.querySelector({}); return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'; }})()", js(&sel.post_button));
     wait_for(cdp, &ready, cfg.step_timeout, "Кнопка «Опубликовать» не стала доступной: TikTok ещё обрабатывает файл или изменилась вёрстка", captcha.as_deref()).await?;
     if cdp.eval(&format!("(() => {{ const b = document.querySelector({}); if (!b) return false; b.click(); return true; }})()", js(&sel.post_button))).await?.as_bool() != Some(true) {
         bail!("Кнопка «Опубликовать» пропала");
