@@ -19,10 +19,11 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::{
+    accounts,
     drafts::get as get_draft,
     state::AppState,
-    tiktok::api::make_title,
-    tiktok_cmds::{finish_post, begin_post, PostDone, PostFailed, PostProgress, PublishArgs, PublishStart},
+    tiktok::api::make_caption,
+    tiktok_cmds::{finish_post, begin_post, mark_sent, PostDone, PostFailed, PostProgress, PublishArgs, PublishStart},
 };
 
 pub const UPLOAD_URL: &str = "https://www.tiktok.com/tiktokstudio/upload";
@@ -32,17 +33,54 @@ pub struct Selectors {
     pub file_input: String,
     pub caption: String,
     pub post_button: String,
+    /// Кнопка в окне «Продолжить публикацию?» (TikTok так спрашивает, пока идёт проверка авторских прав). Пусто — окна нет.
+    pub confirm_button: String,
+    /// Признак успеха: адрес страницы после публикации содержит эту строку…
+    pub success_url: String,
+    /// …или на странице появился этот элемент. Если не задано ни то, ни другое, очередь не стартует: подтвердить публикацию нечем.
+    pub success_selector: String,
+    /// Окно проверки «я не робот». Видимое — значит, дальше решает человек: обходить такие проверки программа не пытается.
+    pub captcha: String,
 }
 
 impl Default for Selectors {
     fn default() -> Self {
+        // Рабочая гипотеза, не проверенная на живой странице (см. заголовок файла): сверять нужно человеку с аккаунтом.
         Self {
             file_input: r#"input[type="file"]"#.into(),
             caption: r#".public-DraftEditor-content[contenteditable="true"], div[contenteditable="true"]"#.into(),
             post_button: r#"button[data-e2e="post_video_button"]"#.into(),
+            confirm_button: String::new(),
+            success_url: "tiktokstudio/content".into(),
+            success_selector: String::new(),
+            captcha: r#"[id*="captcha" i], [class*="captcha" i]"#.into(),
         }
     }
 }
+
+/// TikTok просит человека: проверка «я не робот» или вход. Автоматика остановилась, дальше решает пользователь.
+#[derive(Debug)]
+pub struct NeedsHuman(pub String);
+
+impl std::fmt::Display for NeedsHuman {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeedsHuman {}
+
+/// Кнопка «Опубликовать» нажата, но выход ролика не подтверждён: он мог выйти. Повторять отправку нельзя, пока человек не проверил.
+#[derive(Debug)]
+pub struct AfterClick(pub String);
+
+impl std::fmt::Display for AfterClick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AfterClick {}
 
 /// Браузер на движке Chromium. Linux: сначала настоящий Chromium, затем Chrome (из PATH).
 /// Windows: Chrome, Chromium, затем Edge (он есть в любой Windows 11 и говорит на том же протоколе управления).
@@ -236,19 +274,44 @@ pub struct DriveConfig {
     pub login_timeout: Duration,
     /// Сколько ждать каждого следующего шага страницы (загрузка файла, редактор, кнопка).
     pub step_timeout: Duration,
+    /// После клика дождаться, пока TikTok подтвердит публикацию (адрес или элемент из `Selectors`). Для очереди обязательно.
+    pub require_confirmation: bool,
+    /// Сколько ждать этого подтверждения.
+    pub confirm_timeout: Duration,
+    /// После подтверждённой публикации закрыть вкладку: очередь из десятков роликов не должна копить окна.
+    pub close_on_success: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct DriveOutcome {
     /// Кнопка «Опубликовать» нажата программой. Иначе ролик ждёт нажатия пользователя.
     pub clicked_post: bool,
+    /// TikTok подтвердил публикацию (только при `require_confirmation`).
+    pub confirmed: bool,
 }
 
-async fn wait_for(cdp: &mut Cdp, expr: &str, timeout: Duration, what: &str) -> anyhow::Result<()> {
+/// Видимое окно проверки: скрытый контейнер с «captcha» в имени у страницы может быть всегда.
+fn captcha_expr(selector: &str) -> Option<String> {
+    (!selector.trim().is_empty()).then(|| {
+        format!(
+            "(() => {{ try {{ return [...document.querySelectorAll({})].some(e => {{ const r = e.getBoundingClientRect(); return r.width > 40 && r.height > 40 && getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).display !== 'none'; }}); }} catch (_) {{ return false; }} }})()",
+            js(selector)
+        )
+    })
+}
+
+const CAPTCHA_TEXT: &str = "TikTok просит пройти проверку (капчу) или войти. Реши её в окне браузера и запусти очередь снова: программа такие проверки не обходит";
+
+async fn wait_for(cdp: &mut Cdp, expr: &str, timeout: Duration, what: &str, captcha: Option<&str>) -> anyhow::Result<()> {
     let end = tokio::time::Instant::now() + timeout;
     loop {
         if cdp.eval(expr).await?.as_bool() == Some(true) {
             return Ok(());
+        }
+        if let Some(c) = captcha {
+            if cdp.eval(c).await?.as_bool() == Some(true) {
+                return Err(anyhow::Error::new(NeedsHuman(CAPTCHA_TEXT.into())));
+            }
         }
         if tokio::time::Instant::now() >= end {
             bail!("{what}");
@@ -257,11 +320,58 @@ async fn wait_for(cdp: &mut Cdp, expr: &str, timeout: Duration, what: &str) -> a
     }
 }
 
+const UPLOAD_ERROR_TEXT: &str = "TikTok не принял видео: на странице появилась ошибка загрузки. Ролик не опубликован, его можно отправить снова";
+
+/// На странице TikTok написано, что загрузка сорвалась (во всплывающем окне или в списке загрузок).
+const UPLOAD_FAILED_EXPR: &str = r#"(() => { const t = document.body ? document.body.innerText : ''; return /Не удалось загрузить|Ошибка загрузки/.test(t); })()"#;
+
+/// Знаков без пробелов в том поле подписи, куда писали. -1, если поле уже не на странице.
+const READ_CAPTION_EXPR: &str = r#"(() => { const el = window.__avtoCaption; return el && el.isConnected ? [...(el.innerText || '')].filter(c => !/\s/.test(c)).length : -1; })()"#;
+
+/// Ждёт, пока TikTok примет ролик (кнопка «Опубликовать» готова). Ошибка загрузки на странице — сразу провал, а не таймаут.
+async fn wait_upload(cdp: &mut Cdp, ready: &str, timeout: Duration, captcha: Option<&str>) -> anyhow::Result<()> {
+    let end = tokio::time::Instant::now() + timeout;
+    loop {
+        if cdp.eval(ready).await?.as_bool() == Some(true) {
+            return Ok(());
+        }
+        if cdp.eval(UPLOAD_FAILED_EXPR).await?.as_bool() == Some(true) {
+            bail!(UPLOAD_ERROR_TEXT);
+        }
+        if let Some(c) = captcha {
+            if cdp.eval(c).await?.as_bool() == Some(true) {
+                return Err(anyhow::Error::new(NeedsHuman(CAPTCHA_TEXT.into())));
+            }
+        }
+        if tokio::time::Instant::now() >= end {
+            bail!("TikTok не закончил загрузку ролика за {} с", timeout.as_secs());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Идентификатор вкладки из адреса управления `ws://127.0.0.1:порт/devtools/page/<id>`.
+fn tab_id(ws: &str) -> Option<&str> {
+    ws.rsplit('/').next().filter(|s| !s.is_empty())
+}
+
+async fn close_tab(port: u16, id: &str) {
+    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
+        let _ = c.get(format!("http://127.0.0.1:{port}/json/close/{id}")).send().await;
+    }
+}
+
 pub async fn drive(cfg: &DriveConfig, on: &mut (dyn FnMut(f64, &str) + Send)) -> anyhow::Result<DriveOutcome> {
     let sel = &cfg.selectors;
+    if cfg.auto_publish && cfg.require_confirmation && sel.success_url.is_empty() && sel.success_selector.is_empty() {
+        // до клика: нажать «Опубликовать» и не узнать, вышел ли ролик, хуже, чем не нажимать
+        bail!("Не задан признак успешной публикации (адрес или элемент страницы): подтвердить выход ролика нечем, поэтому ничего не отправлено");
+    }
+    let captcha = captcha_expr(&sel.captcha);
     on(0.02, "Открываю браузер");
     let port = ensure_browser(&cfg.chromium, &cfg.profile, cfg.headless, "about:blank").await?;
     let ws = open_tab(port, &cfg.upload_url).await?;
+    let tab = tab_id(&ws).map(str::to_string);
     let mut cdp = Connected::new(&ws).await?;
     let cdp = &mut cdp.0;
     cdp.call("Page.enable", json!({})).await?;
@@ -270,7 +380,7 @@ pub async fn drive(cfg: &DriveConfig, on: &mut (dyn FnMut(f64, &str) + Send)) ->
     // страница загрузки появляется только после входа: ждём поле выбора файла, пока пользователь входит
     let has_input = format!("!!document.querySelector({})", js(&sel.file_input));
     on(0.08, "Жду страницу загрузки TikTok. Если попросит, войди в аккаунт в окне браузера");
-    wait_for(cdp, &has_input, cfg.login_timeout, "Не дождался страницы загрузки TikTok: войди в аккаунт в окне браузера и повтори отправку").await?;
+    wait_for(cdp, &has_input, cfg.login_timeout, "Не дождался страницы загрузки TikTok: войди в аккаунт в окне браузера и повтори отправку", captcha.as_deref()).await?;
 
     on(0.25, "Выбираю файл");
     let doc = cdp.call("DOM.getDocument", json!({ "depth": 0 })).await?;
@@ -284,11 +394,18 @@ pub async fn drive(cfg: &DriveConfig, on: &mut (dyn FnMut(f64, &str) + Send)) ->
 
     on(0.45, "Жду, пока TikTok примет файл");
     let has_caption = format!("!!document.querySelector({})", js(&sel.caption));
-    wait_for(cdp, &has_caption, cfg.step_timeout, "TikTok не показал поле подписи. Возможно, изменилась вёрстка страницы").await?;
+    wait_for(cdp, &has_caption, cfg.step_timeout, "TikTok не показал поле подписи. Возможно, изменилась вёрстка страницы", captcha.as_deref()).await?;
+
+    // Поле подписи появляется сразу после выбора файла, а загрузка идёт дальше. Подпись пишем, когда TikTok принял ролик:
+    // при ошибке загрузки страница перерисовывается и введённый текст пропадает.
+    let ready = format!("(() => {{ const b = document.querySelector({}); return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'; }})()", js(&sel.post_button));
+    on(0.6, "Жду, пока TikTok загрузит ролик");
+    wait_upload(cdp, &ready, cfg.step_timeout, captcha.as_deref()).await?;
 
     on(0.7, "Вставляю подпись");
+    // запоминаем именно это поле: проверка потом читает то же самое, а не первое подходящее на странице
     let focus = format!(
-        "(() => {{ const el = document.querySelector({}); if (!el) return false; el.focus(); document.execCommand('selectAll', false); document.execCommand('delete', false); return document.activeElement === el; }})()",
+        "(() => {{ const el = document.querySelector({}); if (!el) return false; window.__avtoCaption = el; el.focus(); document.execCommand('selectAll', false); document.execCommand('delete', false); return document.activeElement === el; }})()",
         js(&sel.caption)
     );
     if cdp.eval(&focus).await?.as_bool() != Some(true) {
@@ -296,21 +413,83 @@ pub async fn drive(cfg: &DriveConfig, on: &mut (dyn FnMut(f64, &str) + Send)) ->
     }
     if !cfg.caption.is_empty() {
         cdp.call("Input.insertText", json!({ "text": cfg.caption })).await?;
+        // Поле TikTok могло принять не всё (лимит, обработчик): сверяем, что в нём ровно наш текст, до клика, а не после.
+        // Пробелы и переводы строк не считаем: редактор раскладывает их по абзацам по-своему.
+        let expected = cfg.caption.chars().filter(|c| !c.is_whitespace()).count();
+        let mut got = -1;
+        for _ in 0..10 {
+            got = cdp.eval(READ_CAPTION_EXPR).await?.as_i64().unwrap_or(-1);
+            if got == expected as i64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if got == -1 {
+            bail!("Поле подписи пропало со страницы после загрузки: TikTok перерисовал страницу. Ролик не опубликован");
+        }
+        if got != expected as i64 {
+            bail!("Текст в поле подписи не совпал с отправленным: в поле {got} знаков без пробелов, а должно быть {expected}. TikTok мог обрезать подпись, поэтому ролик не опубликован");
+        }
     }
 
     if !cfg.auto_publish {
         on(1.0, "Файл и подпись внесены. Проверь и нажми «Опубликовать» в окне TikTok");
-        return Ok(DriveOutcome { clicked_post: false });
+        return Ok(DriveOutcome { clicked_post: false, confirmed: false });
     }
 
     on(0.85, "Жду, когда станет доступна кнопка «Опубликовать»");
-    let ready = format!("(() => {{ const b = document.querySelector({}); return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'; }})()", js(&sel.post_button));
-    wait_for(cdp, &ready, cfg.step_timeout, "Кнопка «Опубликовать» не стала доступной: TikTok ещё обрабатывает файл или изменилась вёрстка").await?;
+    wait_for(cdp, &ready, cfg.step_timeout, "Кнопка «Опубликовать» не стала доступной: TikTok ещё обрабатывает файл или изменилась вёрстка", captcha.as_deref()).await?;
     if cdp.eval(&format!("(() => {{ const b = document.querySelector({}); if (!b) return false; b.click(); return true; }})()", js(&sel.post_button))).await?.as_bool() != Some(true) {
         bail!("Кнопка «Опубликовать» пропала");
     }
-    on(1.0, "Нажата кнопка «Опубликовать». Проверь результат в окне TikTok");
-    Ok(DriveOutcome { clicked_post: true })
+    if !cfg.require_confirmation {
+        on(1.0, "Нажата кнопка «Опубликовать». Проверь результат в окне TikTok");
+        return Ok(DriveOutcome { clicked_post: true, confirmed: false });
+    }
+
+    // Кнопка нажата: с этой минуты любой сбой означает «мог выйти», а не «не вышел».
+    on(0.95, "Нажата «Опубликовать», жду подтверждения от TikTok");
+    let success = format!(
+        "(() => {{ const u = {}; const s = {}; return (u !== '' && location.href.includes(u)) || (s !== '' && !!document.querySelector(s)); }})()",
+        js(&sel.success_url),
+        js(&sel.success_selector)
+    );
+    let confirm = (!sel.confirm_button.trim().is_empty()).then(|| {
+        format!("(() => {{ const b = document.querySelector({}); if (!b) return false; const r = b.getBoundingClientRect(); if (r.width < 1 || r.height < 1) return false; b.click(); return true; }})()", js(&sel.confirm_button))
+    });
+    let end = tokio::time::Instant::now() + cfg.confirm_timeout;
+    let mut confirm_clicks = 0;
+    loop {
+        // страница в этот момент переходит на другой адрес, и запрос может не пройти: это не провал, спрашиваем снова
+        if cdp.eval(&success).await.is_ok_and(|v| v.as_bool() == Some(true)) {
+            break;
+        }
+        if let Some(c) = &captcha {
+            if cdp.eval(c).await.unwrap_or(Value::Null).as_bool() == Some(true) {
+                return Err(anyhow::Error::new(AfterClick(format!("{CAPTCHA_TEXT}. «Опубликовать» уже нажато: проверь в TikTok Studio, вышел ли ролик"))));
+            }
+        }
+        if let (Some(c), true) = (&confirm, confirm_clicks < 3) {
+            if cdp.eval(c).await.unwrap_or(Value::Null).as_bool() == Some(true) {
+                confirm_clicks += 1;
+                on(0.97, "Подтверждаю публикацию в окне TikTok");
+            }
+        }
+        if tokio::time::Instant::now() >= end {
+            return Err(anyhow::Error::new(AfterClick(format!(
+                "TikTok не подтвердил публикацию за {} с. «Опубликовать» нажато: проверь в TikTok Studio, вышел ли ролик",
+                cfg.confirm_timeout.as_secs()
+            ))));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    on(1.0, "TikTok подтвердил публикацию");
+    if cfg.close_on_success {
+        if let Some(id) = &tab {
+            close_tab(port, id).await;
+        }
+    }
+    Ok(DriveOutcome { clicked_post: true, confirmed: true })
 }
 
 struct Connected(Cdp);
@@ -323,9 +502,87 @@ impl Connected {
 
 // ---------------------------------------------------------------- стык с приложением
 
+/// Длина подписи, которую принимает страница загрузки TikTok Studio (у API `title` короче: 2200). Сверена по сторонним
+/// источникам, не по живой странице: ошибка здесь поймается сверкой текста в поле до клика (см. `drive`).
+pub const CAPTION_LIMIT: usize = 4000;
+
+/// Что и как отправить через страницу загрузки.
+pub(crate) struct BrowserPost {
+    pub file: PathBuf,
+    pub caption: String,
+    pub auto_publish: bool,
+    /// Дождаться подтверждения публикации от TikTok. Для очереди обязательно.
+    pub require_confirmation: bool,
+    pub close_on_success: bool,
+    /// Профиль Chromium аккаунта, с которого идёт выкладка: в нём лежит вход в TikTok.
+    pub profile: PathBuf,
+}
+
+/// Окно Chromium с профилем аккаунта на странице загрузки, чтобы человек вошёл в TikTok. Не ждёт входа:
+/// окно остаётся открытым, а очередь потом пользуется тем же профилем.
+pub(crate) async fn open_login_window(chromium: &Path, profile: &Path) -> anyhow::Result<()> {
+    let port = ensure_browser(chromium, profile, false, "about:blank").await?;
+    open_tab(port, &upload_url()).await?;
+    Ok(())
+}
+
+fn upload_url() -> String {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("AVTO_TIKTOK_UPLOAD_URL").unwrap_or_else(|_| UPLOAD_URL.into())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        UPLOAD_URL.to_string()
+    }
+}
+
+/// Один ролик через браузер, с событиями хода `post-progress`. Записей в журнал не делает: это забота вызывающего.
+pub(crate) async fn run_browser_post(app: &AppHandle, draft_id: i64, p: BrowserPost) -> anyhow::Result<DriveOutcome> {
+    let chromium = find_chromium().ok_or_else(|| anyhow!("Не найден Chromium. Установи пакет chromium или Google Chrome"))?;
+    // по одной выкладке за раз: очередь и ручной диалог не пишут в браузер одновременно
+    let state = app.state::<AppState>();
+    let _turn = state.browser_gate.lock().await;
+    #[allow(unused_mut)] // в release подмен нет
+    let mut selectors = Selectors::default();
+    #[cfg(debug_assertions)]
+    {
+        // макет страницы для проверок без настоящего TikTok
+        if let Ok(v) = std::env::var("AVTO_TIKTOK_SUCCESS_URL") {
+            selectors.success_url = v;
+        }
+        if let Ok(v) = std::env::var("AVTO_TIKTOK_CONFIRM") {
+            selectors.confirm_button = v;
+        }
+    }
+    // в проверках без человека окно браузера не нужно (только debug-сборка)
+    let headless = cfg!(debug_assertions) && std::env::var("AVTO_TIKTOK_HEADLESS").is_ok_and(|v| v == "1");
+    let cfg = DriveConfig {
+        chromium,
+        profile: p.profile,
+        headless,
+        upload_url: upload_url(),
+        file: p.file,
+        caption: p.caption,
+        auto_publish: p.auto_publish,
+        selectors,
+        login_timeout: Duration::from_secs(600),
+        step_timeout: Duration::from_secs(180),
+        require_confirmation: p.require_confirmation,
+        confirm_timeout: Duration::from_secs(120),
+        close_on_success: p.close_on_success,
+    };
+    let reporter = app.clone();
+    drive(&cfg, &mut |fraction, message| {
+        let _ = reporter.emit("post-progress", PostProgress { draft_id, fraction, message: message.to_string() });
+    })
+    .await
+}
+
 pub(crate) async fn start(app: AppHandle, state: State<'_, AppState>, args: PublishArgs, file: PathBuf, auto_publish: bool) -> Result<PublishStart, String> {
-    let chromium = find_chromium().ok_or("Не найден Chromium. Установи пакет chromium или выбери способ «через API»")?;
-    let (post_id, caption) = {
+    find_chromium().ok_or("Не найден Chromium. Установи пакет chromium или выбери способ «через API»")?;
+    // ручной диалог выкладывает с основного аккаунта: его вход лежит в его профиле
+    let (post_id, caption, account, profile) = {
         let db = state.db.0.lock().unwrap();
         let d = get_draft(&db, args.draft_id)?;
         db.execute(
@@ -333,40 +590,15 @@ pub(crate) async fn start(app: AppHandle, state: State<'_, AppState>, args: Publ
             rusqlite::params![d.moment_id, args.caption.trim(), serde_json::to_string(&crate::tiktok::api::normalize_hashtags(&args.hashtags)).unwrap_or_else(|_| "[]".into())],
         )
         .map_err(|e| e.to_string())?;
-        (begin_post(&db, args.draft_id, "browser", "browser").map_err(|e| e.to_string())?, make_title(&args.caption, &args.hashtags))
+        let account = accounts::main_id(&db);
+        let profile = accounts::profile_dir(&db, &state.data_dir, account)?;
+        (begin_post(&db, args.draft_id, "browser", "browser").map_err(|e| e.to_string())?, make_caption(&args.caption, &args.hashtags, CAPTION_LIMIT), account, profile)
     };
     state.posting.lock().unwrap().insert(args.draft_id);
-    let profile = state.data_dir.join("tiktok-browser");
     let draft_id = args.draft_id;
 
     tauri::async_runtime::spawn(async move {
-        let url = {
-            #[cfg(debug_assertions)]
-            {
-                std::env::var("AVTO_TIKTOK_UPLOAD_URL").unwrap_or_else(|_| UPLOAD_URL.into())
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                UPLOAD_URL.to_string()
-            }
-        };
-        let cfg = DriveConfig {
-            chromium,
-            profile,
-            headless: false,
-            upload_url: url,
-            file,
-            caption,
-            auto_publish,
-            selectors: Selectors::default(),
-            login_timeout: Duration::from_secs(600),
-            step_timeout: Duration::from_secs(180),
-        };
-        let reporter = app.clone();
-        let result = drive(&cfg, &mut |fraction, message| {
-            let _ = reporter.emit("post-progress", PostProgress { draft_id, fraction, message: message.to_string() });
-        })
-        .await;
+        let result = run_browser_post(&app, draft_id, BrowserPost { file, caption, auto_publish, require_confirmation: false, close_on_success: false, profile }).await;
 
         let state = app.state::<AppState>();
         state.posting.lock().unwrap().remove(&draft_id);
@@ -375,7 +607,13 @@ pub(crate) async fn start(app: AppHandle, state: State<'_, AppState>, args: Publ
             Ok(_) => Ok(("Файл и подпись внесены в окне TikTok. Осталось проверить и нажать «Опубликовать».".to_string(), None)),
             Err(e) => Err(format!("{e:#}")),
         };
-        finish_post(&state.db.0.lock().unwrap(), post_id, &stored);
+        {
+            let db = state.db.0.lock().unwrap();
+            finish_post(&db, post_id, &stored);
+            if matches!(&result, Ok(o) if o.clicked_post) {
+                mark_sent(&db, post_id, account);
+            }
+        }
         let _ = match stored {
             Ok((detail, _)) => app.emit("post-done", PostDone { draft_id, detail }),
             Err(message) => app.emit("post-error", PostFailed { draft_id, message }),

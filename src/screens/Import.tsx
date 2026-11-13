@@ -7,6 +7,7 @@ import { api, errText, fmtDuration, inTauri, type AssetKind, type Project } from
 import AssetLibrary, { addAssets, AUDIO_EXT, VIDEO_EXT } from "../components/AssetLibrary";
 import DownloadsList from "../components/DownloadsList";
 import YoutubeCard from "../components/YoutubeCard";
+import BatchPanel from "../components/BatchPanel";
 import { extractYoutubeLink } from "../lib/youtube";
 import { useUi } from "../store";
 import { Arrow, Film, Link, Trash, Upload } from "../components/icons";
@@ -15,7 +16,7 @@ import { Switch } from "../components/Controls";
 const EXT = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts", "mpg", "mpeg"];
 const isVideo = (p: string) => EXT.includes(p.split(".").pop()?.toLowerCase() ?? "");
 
-type Mode = "file" | "youtube";
+type Mode = "file" | "youtube" | "batch";
 
 export default function ImportScreen() {
   const { project, projects, setProject, setProjects, notify, go } = useUi();
@@ -160,13 +161,19 @@ export default function ImportScreen() {
         <div className="flex min-w-0 flex-col gap-3">
           <ModeTabs mode={mode} onChange={setMode} />
           <AnimatePresence mode="wait" initial={false}>
-            {mode === "file" ? (
+            {mode === "file" && (
               <motion.div key="file" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.18 }}>
                 <DropZone dragging={dragging} busy={busy} onPick={pick} />
               </motion.div>
-            ) : (
+            )}
+            {mode === "youtube" && (
               <motion.div key="youtube" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.18 }}>
                 <YoutubeCard paste={paste} />
+              </motion.div>
+            )}
+            {mode === "batch" && (
+              <motion.div key="batch" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.18 }}>
+                <BatchPanel />
               </motion.div>
             )}
           </AnimatePresence>
@@ -252,6 +259,7 @@ function ModeTabs({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => void 
   const tabs = [
     { id: "file" as const, label: "Файл", Icon: Upload },
     { id: "youtube" as const, label: "Ссылка YouTube", Icon: Link },
+    { id: "batch" as const, label: "Пачка", Icon: Film },
   ];
   return (
     <div className="glass-lite inline-flex self-start rounded-2xl p-1">

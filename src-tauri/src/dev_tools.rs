@@ -78,7 +78,7 @@ pub fn accept_all(app: &AppHandle, project_id: i64) -> Result<String, String> {
 
 /// Собирает черновики, как кнопка «Собрать черновики».
 pub fn generate(app: &AppHandle, project_id: i64) -> Result<String, String> {
-    let n = crate::drafts::drafts_generate(app.clone(), app.state(), project_id)?;
+    let n = crate::drafts::generate_and_render(app, project_id)?;
     Ok(format!("создано черновиков: {n}"))
 }
 
@@ -89,7 +89,7 @@ pub fn rerender(app: &AppHandle, draft_id: i64) {
 
 /// Запускает финальный рендер одобренных черновиков, как кнопка «Финальный рендер».
 pub fn finals(app: &AppHandle, project_id: i64) -> Result<String, String> {
-    let n = crate::drafts::finals_start(app.clone(), app.state(), project_id)?;
+    let n = crate::drafts::start_finals(app, project_id)?;
     Ok(format!("запущено финалов: {n}"))
 }
 
@@ -135,6 +135,37 @@ pub async fn tiktok_publish(app: &AppHandle, q: &std::collections::HashMap<Strin
     };
     let r = tiktok_publish(app.clone(), app.state(), args).await?;
     serde_json::to_string(&r).map_err(|e| e.to_string())
+}
+
+/// Очередь автовыкладки: состояние, написание описаний, запуск (с согласием, как кнопка в диалоге), остановка.
+pub fn queue_state(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    let q = crate::publish_queue::queue_state(app.state(), project_id)?;
+    serde_json::to_string(&q).map_err(|e| e.to_string())
+}
+
+pub async fn queue_prepare(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    crate::publish_queue::queue_prepare(app.clone(), app.state(), project_id).await.map(|_| "описания пишутся".into())
+}
+
+pub fn queue_start(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    crate::publish_queue::queue_start(app.clone(), app.state(), project_id, true).map(|_| "очередь запущена".into())
+}
+
+pub fn queue_stop(app: &AppHandle, project_id: i64) -> Result<String, String> {
+    crate::publish_queue::queue_stop(app.clone(), app.state(), project_id).map(|_| "очередь остановлена".into())
+}
+
+pub fn queue_apply_text(app: &AppHandle, project_id: i64, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
+    let tags = q.get("tags").map(|t| t.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+    crate::publish_queue::queue_apply_text(app.clone(), app.state(), project_id, q.get("text").cloned().unwrap_or_default(), tags).map(|n| format!("текст назначен роликам: {n}"))
+}
+
+pub fn queue_settings(app: &AppHandle, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
+    let get = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok()).ok_or_else(|| format!("нужен ?{k}=<число>"));
+    // окно необязательно: без него публикация идёт весь день
+    let opt = |k: &str, default: i64| q.get(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(default);
+    let s = crate::publish_queue::queue_settings_set(app.state(), get("pause")?, get("limit")?, opt("from", 0), opt("to", 1440))?;
+    serde_json::to_string(&s).map_err(|e| e.to_string())
 }
 
 /// Убирает все следы проверки: секрет из связки ключей, вход и настройки TikTok.
@@ -190,4 +221,26 @@ pub async fn snapshot(app: &AppHandle, path: PathBuf) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 pub async fn snapshot(_app: &AppHandle, _path: PathBuf) -> Result<(), String> {
     Err("снимок окна реализован только для Linux".into())
+}
+
+/// Пачка для проверки: один файл за вызов, как «Добавить файлы в пачку».
+pub fn batch_add(app: &AppHandle, path: String, precut: bool) -> Result<String, String> {
+    let item = crate::batch::NewItem { kind: "file".into(), source: path, title: String::new(), preset: "1080".into(), precut };
+    let n = crate::batch::batch_add(app.clone(), app.state(), vec![item])?;
+    Ok(format!("в пачке: {n}"))
+}
+
+/// Запуск пачки, как «Запустить пачку».
+pub fn batch_start(app: &AppHandle) {
+    crate::batch::batch_start(app.clone());
+}
+
+/// Одобрение готовых черновиков пачки, как «Одобрить готовые по пачке».
+pub fn batch_approve(app: &AppHandle) -> Result<String, String> {
+    let n = crate::batch::batch_approve_ready(app.clone(), app.state())?;
+    Ok(format!("одобрено: {n}"))
+}
+
+pub fn batch_list(app: &AppHandle) -> Result<String, String> {
+    serde_json::to_string(&crate::batch::batch_list(app.state())?).map_err(|e| e.to_string())
 }

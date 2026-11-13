@@ -288,11 +288,23 @@ pub(crate) fn begin_post(db: &Connection, draft_id: i64, method: &str, mode: &st
     Ok(db.last_insert_rowid())
 }
 
+/// Выкладка готового ролика из папки. Записи без черновика не попадают в список «последние выкладки» по проекту,
+/// но учитываются в суточном лимите аккаунта (`sent_at`).
+pub(crate) fn begin_ready_post(db: &Connection, ready_id: i64, method: &str, mode: &str) -> rusqlite::Result<i64> {
+    db.execute("INSERT INTO posts (ready_id, method, mode, status) VALUES (?1, ?2, ?3, 'uploading')", params![ready_id, method, mode])?;
+    Ok(db.last_insert_rowid())
+}
+
 pub(crate) fn finish_post(db: &Connection, id: i64, result: &Result<(String, Option<String>), String>) {
     let _ = match result {
         Ok((detail, publish_id)) => db.execute("UPDATE posts SET status = 'done', detail = ?2, publish_id = ?3, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![id, detail, publish_id]),
         Err(e) => db.execute("UPDATE posts SET status = 'failed', error = ?2, updated_at = unixepoch() WHERE id = ?1", params![id, e]),
     };
+}
+
+/// Ролик ушёл с аккаунта: время выкладки и аккаунт попадают в суточный лимит. `None` — основной аккаунт.
+pub(crate) fn mark_sent(db: &Connection, id: i64, account: Option<i64>) {
+    let _ = db.execute("UPDATE posts SET sent_at = unixepoch(), account_id = COALESCE(?2, account_id) WHERE id = ?1", params![id, account]);
 }
 
 /// Последняя отправка каждого ролика проекта.

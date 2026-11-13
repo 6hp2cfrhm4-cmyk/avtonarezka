@@ -1,3 +1,4 @@
+mod accounts;
 mod analysis_cmds;
 mod assets_cmds;
 mod commands;
@@ -12,9 +13,13 @@ pub mod youtube;
 mod dev_tools;
 mod media;
 mod media_server;
+mod model_download;
 pub mod models;
 pub mod platform;
 mod state;
+mod publish_queue;
+mod batch;
+mod ready;
 mod tiktok_cmds;
 pub mod vulkan_loader;
 mod youtube_cmds;
@@ -49,6 +54,8 @@ pub fn run() {
             install_fonts(&data_dir.join("fonts"))?;
             drafts::recover_interrupted(&db.0.lock().unwrap());
             tiktok_cmds::recover_interrupted_posts(&db.0.lock().unwrap());
+            publish_queue::recover_interrupted_jobs(&db.0.lock().unwrap());
+            batch::recover_interrupted(&db.0.lock().unwrap());
             app.manage(state::AppState {
                 db,
                 media,
@@ -58,12 +65,22 @@ pub fn run() {
                 draft_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
                 final_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
                 nvenc: Default::default(),
+                cuda: Default::default(),
                 secrets: tiktok::secrets::Secrets::detect(),
                 login: Default::default(),
                 posting: Default::default(),
+                browser_gate: Default::default(),
+                models_downloading: Default::default(),
+                publisher: Default::default(),
+                drafting: Default::default(),
+                queue_note: Default::default(),
                 downloads: Default::default(),
                 youtube_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+                batch: Default::default(),
             });
+            // модели качаются сами, если их нет: без них анализ не запустится
+            model_download::start(app.handle());
+            batch::resume(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -74,6 +91,7 @@ pub fn run() {
             commands::delete_project,
             commands::project_set_tight,
             analysis_cmds::models_status,
+            model_download::models_download,
             analysis_cmds::analysis_start,
             analysis_cmds::analysis_cancel,
             analysis_cmds::analysis_notes,
@@ -109,6 +127,30 @@ pub fn run() {
             tiktok_cmds::tiktok_logout,
             tiktok_cmds::tiktok_publish,
             tiktok_cmds::posts_list,
+            publish_queue::queue_state,
+            publish_queue::queue_prepare,
+            publish_queue::queue_prepare_cancel,
+            publish_queue::queue_apply_text,
+            publish_queue::queue_job_update,
+            publish_queue::queue_job_resolve,
+            publish_queue::queue_settings_set,
+            publish_queue::queue_start,
+            publish_queue::queue_pause,
+            publish_queue::queue_stop,
+            batch::batch_list,
+            batch::batch_add,
+            batch::batch_start,
+            batch::batch_cancel,
+            batch::batch_remove,
+            batch::batch_retry,
+            batch::batch_approve_ready,
+            ready::ready_add,
+            ready::ready_remove,
+            publish_queue::queue_job_account,
+            accounts::accounts_add,
+            accounts::accounts_set_enabled,
+            accounts::accounts_remove,
+            accounts::accounts_open_login,
             youtube_cmds::youtube_analyze,
             youtube_cmds::youtube_download,
             youtube_cmds::youtube_cancel,

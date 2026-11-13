@@ -4,6 +4,7 @@ import Scene from "./scene/Scene";
 import Stepper from "./components/Stepper";
 import TopBar from "./components/TopBar";
 import Toasts from "./components/Toasts";
+import ModelsBanner from "./components/ModelsBanner";
 import ErrorBoundary from "./components/ErrorBoundary";
 import ImportScreen from "./screens/Import";
 import AnalysisScreen from "./screens/Analysis";
@@ -12,7 +13,7 @@ import DraftsScreen from "./screens/Drafts";
 import FinalScreen from "./screens/Final";
 import { onEvent } from "./lib/events";
 import { listen } from "@tauri-apps/api/event";
-import { api, errText, inTauri, type DoneEvent, type ErrorEvent, type ProgressEvent, type LoginEvent, type PostDoneEvent, type PostFailedEvent, type PostProgressEvent, type RenderDoneEvent, type RenderFailedEvent, type RenderProgressEvent, type YoutubeDoneEvent, type YoutubeErrorEvent, type YoutubeProgressEvent } from "./lib/api";
+import { api, errText, inTauri, type DoneEvent, type ErrorEvent, type ProgressEvent, type LoginEvent, type PostDoneEvent, type PostFailedEvent, type PostProgressEvent, type QueueTextEvent, type RenderDoneEvent, type RenderFailedEvent, type RenderProgressEvent, type YoutubeDoneEvent, type YoutubeErrorEvent, type YoutubeProgressEvent } from "./lib/api";
 import { SCREENS, useUi, type ScreenId } from "./store";
 
 /** Экраны с сеткой карточек. Их не крутим в 3D: целый прокручиваемый экран в 3D-слое с перспективой для композитора лишняя нагрузка. */
@@ -133,6 +134,27 @@ export default function App() {
     return () => offs.forEach((f) => f());
   }, []);
 
+  // Очередь автовыкладки: любое изменение — перечитываем состояние (оно небольшое), ход написания описаний — в карточки.
+  useEffect(() => {
+    const ui = () => useUi.getState();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const reload = () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const p = ui().project;
+        if (p) ui().setQueue(await api.queueState(p.id).catch(() => ui().queue));
+      }, 120);
+    };
+    const offs = [
+      onEvent<{ projectId?: number }>("queue-update", reload),
+      onEvent<QueueTextEvent>("queue-text", (e) => ui().setQueueText(e.draftId, e.message)),
+    ];
+    return () => {
+      clearTimeout(timer);
+      offs.forEach((f) => f());
+    };
+  }, []);
+
   // События загрузки с YouTube: ход, готово, ошибка или остановка.
   useEffect(() => {
     const ui = () => useUi.getState();
@@ -193,6 +215,7 @@ export default function App() {
       <Scene />
       <div className="relative z-10 flex h-full flex-col gap-6 p-7">
         <TopBar />
+        <ModelsBanner />
         <div className="flex min-h-0 flex-1 gap-8">
           <aside className="w-[230px] shrink-0 pt-2">
             <Stepper />

@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AppInfo, Asset, Defaults, Draft, Moment, Post, Project, TikTokStatus, YoutubeProgressEvent } from "./lib/api";
+import type { AppInfo, Asset, Defaults, Draft, Moment, Post, Project, PublishJob, QueueState, TikTokStatus, YoutubeProgressEvent } from "./lib/api";
 
 export type ScreenId = "import" | "analysis" | "moments" | "drafts" | "final";
 
@@ -50,6 +50,13 @@ interface UiState {
   posts: Record<number, Post>;
   /** Ход отправки в TikTok по id черновика. */
   postProgress: Record<number, { fraction: number; message: string }>;
+  /** Очередь автовыкладки выбранного проекта и её задачи по id черновика (карточки берут свою без перерисовки остальных). */
+  queue: QueueState | null;
+  queueJobs: Record<number, PublishJob>;
+  /** Что сейчас делает модель по черновику: «Пишу описание, часть 2 из 4». */
+  queueText: Record<number, string>;
+  setQueue: (q: QueueState | null) => void;
+  setQueueText: (draftId: number, message: string | null) => void;
   /** Загрузки с YouTube по id задачи (в порядке появления). */
   downloads: Record<string, DownloadJob>;
   upsertDownload: (e: YoutubeProgressEvent) => void;
@@ -124,6 +131,17 @@ export const useUi = create<UiState>((set, get) => ({
   tiktok: null,
   posts: {},
   postProgress: {},
+  queue: null,
+  queueJobs: {},
+  queueText: {},
+  setQueue: (queue) => set({ queue, queueJobs: Object.fromEntries((queue?.jobs ?? []).map((j) => [j.draftId, j])) }),
+  setQueueText: (id, message) =>
+    set((s) => {
+      const next = { ...s.queueText };
+      if (message === null) delete next[id];
+      else next[id] = message;
+      return { queueText: next };
+    }),
   downloads: {},
   upsertDownload: (e) =>
     set((s) => {

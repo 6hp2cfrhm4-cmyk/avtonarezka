@@ -72,7 +72,7 @@ Ready-made packages are on the [Releases](https://github.com/6hp2cfrhm4-cmyk/avt
 ### Arch Linux
 
 ```bash
-sudo pacman -U avtonarezka-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U avtonarezka-0.3.0-1-x86_64.pkg.tar.zst
 ```
 
 pacman installs the dependencies: `ffmpeg`, `webkit2gtk-4.1`, `libsecret`, `vulkan-icd-loader`, `yt-dlp`, `deno`.
@@ -81,7 +81,7 @@ You also need an `ffmpeg` build with `h264_nvenc` and `libass`, and a Vulkan dri
 
 ### Windows 11
 
-1. Download `avtonarezka-0.1.1-windows-x64-setup.exe` and run it. No administrator rights are needed.
+1. Download `avtonarezka-0.3.0-windows-x64-setup.exe` and run it. No administrator rights are needed.
 2. SmartScreen will warn about an unknown publisher. The installer is not signed yet: click **More info → Run anyway**.
 3. Download the models (see below) with `fetch-models.ps1` from the Releases page.
 
@@ -89,7 +89,8 @@ ffmpeg, ffprobe, yt-dlp and Deno are already included in the installer. You don'
 
 ### Models (about 3 GB, once)
 
-The models are not included in the packages. The script downloads them and verifies SHA256 checksums; an interrupted download can be resumed.
+The models are not included in the packages. The app downloads them by itself on launch if any are missing: progress
+shows as a bar at the top. Checked with SHA256 checksums; an interrupted download resumes. To download by hand:
 
 ```bash
 scripts/fetch-models.sh                    # from the source tree
@@ -134,6 +135,39 @@ you can only publish with "Only me" visibility, and at most 5 drafts per day.
 **Through the browser.** The app opens Chromium or Edge with a separate profile and fills in the upload page. You sign in
 to your account yourself in that window. This depends on TikTok's page layout and can break after a TikTok update.
 
+### Auto-posting every clip
+
+The Final screen has an "Auto-posting to TikTok" panel. It works through the browser only: a long description does not
+fit the API (its caption is limited to 2200 characters).
+
+1. **"Write descriptions"**: the local model writes a separate text for every finished clip from its transcript, plus up to
+   5 hashtags. Together with the hashtags it is exactly 3990–3999 characters. You can edit any description, and the counter
+   shows whether it still fits the window.
+2. **"Start posting"**: after you confirm, the clips go out one at a time. There is a pause between them (45 minutes by
+   default). The limit "per day per account" (5 by default) counts local days from midnight. Clips go out only inside the
+   publishing window "from … to …" (the whole day by default, in local time). The app clicks "Post" itself and waits for
+   TikTok to confirm the publication.
+
+### Account pool
+
+In the "Accounts for posting" block, paste a list of accounts, one per line, or load a `.txt` file. For each one click
+"Sign in": a browser window opens with its own profile, and you sign in to TikTok there. The app never sees or stores
+passwords. If two or more accounts are enabled, the clips go round in a circle (first, second, then the first again),
+skipping any account that has already reached its daily limit. Clips from the pool get no "Part N" label. The main account
+keeps the old sign-in.
+
+Good to know:
+
+- The app has to stay open while the queue runs. After a restart the queue does not start by itself; start it again. If the
+  computer sleeps, the queue carries on by the clock.
+- If TikTok asks you to sign in or pass a check ("I'm not a robot"), the queue pauses. You pass the check yourself in the
+  browser window; the app does not get around it.
+- If there is no confirmation after the "Post" click, the clip is marked "Check in TikTok": it may have gone out. The queue
+  will not send it again until you decide: "It went out", "Send again" or "Remove".
+- The visibility of a clip comes from your account settings in TikTok Studio. Check it before you start.
+- Automating the website is not allowed by TikTok's rules, so your account may get restricted. That is why the default limit
+  is small.
+
 ## Data
 
 Everything lives in `~/.local/share/app.avtonarezka.desktop/` (Windows: `%LOCALAPPDATA%\app.avtonarezka.desktop\`):
@@ -166,8 +200,9 @@ Development: `npm run tauri dev`. Tests: `cd src-tauri && cargo test` (heavy che
 
 ## Status
 
-Version 0.1.1. The Arch package is built and in use. The Windows installer is built on Linux and
-tested under Wine, but it has not yet been run on a real Windows 11 machine. Found a problem? Open an [issue](https://github.com/6hp2cfrhm4-cmyk/avtonarezka/issues).
+Version 0.3.0. The Arch package is built and in use. The Windows installer is built on Linux and
+tested under Wine, but it has not yet been run on a real Windows 11 machine. The account pool and the publishing window
+are covered by tests, but not yet tried on a live TikTok account. Found a problem? Open an [issue](https://github.com/6hp2cfrhm4-cmyk/avtonarezka/issues).
 
 ## License
 

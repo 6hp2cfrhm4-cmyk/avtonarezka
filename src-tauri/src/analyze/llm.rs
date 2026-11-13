@@ -106,6 +106,20 @@ pub fn find_worker() -> Option<PathBuf> {
     [dir.join(name), dir.parent()?.join(name)].into_iter().find(|p| p.is_file())
 }
 
+/// Как модели выбирать слова. По умолчанию — осторожно, как для оценки фрагментов.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub seed: Option<u32>,
+    pub repeat_penalty: Option<f32>,
+}
+
+impl Default for Sampling {
+    fn default() -> Self {
+        Self { temperature: 0.2, seed: None, repeat_penalty: None }
+    }
+}
+
 pub struct LlmClient {
     child: Child,
     stdin: ChildStdin,
@@ -148,9 +162,20 @@ impl LlmClient {
     }
 
     pub async fn complete(&mut self, prompt: &str, grammar: &str, max_tokens: u32) -> anyhow::Result<String> {
+        self.complete_with(prompt, grammar, max_tokens, Sampling::default()).await
+    }
+
+    /// То же с настройкой выбора слов: для длинных текстов нужны температура повыше, своё зерно и штраф за повторы.
+    pub async fn complete_with(&mut self, prompt: &str, grammar: &str, max_tokens: u32, s: Sampling) -> anyhow::Result<String> {
         let id = self.next_id;
         self.next_id += 1;
-        let req = serde_json::json!({ "id": id, "prompt": prompt, "grammar": grammar, "maxTokens": max_tokens, "temperature": 0.2 });
+        let mut req = serde_json::json!({ "id": id, "prompt": prompt, "grammar": grammar, "maxTokens": max_tokens, "temperature": s.temperature });
+        if let Some(seed) = s.seed {
+            req["seed"] = seed.into();
+        }
+        if let Some(p) = s.repeat_penalty {
+            req["repeatPenalty"] = p.into();
+        }
         self.stdin.write_all(format!("{req}\n").as_bytes()).await?;
         self.stdin.flush().await?;
         let line = self.stdout.next_line().await?.context("llm-worker закрыл вывод")?;

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { api, errText, fmtDuration, type AnalysisOptions, type ModelsStatus } from "../lib/api";
+import { onEvent } from "../lib/events";
 import { useUi } from "../store";
 import { Arrow, Check } from "../components/icons";
 import { Field, Switch } from "../components/Controls";
@@ -30,7 +31,10 @@ export default function AnalysisScreen() {
   });
 
   useEffect(() => {
-    api.modelsStatus().then(setModels).catch((e) => notify(errText(e), "error"));
+    const load = () => api.modelsStatus().then(setModels).catch((e) => notify(errText(e), "error"));
+    void load();
+    // модели могут докачаться уже на этом экране: тогда переключатели должны загореться без перехода
+    return onEvent("models-done", () => void load());
   }, [notify]);
 
   if (!project) {

@@ -185,6 +185,14 @@ async fn cancelled(rx: &mut watch::Receiver<bool>) {
 /// Ставит загрузку в очередь. Возвращает id задачи; дальше всё сообщают события.
 #[tauri::command]
 pub fn youtube_download(app: AppHandle, state: State<'_, AppState>, args: StartArgs) -> CmdResult<String> {
+    let (job, ytdlp, out_dir, rx) = register(&state, args)?;
+    let id = job.id.clone();
+    tauri::async_runtime::spawn(run(app, job, ytdlp, out_dir, rx));
+    Ok(id)
+}
+
+/// Проверяет ссылку и заводит задачу в списке идущих (чтобы её можно было остановить).
+fn register(state: &AppState, args: StartArgs) -> CmdResult<(Job, PathBuf, PathBuf, watch::Receiver<bool>)> {
     let video_id = extract_video_id(&args.url).map_err(|e| e.to_string())?;
     select::height_limit(&args.preset)?;
     let ytdlp = engine::find_ytdlp().ok_or_else(|| engine::NOT_FOUND.to_string())?;
@@ -207,49 +215,23 @@ pub fn youtube_download(app: AppHandle, state: State<'_, AppState>, args: StartA
         }
         jobs.insert(job.id.clone(), (job.video_id.clone(), tx));
     }
-
-    let id = job.id.clone();
-    tauri::async_runtime::spawn(run(app, job, ytdlp, out_dir, rx));
-    Ok(id)
+    Ok((job, ytdlp, out_dir, rx))
 }
 
-async fn run(app: AppHandle, job: Job, ytdlp: PathBuf, out_dir: PathBuf, mut cancel: watch::Receiver<bool>) {
+/// Для пачки: та же загрузка, что у кнопки, но результат возвращается прямо, без событий «готово».
+/// `on_started` получает id задачи, по нему пачку можно остановить через `cancel_job`.
+pub(crate) async fn download_for_batch(app: &AppHandle, args: StartArgs, on_started: impl FnOnce(&str)) -> Result<Project, String> {
     let state = app.state::<AppState>();
-    emit_progress(&app, &job, "queued", &Snapshot::default());
+    let (job, ytdlp, out_dir, rx) = register(&state, args)?;
+    on_started(&job.id);
+    let outcome = fetch(app, &job, ytdlp, out_dir, rx).await;
+    state.downloads.lock().unwrap().remove(&job.id);
+    outcome.map_err(|(message, _)| message)
+}
 
-    // Ждём свободное место; пока ждём, загрузку можно остановить.
-    let permit = tokio::select! {
-        p = state.youtube_slots.clone().acquire_owned() => p.ok(),
-        _ = cancelled(&mut cancel) => None,
-    };
-
-    let result = match permit {
-        None => Err(DownloadError::Cancelled),
-        Some(_permit) => {
-            // очередь прошли; пока yt-dlp разбирается с YouTube, интерфейс пишет «Подключаюсь…»
-            emit_progress(&app, &job, "downloading", &Snapshot::default());
-            let req = DownloadRequest {
-                url: job.url.clone(),
-                video_id: job.video_id.clone(),
-                preset: job.preset.clone(),
-                out_dir,
-                ffmpeg_dir: engine::find_ffmpeg_dir(),
-            };
-            engine::download(&ytdlp, &req, cancel.clone(), |u| emit_progress(&app, &job, stage_name(u.stage), &u.snapshot)).await
-        }
-    };
-
-    let outcome: Result<Project, (String, bool)> = match result {
-        Ok(path) => {
-            emit_progress(&app, &job, "importing", &Snapshot { fraction: Some(1.0), ..Snapshot::default() });
-            commands::import_video(app.state(), path.display().to_string())
-                .await
-                .map_err(|e| (format!("Видео скачано ({}), но не добавилось в проекты: {e}", path.display()), false))
-        }
-        Err(DownloadError::Cancelled) => Err(("Остановлено — можно продолжить".to_string(), true)),
-        Err(DownloadError::Failed(message)) => Err((message, false)),
-    };
-
+async fn run(app: AppHandle, job: Job, ytdlp: PathBuf, out_dir: PathBuf, cancel: watch::Receiver<bool>) {
+    let outcome = fetch(&app, &job, ytdlp, out_dir, cancel).await;
+    let state = app.state::<AppState>();
     state.downloads.lock().unwrap().remove(&job.id);
     match outcome {
         Ok(project) => {
@@ -261,10 +243,53 @@ async fn run(app: AppHandle, job: Job, ytdlp: PathBuf, out_dir: PathBuf, mut can
     }
 }
 
+/// Скачивает и добавляет видео в проекты. Ход загрузки уходит событиями `youtube-progress`.
+async fn fetch(app: &AppHandle, job: &Job, ytdlp: PathBuf, out_dir: PathBuf, mut cancel: watch::Receiver<bool>) -> Result<Project, (String, bool)> {
+    let state = app.state::<AppState>();
+    emit_progress(app, job, "queued", &Snapshot::default());
+
+    // Ждём свободное место; пока ждём, загрузку можно остановить.
+    let permit = tokio::select! {
+        p = state.youtube_slots.clone().acquire_owned() => p.ok(),
+        _ = cancelled(&mut cancel) => None,
+    };
+
+    let result = match permit {
+        None => Err(DownloadError::Cancelled),
+        Some(_permit) => {
+            // очередь прошли; пока yt-dlp разбирается с YouTube, интерфейс пишет «Подключаюсь…»
+            emit_progress(app, job, "downloading", &Snapshot::default());
+            let req = DownloadRequest {
+                url: job.url.clone(),
+                video_id: job.video_id.clone(),
+                preset: job.preset.clone(),
+                out_dir,
+                ffmpeg_dir: engine::find_ffmpeg_dir(),
+            };
+            engine::download(&ytdlp, &req, cancel.clone(), |u| emit_progress(app, job, stage_name(u.stage), &u.snapshot)).await
+        }
+    };
+
+    match result {
+        Ok(path) => {
+            emit_progress(app, job, "importing", &Snapshot { fraction: Some(1.0), ..Snapshot::default() });
+            commands::import_video(app.state(), path.display().to_string())
+                .await
+                .map_err(|e| (format!("Видео скачано ({}), но не добавилось в проекты: {e}", path.display()), false))
+        }
+        Err(DownloadError::Cancelled) => Err(("Остановлено — можно продолжить".to_string(), true)),
+        Err(DownloadError::Failed(message)) => Err((message, false)),
+    }
+}
+
 /// Останавливает загрузку. Частично скачанное остаётся: повторный запуск продолжит с того же места.
-#[tauri::command]
-pub fn youtube_cancel(state: State<'_, AppState>, job_id: String) {
-    if let Some((_, tx)) = state.downloads.lock().unwrap().get(&job_id) {
+pub(crate) fn cancel_job(state: &AppState, job_id: &str) {
+    if let Some((_, tx)) = state.downloads.lock().unwrap().get(job_id) {
         let _ = tx.send(true);
     }
+}
+
+#[tauri::command]
+pub fn youtube_cancel(state: State<'_, AppState>, job_id: String) {
+    cancel_job(&state, &job_id);
 }

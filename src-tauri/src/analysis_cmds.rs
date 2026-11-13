@@ -30,6 +30,10 @@ pub struct ModelsStatus {
     yamnet: bool,
     llm: bool,
     worker: bool,
+    /// Все модели на месте (проверка по размеру).
+    ready: bool,
+    /// Сейчас качаются.
+    downloading: bool,
 }
 
 #[tauri::command]
@@ -41,6 +45,8 @@ pub fn models_status(state: State<'_, AppState>) -> ModelsStatus {
         yamnet: m.yamnet.is_file() && m.yamnet_classes.is_file(),
         llm: m.llm.is_file(),
         worker: llm::find_worker().is_some(),
+        ready: crate::model_download::ready(&state.models_dir()),
+        downloading: state.models_downloading.load(std::sync::atomic::Ordering::SeqCst),
     }
 }
 
@@ -58,7 +64,7 @@ pub struct UiOptions {
 }
 
 impl UiOptions {
-    fn into_options(self) -> Options {
+    pub(crate) fn into_options(self) -> Options {
         let mut o = Options::default();
         o.use_events = self.use_events.unwrap_or(o.use_events);
         o.use_speech = self.use_speech.unwrap_or(o.use_speech);
@@ -103,8 +109,17 @@ struct ErrorEvent {
     cancelled: bool,
 }
 
-#[tauri::command]
-pub fn analysis_start(app: AppHandle, state: State<'_, AppState>, project_id: i64, options: Option<UiOptions>) -> CmdResult<()> {
+/// Что пайплайну нужно от проекта: снимается из базы до запуска.
+pub(crate) struct AnalysisInput {
+    project_id: i64,
+    path: String,
+    duration: f64,
+    has_audio: bool,
+    tight: bool,
+}
+
+/// Регистрирует анализ в списке идущих. Второй анализ того же видео отвергается.
+pub(crate) fn begin(state: &AppState, project_id: i64) -> CmdResult<(AnalysisInput, watch::Receiver<bool>)> {
     let (path, duration, has_audio, tight): (String, f64, bool, bool) = state
         .db
         .0
@@ -123,35 +138,47 @@ pub fn analysis_start(app: AppHandle, state: State<'_, AppState>, project_id: i6
         }
         jobs.insert(project_id, tx);
     }
+    Ok((AnalysisInput { project_id, path, duration, has_audio, tight }, rx))
+}
 
-    let mut opt = options.unwrap_or_default().into_options();
+/// Сам анализ: пайплайн, сохранение моментов, события. Возвращает число моментов или текст ошибки.
+pub(crate) async fn execute(app: AppHandle, input: AnalysisInput, rx: watch::Receiver<bool>, mut opt: Options) -> CmdResult<usize> {
+    let AnalysisInput { project_id, path, duration, has_audio, tight } = input;
     opt.tight = tight;
-    let models = ModelPaths::in_dir(&state.models_dir());
-    tauri::async_runtime::spawn(async move {
-        let emit_app = app.clone();
-        let report: pipeline::Report = Arc::new(move |p: Progress| {
-            let _ = emit_app.emit(
-                "analysis-progress",
-                ProgressEvent { project_id, stage: p.stage, fraction: p.fraction, message: p.message },
-            );
-        });
-        let cancelled_rx = rx.clone();
-        let result = pipeline::run(std::path::Path::new(&path), duration, has_audio, &models, &opt, rx, report).await;
+    let models = ModelPaths::in_dir(&app.state::<AppState>().models_dir());
+    let emit_app = app.clone();
+    let report: pipeline::Report = Arc::new(move |p: Progress| {
+        let _ = emit_app.emit(
+            "analysis-progress",
+            ProgressEvent { project_id, stage: p.stage, fraction: p.fraction, message: p.message },
+        );
+    });
+    let cancelled_rx = rx.clone();
+    let result = pipeline::run(std::path::Path::new(&path), duration, has_audio, &models, &opt, rx, report).await;
 
-        let state = app.state::<AppState>();
-        state.analyses.lock().unwrap().remove(&project_id);
-        // при нарезке вплотную все куски сразу «взяты»: вырезать из видео нечего
-        match result.and_then(|a| save(&state.db.0.lock().unwrap(), project_id, &a, tight).map(|n| (n, a.notes)).map_err(Into::into)) {
-            Ok((moments, notes)) => {
-                let _ = app.emit("analysis-done", DoneEvent { project_id, moments, notes });
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "analysis-error",
-                    ErrorEvent { project_id, message: err(&e), cancelled: *cancelled_rx.borrow() },
-                );
-            }
+    let state = app.state::<AppState>();
+    state.analyses.lock().unwrap().remove(&project_id);
+    // при нарезке вплотную все куски сразу «взяты»: вырезать из видео нечего
+    match result.and_then(|a| save(&state.db.0.lock().unwrap(), project_id, &a, tight).map(|n| (n, a.notes)).map_err(Into::into)) {
+        Ok((moments, notes)) => {
+            let _ = app.emit("analysis-done", DoneEvent { project_id, moments, notes });
+            Ok(moments)
         }
+        Err(e) => {
+            let message = err(&e);
+            let _ = app.emit("analysis-error", ErrorEvent { project_id, message: message.clone(), cancelled: *cancelled_rx.borrow() });
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn analysis_start(app: AppHandle, state: State<'_, AppState>, project_id: i64, options: Option<UiOptions>) -> CmdResult<()> {
+    let (input, rx) = begin(&state, project_id)?;
+    let opt = options.unwrap_or_default().into_options();
+    tauri::async_runtime::spawn(async move {
+        // результат уже ушёл в события «analysis-done» / «analysis-error»
+        let _ = execute(app, input, rx, opt).await;
     });
     Ok(())
 }

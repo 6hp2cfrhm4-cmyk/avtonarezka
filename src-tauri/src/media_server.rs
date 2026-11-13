@@ -70,10 +70,20 @@ impl MediaServer {
             .route("/dev/tiktok_login", get(dev_tt_login))
             .route("/dev/tiktok_publish", get(dev_tt_publish))
             .route("/dev/tiktok_reset", get(dev_tt_reset))
+            .route("/dev/queue_state", get(dev_queue_state))
+            .route("/dev/queue_prepare", get(dev_queue_prepare))
+            .route("/dev/queue_start", get(dev_queue_start))
+            .route("/dev/queue_stop", get(dev_queue_stop))
+            .route("/dev/queue_apply", get(dev_queue_apply))
+            .route("/dev/queue_settings", get(dev_queue_settings))
             .route("/dev/yt_analyze", get(dev_yt_analyze))
             .route("/dev/yt_download", get(dev_yt_download))
             .route("/dev/yt_cancel", get(dev_yt_cancel))
-            .route("/dev/yt_tab", get(dev_yt_tab));
+            .route("/dev/yt_tab", get(dev_yt_tab))
+            .route("/dev/batch_add", get(dev_batch_add))
+            .route("/dev/batch_start", get(dev_batch_start))
+            .route("/dev/batch_approve", get(dev_batch_approve))
+            .route("/dev/batch_list", get(dev_batch_list));
         let app = router.layer(CorsLayer::permissive()).with_state(shared.clone());
 
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
@@ -206,6 +216,39 @@ async fn dev_finals(State(st): State<Shared>, Query(q): Query<HashMap<String, St
 }
 
 #[cfg(debug_assertions)]
+async fn dev_queue_state(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_state(&st.app, id)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_prepare(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    match project_id(&q) {
+        Ok(id) => reply(crate::dev_tools::queue_prepare(&st.app, id).await),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_start(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_start(&st.app, id)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_stop(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_stop(&st.app, id)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_apply(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(project_id(&q).and_then(|id| crate::dev_tools::queue_apply_text(&st.app, id, &q)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_queue_settings(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    reply(crate::dev_tools::queue_settings(&st.app, &q))
+}
+
+#[cfg(debug_assertions)]
 async fn dev_tt_settings(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
     reply(crate::dev_tools::tiktok_settings(&st.app, &q).await)
 }
@@ -248,4 +291,26 @@ async fn dev_yt_cancel(State(st): State<Shared>, Query(q): Query<HashMap<String,
 #[cfg(debug_assertions)]
 async fn dev_yt_tab(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
     reply(crate::dev_tools::yt_tab(&st.app, q.get("url").cloned().unwrap_or_default()).map(|_| "ok".into()))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_batch_add(State(st): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let precut = q.get("precut").is_some_and(|v| v == "1");
+    reply(q.get("path").cloned().ok_or_else(|| "нужен ?path=".to_string()).and_then(|p| crate::dev_tools::batch_add(&st.app, p, precut)))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_batch_start(State(st): State<Shared>) -> Response {
+    crate::dev_tools::batch_start(&st.app);
+    "ok".into_response()
+}
+
+#[cfg(debug_assertions)]
+async fn dev_batch_approve(State(st): State<Shared>) -> Response {
+    reply(crate::dev_tools::batch_approve(&st.app))
+}
+
+#[cfg(debug_assertions)]
+async fn dev_batch_list(State(st): State<Shared>) -> Response {
+    reply(crate::dev_tools::batch_list(&st.app))
 }
