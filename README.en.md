@@ -72,7 +72,7 @@ Ready-made packages are on the [Releases](https://github.com/6hp2cfrhm4-cmyk/avt
 ### Arch Linux
 
 ```bash
-sudo pacman -U avtonarezka-0.2.6-1-x86_64.pkg.tar.zst
+sudo pacman -U avtonarezka-0.3.0-1-x86_64.pkg.tar.zst
 ```
 
 pacman installs the dependencies: `ffmpeg`, `webkit2gtk-4.1`, `libsecret`, `vulkan-icd-loader`, `yt-dlp`, `deno`.
@@ -81,7 +81,7 @@ You also need an `ffmpeg` build with `h264_nvenc` and `libass`, and a Vulkan dri
 
 ### Windows 11
 
-1. Download `avtonarezka-0.2.6-windows-x64-setup.exe` and run it. No administrator rights are needed.
+1. Download `avtonarezka-0.3.0-windows-x64-setup.exe` and run it. No administrator rights are needed.
 2. SmartScreen will warn about an unknown publisher. The installer is not signed yet: click **More info → Run anyway**.
 3. Download the models (see below) with `fetch-models.ps1` from the Releases page.
 
@@ -200,7 +200,7 @@ Development: `npm run tauri dev`. Tests: `cd src-tauri && cargo test` (heavy che
 
 ## Status
 
-Version 0.2.6. The Arch package is built and in use. The Windows installer is built on Linux and
+Version 0.3.0. The Arch package is built and in use. The Windows installer is built on Linux and
 tested under Wine, but it has not yet been run on a real Windows 11 machine. The account pool and the publishing window
 are covered by tests, but not yet tried on a live TikTok account. Found a problem? Open an [issue](https://github.com/6hp2cfrhm4-cmyk/avtonarezka/issues).
 

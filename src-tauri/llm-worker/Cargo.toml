@@ -1,6 +1,6 @@
 [package]
 name = "llm-worker"
-version = "0.2.6"
+version = "0.3.0"
 edition = "2021"
 description = "Отдельный процесс с llama.cpp: у whisper.cpp и llama.cpp свои копии ggml, в одном бинарнике они конфликтуют"
 
