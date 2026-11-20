@@ -8,6 +8,9 @@ cd "$(dirname "$0")/.."
 
 # В бинарники не должны попадать пути вашей машины (имя пользователя, каталоги проекта и кэша cargo)
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/home/user --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup --remap-path-prefix=$PWD=/build"  # rustc берёт последнее подходящее правило
+# то же для C/C++ (llama.cpp, whisper.cpp): иначе их __FILE__ несут путь к кэшу cargo
+export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$HOME=/home/user"
+export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=$HOME=/home/user"
 
 TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
 
