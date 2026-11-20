@@ -8,8 +8,11 @@ use avtonarezka_lib::{
 };
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "тяжёлый: настоящая модель Whisper; запускать отдельно"]
 async fn whisper_transcribes_russian_speech_with_ordered_word_times() {
-    let Some(dir) = ModelPaths::default_dir() else { return };
+    let Some(dir) = ModelPaths::default_dir() else {
+        return;
+    };
     let model = ModelPaths::in_dir(&dir).whisper;
     if !model.is_file() {
         eprintln!("модель Whisper не скачана — тест пропущен");
@@ -23,20 +26,36 @@ async fn whisper_transcribes_russian_speech_with_ordered_word_times() {
     let wav: PathBuf = std::env::temp_dir().join(format!("avto-speech-{}.wav", std::process::id()));
     let text = "Сегодня мы расскажем о новой программе. Она автоматически нарезает длинные видео на короткие ролики. \
                 Попробуйте её прямо сейчас, это действительно удобно.";
-    let st = Command::new("espeak-ng").args(["-v", "ru", "-s", "150", "-w"]).arg(&wav).arg(text).status().unwrap();
+    let st = Command::new("espeak-ng")
+        .args(["-v", "ru", "-s", "150", "-w"])
+        .arg(&wav)
+        .arg(text)
+        .status()
+        .unwrap();
     assert!(st.success());
 
     let pcm = audio::decode_pcm16k(&wav).await.unwrap();
     let secs = pcm.len() as f64 / 16_000.0;
     let started = std::time::Instant::now();
     let model2 = model.clone();
-    let result = tokio::task::spawn_blocking(move || speech::transcribe(&model2, pcm, "ru", 8, Default::default()))
-        .await
-        .unwrap()
-        .unwrap();
-    eprintln!("распознано за {:.1} с ({secs:.1} с звука): {:?}", started.elapsed().as_secs_f64(), result.sentences.iter().map(|s| &s.text).collect::<Vec<_>>());
+    let result = tokio::task::spawn_blocking(move || {
+        speech::transcribe(&model2, pcm, "ru", 8, Default::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    eprintln!(
+        "распознано за {:.1} с ({secs:.1} с звука): {:?}",
+        started.elapsed().as_secs_f64(),
+        result.sentences.iter().map(|s| &s.text).collect::<Vec<_>>()
+    );
 
-    let all = result.words.iter().map(|w| w.text.to_lowercase()).collect::<Vec<_>>().join(" ");
+    let all = result
+        .words
+        .iter()
+        .map(|w| w.text.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
     for key in ["программе", "нарезает", "ролики"] {
         assert!(all.contains(key), "в тексте нет «{key}»: {all}");
     }
@@ -44,7 +63,10 @@ async fn whisper_transcribes_russian_speech_with_ordered_word_times() {
     for w in result.words.windows(2) {
         assert!(w[0].start <= w[1].start + 1e-9, "{:?} → {:?}", w[0], w[1]);
     }
-    assert!(result.words.iter().all(|w| w.start >= 0.0 && w.end <= secs + 0.5 && w.end - w.start <= 1.21 && w.end > w.start));
+    assert!(result.words.iter().all(|w| w.start >= 0.0
+        && w.end <= secs + 0.5
+        && w.end - w.start <= 1.21
+        && w.end > w.start));
     assert!(result.sentences.len() >= 2, "{:?}", result.sentences);
 }
 
@@ -52,7 +74,9 @@ async fn whisper_transcribes_russian_speech_with_ordered_word_times() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "медленный: около минуты на CPU"]
 async fn whisper_handles_audio_longer_than_one_window() {
-    let Some(dir) = ModelPaths::default_dir() else { return };
+    let Some(dir) = ModelPaths::default_dir() else {
+        return;
+    };
     let model = ModelPaths::in_dir(&dir).whisper;
     if !model.is_file() || Command::new("espeak-ng").arg("--version").output().is_err() {
         return;
@@ -76,16 +100,90 @@ async fn whisper_handles_audio_longer_than_one_window() {
         "И последнее, но очень важное: проверьте гарантию и сервисные центры.",
     ]
     .join(" ");
-    let wav: PathBuf = std::env::temp_dir().join(format!("avto-speech-long-{}.wav", std::process::id()));
-    assert!(Command::new("espeak-ng").args(["-v", "ru", "-s", "150", "-w"]).arg(&wav).arg(text).status().unwrap().success());
+    let wav: PathBuf =
+        std::env::temp_dir().join(format!("avto-speech-long-{}.wav", std::process::id()));
+    assert!(Command::new("espeak-ng")
+        .args(["-v", "ru", "-s", "150", "-w"])
+        .arg(&wav)
+        .arg(text)
+        .status()
+        .unwrap()
+        .success());
     let pcm = audio::decode_pcm16k(&wav).await.unwrap();
     eprintln!("аудио {:.1} с", pcm.len() as f64 / 16000.0);
     assert!(pcm.len() > 16000 * 60, "нужно больше двух окон");
 
     let started = std::time::Instant::now();
-    let r = tokio::task::spawn_blocking(move || speech::transcribe(&model, pcm, "ru", 6, Default::default())).await.unwrap();
+    let r = tokio::task::spawn_blocking(move || {
+        speech::transcribe(&model, pcm, "ru", 6, Default::default())
+    })
+    .await
+    .unwrap();
     eprintln!("за {:.1} с", started.elapsed().as_secs_f64());
     let r = r.expect("распознавание длинного аудио упало");
     assert!(r.words.len() > 40, "слов: {}", r.words.len());
-    assert!(r.words.last().unwrap().end > 30.0, "распознана только первая часть: до {:.1} с", r.words.last().unwrap().end);
+    assert!(
+        r.words.last().unwrap().end > 30.0,
+        "распознана только первая часть: до {:.1} с",
+        r.words.last().unwrap().end
+    );
+}
+
+/// Отдельно проверяет повторное использование контекста и абсолютное время разнесённых окон.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "настоящая существующая модель Whisper, без скачиваний; отдельный запуск"]
+async fn whisper_scout_windows_keep_original_times_and_skip_the_gap() {
+    use avtonarezka_lib::analyze::scout::Window;
+    let model = ModelPaths::in_dir(&ModelPaths::default_dir().expect("Нет папки моделей")).whisper;
+    assert!(model.is_file(), "Нужна уже установленная модель Whisper");
+    let wav = std::env::temp_dir().join(format!("avto-scout-speech-{}.wav", std::process::id()));
+    assert!(Command::new("espeak-ng")
+        .args(["-v", "ru", "-s", "150", "-w"])
+        .arg(&wav)
+        .arg("Сегодня программа автоматически нарезает видео на короткие ролики.")
+        .status()
+        .unwrap()
+        .success());
+    let phrase = audio::decode_pcm16k(&wav).await.unwrap();
+    let len = phrase.len() as f64 / 16000.0;
+    let mut pcm = vec![0i16; 16000 * 140];
+    for offset in [10usize, 120] {
+        pcm[offset * 16000..offset * 16000 + phrase.len()].copy_from_slice(&phrase);
+    }
+    let windows = [
+        Window {
+            start: 9.0,
+            end: 10.0 + len + 1.0,
+        },
+        Window {
+            start: 119.0,
+            end: 120.0 + len + 1.0,
+        },
+    ];
+    let ctl = speech::Control::default();
+    let progress = ctl.progress.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        speech::transcribe_windows(&model, std::sync::Arc::new(pcm), &windows, "ru", 2, ctl)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        result.words.iter().any(|w| (9.0..30.0).contains(&w.start)),
+        "{:?}",
+        result.sentences
+    );
+    assert!(
+        result.words.iter().any(|w| w.start >= 119.0),
+        "{:?}",
+        result.sentences
+    );
+    assert!(result
+        .words
+        .iter()
+        .all(|w| windows.iter().any(|r| r.contains(w.start, w.end))));
+    assert!(result.words.windows(2).all(|w| w[0].start <= w[1].start));
+    assert!(result.sentences.iter().all(|s| s.end - s.start < 20.0));
+    assert_eq!(progress.load(std::sync::atomic::Ordering::Relaxed), 100);
+    std::fs::remove_file(wav).unwrap();
 }

@@ -1,32 +1,35 @@
-//! Очередь автовыкладки в TikTok: каждому готовому ролику своё описание от модели, дальше ролики выходят по одному
+//! Очередь автовыкладки в TikTok: необязательный ручной текст и локальные хэштеги, дальше ролики выходят по одному
 //! через браузер с паузой между ними и суточным лимитом.
 //!
-//! Очередь живёт в базе (`publish_jobs`), а работает, пока открыто приложение. После перезапуска очередь не стартует сама:
-//! выкладка без присмотра начинается только по новому согласию человека.
+//! Очередь живёт в базе (`publications`), а работает, пока открыто приложение.
+//! Возобновление возможно только после сохранённого запуска и при включённой настройке.
 
-use std::{collections::HashSet, path::{Path, PathBuf}, time::Duration};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
+use crate::host::{AppHandle, Emitter, Manager, State};
 use chrono::{Local, TimeZone};
 use rusqlite::{params, Connection, Row};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::{
     accounts,
     analyze::{
-        describe::{self, MAX_LEN, MAX_TAGS, MIN_LEN},
+        describe::{MAX_LEN, MAX_TAGS},
         llm::{self, LlmClient},
         pipeline::Options,
     },
-    drafts::{get as get_draft, kv_get, kv_set, render_pool_copy},
+    drafts::{get as get_draft, kv_get, kv_set},
     models::ModelPaths,
     state::AppState,
     tiktok::{
         api::{len_utf16, make_caption, normalize_hashtags, now_unix},
         browser::{find_chromium, run_browser_post, AfterClick, BrowserPost, CAPTION_LIMIT},
     },
-    tiktok_cmds::{begin_post, begin_ready_post, finish_post, latest_posts, mark_sent, PostDone, PostDto, PostFailed, PostProgress},
+    tiktok_cmds::{
+        begin_post, begin_ready_post, finish_post, latest_posts, mark_sent, PostDone, PostDto,
+        PostFailed,
+    },
 };
 
 type CmdResult<T> = Result<T, String>;
@@ -59,10 +62,18 @@ pub struct QueueSettings {
 
 pub(crate) fn load_settings(db: &Connection) -> QueueSettings {
     QueueSettings {
-        pause_min: kv_get(db, K_PAUSE).and_then(|v| v.parse().ok()).map_or(45, |v: i64| v.clamp(1, 1440)),
-        daily_limit: kv_get(db, K_LIMIT).and_then(|v| v.parse().ok()).map_or(5, |v: i64| v.clamp(1, 50)),
-        window_start: kv_get(db, K_WINDOW_START).and_then(|v| v.parse().ok()).map_or(0, |v: i64| v.clamp(0, DAY_MIN)),
-        window_end: kv_get(db, K_WINDOW_END).and_then(|v| v.parse().ok()).map_or(DAY_MIN, |v: i64| v.clamp(0, DAY_MIN)),
+        pause_min: kv_get(db, K_PAUSE)
+            .and_then(|v| v.parse().ok())
+            .map_or(45, |v: i64| v.clamp(1, 1440)),
+        daily_limit: kv_get(db, K_LIMIT)
+            .and_then(|v| v.parse().ok())
+            .map_or(5, |v: i64| v.clamp(1, 50)),
+        window_start: kv_get(db, K_WINDOW_START)
+            .and_then(|v| v.parse().ok())
+            .map_or(0, |v: i64| v.clamp(0, DAY_MIN)),
+        window_end: kv_get(db, K_WINDOW_END)
+            .and_then(|v| v.parse().ok())
+            .map_or(DAY_MIN, |v: i64| v.clamp(0, DAY_MIN)),
     }
 }
 
@@ -94,7 +105,7 @@ pub struct JobDto {
 
 const JOB_SELECT: &str = "SELECT j.id, j.draft_id, j.caption, j.hashtags, j.state, j.error, j.attempts, j.not_before, j.updated_at,
     j.ready_id, COALESCE(r.name, ''), j.wanted_account_id
-    FROM publish_jobs j LEFT JOIN ready_videos r ON r.id = j.ready_id";
+    FROM publications j LEFT JOIN ready_videos r ON r.id = j.ready_id";
 
 fn job_from_row(r: &Row) -> rusqlite::Result<JobDto> {
     let caption: String = r.get(2)?;
@@ -117,31 +128,35 @@ fn job_from_row(r: &Row) -> rusqlite::Result<JobDto> {
 }
 
 fn job_by_id(db: &Connection, id: i64) -> rusqlite::Result<JobDto> {
-    db.query_row(&format!("{JOB_SELECT} WHERE j.id = ?1"), [id], job_from_row)
+    db.query_row(
+        &format!("{JOB_SELECT} WHERE j.legacy=1 AND j.id = ?1"),
+        [id],
+        job_from_row,
+    )
 }
 
 /// Задачи проекта: сначала ролики из пачки по частям, потом готовые ролики из папки.
 pub(crate) fn jobs_for_project(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<JobDto>> {
     let mut st = db.prepare(&format!(
         "{JOB_SELECT} LEFT JOIN drafts d ON d.id = j.draft_id LEFT JOIN moments m ON m.id = d.moment_id
-         WHERE COALESCE(m.project_id, r.project_id) = ?1 ORDER BY COALESCE(d.part, 1000000), j.id"
+         WHERE j.legacy=1 AND COALESCE(m.project_id, r.project_id) = ?1 ORDER BY COALESCE(d.part, 1000000), j.id"
     ))?;
     let rows = st.query_map([project_id], job_from_row)?;
     rows.collect()
 }
 
 /// Правило для любого текста, который пойдёт в очередь, будь он от модели, вставленный или поправленный руками:
-/// текст не пустой, хэштегов от одного до `MAX_TAGS`, подпись с хэштегами влезает в страницу TikTok.
-pub(crate) fn validate_job(caption: &str, hashtags: &[String]) -> Result<(Vec<String>, usize), String> {
-    if caption.trim().is_empty() {
-        return Err("Описание пустое".into());
-    }
+/// текст и хэштеги необязательны; проверяем только верхние лимиты площадки.
+pub(crate) fn validate_job(
+    caption: &str,
+    hashtags: &[String],
+) -> Result<(Vec<String>, usize), String> {
     let tags = normalize_hashtags(hashtags);
-    if tags.is_empty() {
-        return Err("Нужен хотя бы один хэштег".into());
-    }
     if tags.len() > MAX_TAGS {
-        return Err(format!("Хэштегов {}, а можно не больше {MAX_TAGS}", tags.len()));
+        return Err(format!(
+            "Хэштегов {}, а можно не больше {MAX_TAGS}",
+            tags.len()
+        ));
     }
     let len = len_utf16(&make_caption(caption, &tags, usize::MAX));
     if len > CAPTION_LIMIT {
@@ -150,19 +165,12 @@ pub(crate) fn validate_job(caption: &str, hashtags: &[String]) -> Result<(Vec<St
     Ok((tags, len))
 }
 
-/// Описание от модели обязано занять `MIN_LEN`–`MAX_LEN` знаков: это цель генерации, а не лимит страницы.
-/// Свой текст этому окну не подчиняется (см. [`validate_job`]).
-pub(crate) fn validate_generated(caption: &str, hashtags: &[String]) -> Result<(Vec<String>, usize), String> {
-    let (tags, len) = validate_job(caption, hashtags)?;
-    if !(MIN_LEN..=MAX_LEN).contains(&len) {
-        return Err(format!("Длина подписи с хэштегами {len}, а нужно {MIN_LEN}–{MAX_LEN} символов"));
-    }
-    Ok((tags, len))
-}
-
 /// Ролик, выложенный вручную через диалог: повторно описывать и выкладывать его очередью незачем.
 fn was_published(p: &PostDto) -> bool {
-    p.status == "done" && ["Нажата кнопка", "Опубликовано", "Выложено"].iter().any(|s| p.detail.starts_with(s))
+    p.status == "done"
+        && ["Нажата кнопка", "Опубликовано", "Выложено"]
+            .iter()
+            .any(|s| p.detail.starts_with(s))
 }
 
 pub(crate) struct Todo {
@@ -171,49 +179,81 @@ pub(crate) struct Todo {
     pub transcript: String,
 }
 
-/// Готовые ролики проекта без описания становятся задачами `drafting`. Упавшие описания пишутся заново.
-pub(crate) fn create_drafting_jobs(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<Todo>> {
-    let published: HashSet<i64> = latest_posts(db, project_id)?.iter().filter(|p| was_published(p)).map(|p| p.draft_id).collect();
+/// Подбираем теги для готовых и ошибочных задач; введённый текст сохраняется.
+pub(crate) fn create_drafting_jobs(
+    db: &Connection,
+    project_id: i64,
+) -> rusqlite::Result<Vec<Todo>> {
+    let published: HashSet<i64> = latest_posts(db, project_id)?
+        .iter()
+        .filter(|p| was_published(p))
+        .map(|p| p.draft_id)
+        .collect();
     let mut st = db.prepare(
         "SELECT d.id, m.title, m.transcript FROM drafts d JOIN moments m ON m.id = d.moment_id
          WHERE m.project_id = ?1 AND d.status = 'final_done'
-           AND NOT EXISTS (SELECT 1 FROM publish_jobs j WHERE j.draft_id = d.id AND j.state != 'failed')
+           AND NOT EXISTS (SELECT 1 FROM publications j WHERE j.legacy=1 AND j.draft_id = d.id AND j.state NOT IN ('failed','ready'))
          ORDER BY d.part, d.id",
     )?;
     let todo: Vec<Todo> = st
-        .query_map([project_id], |r| Ok(Todo { draft_id: r.get(0)?, title: r.get(1)?, transcript: r.get(2)? }))?
+        .query_map([project_id], |r| {
+            Ok(Todo {
+                draft_id: r.get(0)?,
+                title: r.get(1)?,
+                transcript: r.get(2)?,
+            })
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    let todo: Vec<Todo> = todo.into_iter().filter(|t| !published.contains(&t.draft_id)).collect();
+    let todo: Vec<Todo> = todo
+        .into_iter()
+        .filter(|t| !published.contains(&t.draft_id))
+        .collect();
     for t in &todo {
         db.execute(
-            "INSERT INTO publish_jobs (draft_id, state) VALUES (?1, 'drafting')
-             ON CONFLICT(draft_id) DO UPDATE SET state = 'drafting', caption = '', hashtags = '[]', error = NULL, updated_at = unixepoch()",
+            "INSERT INTO publications (draft_id, state) VALUES (?1, 'drafting')
+             ON CONFLICT(draft_id) WHERE legacy=1 DO UPDATE SET state = 'drafting', error = NULL, updated_at = unixepoch()",
             [t.draft_id],
         )?;
     }
     Ok(todo)
 }
 
-fn store_ready(db: &Connection, draft_id: i64, caption: &str, hashtags: &[String]) -> rusqlite::Result<usize> {
+fn store_ready(
+    db: &Connection,
+    draft_id: i64,
+    caption: &str,
+    hashtags: &[String],
+) -> rusqlite::Result<usize> {
     db.execute(
-        "UPDATE publish_jobs SET caption = ?2, hashtags = ?3, state = 'ready', error = NULL, updated_at = unixepoch() WHERE draft_id = ?1 AND state = 'drafting'",
+        "UPDATE publications SET caption = ?2, hashtags = ?3, state = 'ready', error = NULL, updated_at = unixepoch() WHERE legacy=1 AND draft_id = ?1 AND state = 'drafting'",
         params![draft_id, caption.trim(), serde_json::to_string(hashtags).unwrap_or_else(|_| "[]".into())],
     )
 }
 
 fn store_text_failed(db: &Connection, draft_id: i64, message: &str) {
-    let _ = db.execute("UPDATE publish_jobs SET state = 'failed', error = ?2, updated_at = unixepoch() WHERE draft_id = ?1 AND state = 'drafting'", params![draft_id, message]);
+    let _ = db.execute("UPDATE publications SET state = 'failed', error = ?2, updated_at = unixepoch() WHERE legacy=1 AND draft_id = ?1 AND state = 'drafting'", params![draft_id, message]);
 }
 
 /// Правка человека: только пока задача не ушла в работу. После правки задача снова готова к выкладке.
-pub(crate) fn update_job(db: &Connection, id: i64, caption: &str, hashtags: &[String]) -> Result<JobDto, String> {
+pub(crate) fn update_job(
+    db: &Connection,
+    id: i64,
+    caption: &str,
+    hashtags: &[String],
+) -> Result<JobDto, String> {
     let (tags, _) = validate_job(caption, hashtags)?;
-    let state: String = db.query_row("SELECT state FROM publish_jobs WHERE id = ?1", [id], |r| r.get(0)).map_err(|_| "Задача не найдена".to_string())?;
+    let state: String = db
+        .query_row(
+            "SELECT state FROM publications WHERE legacy=1 AND id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "Задача не найдена".to_string())?;
     if !["ready", "failed"].contains(&state.as_str()) {
         return Err("Сейчас править нельзя: ролик в очереди, выкладывается или уже выложен".into());
     }
     db.execute(
-        "UPDATE publish_jobs SET caption = ?2, hashtags = ?3, state = 'ready', error = NULL, updated_at = unixepoch() WHERE id = ?1",
+        "UPDATE publications SET caption = ?2, hashtags = ?3, state = 'ready', error = NULL, updated_at = unixepoch() WHERE id = ?1",
         params![id, caption.trim(), serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into())],
     )
     .map_err(err)?;
@@ -223,25 +263,63 @@ pub(crate) fn update_job(db: &Connection, id: i64, caption: &str, hashtags: &[St
 /// Один свой текст на все готовые ролики проекта, без модели. Берутся ролики, которым можно назначить текст: у них нет задачи
 /// либо она ещё не пошла в работу (готова или упала, текст в ней заменяется). Уже в очереди, выкладываемые, выложенные,
 /// ждущие проверки и пишущиеся моделью не трогаем, как и ролики, выложенные вручную. Возвращает, скольким назначен текст.
-pub(crate) fn apply_text(db: &Connection, project_id: i64, caption: &str, hashtags: &[String]) -> Result<usize, String> {
-    let (tags, _) = validate_job(caption, hashtags)?;
-    let published: HashSet<i64> = latest_posts(db, project_id).map_err(err)?.iter().filter(|p| was_published(p)).map(|p| p.draft_id).collect();
+pub(crate) fn apply_text(
+    db: &Connection,
+    project_id: i64,
+    caption: &str,
+    hashtags: &[String],
+) -> Result<usize, String> {
+    apply_text_with_tags(db, project_id, caption, Some(hashtags))
+}
+
+fn apply_text_with_tags(
+    db: &Connection,
+    project_id: i64,
+    caption: &str,
+    hashtags: Option<&[String]>,
+) -> Result<usize, String> {
+    validate_job(caption, hashtags.unwrap_or_default())?;
+    let tx = db.unchecked_transaction().map_err(err)?;
+    let db = &tx;
+    let published: HashSet<i64> = latest_posts(db, project_id)
+        .map_err(err)?
+        .iter()
+        .filter(|p| was_published(p))
+        .map(|p| p.draft_id)
+        .collect();
     let mut st = db
         .prepare(
             "SELECT d.id FROM drafts d JOIN moments m ON m.id = d.moment_id
              WHERE m.project_id = ?1 AND d.status = 'final_done'
-               AND NOT EXISTS (SELECT 1 FROM publish_jobs j WHERE j.draft_id = d.id AND j.state IN ('drafting', 'queued', 'sending', 'done', 'needs_check'))
+               AND NOT EXISTS (SELECT 1 FROM publications j WHERE j.legacy=1 AND j.draft_id = d.id AND j.state IN ('drafting', 'queued', 'sending', 'done', 'needs_check'))
              ORDER BY d.part, d.id",
         )
         .map_err(err)?;
-    let drafts: Vec<i64> = st.query_map([project_id], |r| r.get(0)).map_err(err)?.collect::<rusqlite::Result<_>>().map_err(err)?;
-    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
+    let drafts: Vec<i64> = st
+        .query_map([project_id], |r| r.get(0))
+        .map_err(err)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(err)?;
+    drop(st);
+    let tags_for = |draft: Option<i64>, ready: Option<i64>| -> Result<String, String> {
+        let saved: Vec<String>;
+        let tags = if let Some(tags) = hashtags {
+            tags
+        } else {
+            let raw: String = db.query_row("SELECT COALESCE((SELECT hashtags FROM publications WHERE legacy=1 AND (draft_id=?1 OR ready_id=?2)),(SELECT m.hashtags FROM drafts d JOIN moments m ON m.id=d.moment_id WHERE d.id=?1),'[]')",params![draft,ready],|r|r.get(0)).map_err(err)?;
+            saved = serde_json::from_str(&raw)
+                .map_err(|_| "Не удалось прочитать хэштеги ролика".to_string())?;
+            &saved
+        };
+        let (tags, _) = validate_job(caption, tags)?;
+        serde_json::to_string(&tags).map_err(err)
+    };
     let mut n = 0;
     for id in drafts.into_iter().filter(|d| !published.contains(d)) {
         db.execute(
-            "INSERT INTO publish_jobs (draft_id, caption, hashtags, state) VALUES (?1, ?2, ?3, 'ready')
-             ON CONFLICT(draft_id) DO UPDATE SET caption = excluded.caption, hashtags = excluded.hashtags, state = 'ready', error = NULL, updated_at = unixepoch()",
-            params![id, caption.trim(), tags_json],
+            "INSERT INTO publications (draft_id, caption, hashtags, state) VALUES (?1, ?2, ?3, 'ready')
+             ON CONFLICT(draft_id) WHERE legacy=1 DO UPDATE SET caption = excluded.caption, hashtags = excluded.hashtags, state = 'ready', error = NULL, updated_at = unixepoch()",
+            params![id, caption.trim(), tags_for(Some(id),None)?],
         )
         .map_err(err)?;
         n += 1;
@@ -252,22 +330,27 @@ pub(crate) fn apply_text(db: &Connection, project_id: i64, caption: &str, hashta
             .prepare(
                 "SELECT r.id FROM ready_videos r
                  WHERE r.project_id = ?1
-                   AND NOT EXISTS (SELECT 1 FROM publish_jobs j WHERE j.ready_id = r.id AND j.state IN ('queued', 'sending', 'done', 'needs_check'))
+                   AND NOT EXISTS (SELECT 1 FROM publications j WHERE j.legacy=1 AND j.ready_id = r.id AND j.state IN ('queued', 'sending', 'done', 'needs_check'))
                  ORDER BY r.id",
             )
             .map_err(err)?;
-        let rows: Vec<i64> = st.query_map([project_id], |r| r.get(0)).map_err(err)?.collect::<rusqlite::Result<_>>().map_err(err)?;
+        let rows: Vec<i64> = st
+            .query_map([project_id], |r| r.get(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?;
         rows
     };
     for id in readies {
         db.execute(
-            "INSERT INTO publish_jobs (ready_id, caption, hashtags, state) VALUES (?1, ?2, ?3, 'ready')
-             ON CONFLICT(ready_id) DO UPDATE SET caption = excluded.caption, hashtags = excluded.hashtags, state = 'ready', error = NULL, updated_at = unixepoch()",
-            params![id, caption.trim(), tags_json],
+            "INSERT INTO publications (ready_id, caption, hashtags, state) VALUES (?1, ?2, ?3, 'ready')
+             ON CONFLICT(ready_id) WHERE legacy=1 DO UPDATE SET caption = excluded.caption, hashtags = excluded.hashtags, state = 'ready', error = NULL, updated_at = unixepoch()",
+            params![id, caption.trim(), tags_for(None,Some(id))?],
         )
         .map_err(err)?;
         n += 1;
     }
+    tx.commit().map_err(err)?;
     Ok(n)
 }
 
@@ -276,11 +359,18 @@ pub(crate) fn resolve_job(db: &Connection, id: i64, action: &str) -> Result<(), 
     let job = job_by_id(db, id).map_err(|_| "Задача не найдена".to_string())?;
     match action {
         "retry" if ["failed", "needs_check"].contains(&job.state.as_str()) => {
-            db.execute("UPDATE publish_jobs SET state = 'queued', not_before = 0, error = NULL, updated_at = unixepoch() WHERE id = ?1", [id]).map_err(err)?;
+            db.execute("UPDATE publications SET state = 'queued', not_before = 0, error = NULL, updated_at = unixepoch() WHERE id = ?1", [id]).map_err(err)?;
         }
         "mark_done" if ["failed", "needs_check"].contains(&job.state.as_str()) => {
-            db.execute("UPDATE publish_jobs SET state = 'done', sent_at = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![id, now_unix()]).map_err(err)?;
-            let account: Option<i64> = db.query_row("SELECT account_id FROM publish_jobs WHERE id = ?1", [id], |r| r.get(0)).ok().flatten();
+            db.execute("UPDATE publications SET state = 'done', sent_at = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![id, now_unix()]).map_err(err)?;
+            let account: Option<i64> = db
+                .query_row(
+                    "SELECT account_id FROM publications WHERE legacy=1 AND id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten();
             // чтобы на карточке ролика было видно, что он выложен, и повторный запуск его не тронул
             let post = match (job.draft_id, job.ready_id) {
                 (Some(draft), _) => begin_post(db, draft, "browser", "browser"),
@@ -288,15 +378,25 @@ pub(crate) fn resolve_job(db: &Connection, id: i64, action: &str) -> Result<(), 
                 (None, None) => return Err("Задача без ролика".into()),
             };
             if let Ok(post) = post {
-                finish_post(db, post, &Ok(("Выложено (отмечено вручную)".to_string(), None)));
+                finish_post(
+                    db,
+                    post,
+                    &Ok(("Выложено (отмечено вручную)".to_string(), None)),
+                );
                 // «он вышел» тоже входит в суточный лимит того аккаунта, с которого шла выкладка
                 mark_sent(db, post, account);
             }
         }
         "remove" if job.state != "sending" => {
-            db.execute("DELETE FROM publish_jobs WHERE id = ?1", [id]).map_err(err)?;
+            db.execute("DELETE FROM publications WHERE legacy=1 AND id = ?1", [id])
+                .map_err(err)?;
         }
-        "retry" | "mark_done" | "remove" => return Err(format!("Так сделать нельзя, пока задача в состоянии «{}»", job.state)),
+        "retry" | "mark_done" | "remove" => {
+            return Err(format!(
+                "Так сделать нельзя, пока задача в состоянии «{}»",
+                job.state
+            ))
+        }
         _ => return Err("Неизвестное действие".into()),
     }
     Ok(())
@@ -304,23 +404,42 @@ pub(crate) fn resolve_job(db: &Connection, id: i64, action: &str) -> Result<(), 
 
 /// Готовые к выкладке становятся очередью. Возвращает, сколько задач в очереди.
 pub(crate) fn start_jobs(db: &Connection, project_id: i64) -> Result<usize, String> {
+    let tx = db.unchecked_transaction().map_err(err)?;
     let jobs = jobs_for_project(db, project_id).map_err(err)?;
     for j in jobs.iter().filter(|j| j.state == "ready") {
-        validate_job(&j.caption, &j.hashtags).map_err(|e| format!("Описание ролика №{} не подходит: {e}. Исправь его перед запуском", j.id))?;
+        let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM publications old JOIN publications scheduled ON (scheduled.draft_id=old.draft_id OR scheduled.ready_id=old.ready_id) WHERE old.id=?1 AND scheduled.legacy=0 AND scheduled.platform='tiktok' AND scheduled.state IN ('scheduled','sending','done','needs_check'))",[j.id],|r|r.get(0)).map_err(err)?;
+        if conflict {
+            return Err(format!(
+                "Ролик №{} уже учтён в Календаре TikTok. Проверь его перед запуском Студии",
+                j.id
+            ));
+        }
+        validate_job(&j.caption, &j.hashtags).map_err(|e| {
+            format!(
+                "Описание ролика №{} не подходит: {e}. Исправь его перед запуском",
+                j.id
+            )
+        })?;
+        crate::publish::output::freeze(&tx, j.id, crate::publish::PlatformId::Tiktok)?;
     }
-    db.execute(
+    tx.execute(
         // паузу после прошлой выкладки не сбрасываем: иначе «стоп → старт» выпускает следующий ролик сразу
-        "UPDATE publish_jobs SET state = 'queued', error = NULL, updated_at = unixepoch()
-         WHERE state = 'ready' AND (
+        "UPDATE publications SET state = 'queued', error = NULL, updated_at = unixepoch()
+         WHERE legacy=1 AND state = 'ready' AND (
              draft_id IN (SELECT d.id FROM drafts d JOIN moments m ON m.id = d.moment_id WHERE m.project_id = ?1)
              OR ready_id IN (SELECT id FROM ready_videos WHERE project_id = ?1))",
         [project_id],
     )
     .map_err(err)?;
-    let queued = jobs_for_project(db, project_id).map_err(err)?.iter().filter(|j| j.state == "queued").count();
+    let queued = jobs_for_project(db, project_id)
+        .map_err(err)?
+        .iter()
+        .filter(|j| j.state == "queued")
+        .count();
     if queued == 0 {
-        return Err("Нет роликов с готовым описанием: сначала составь описания".into());
+        return Err("Нет готовых задач: назначь текст или добавь ролики без текста".into());
     }
+    tx.commit().map_err(err)?;
     Ok(queued)
 }
 
@@ -328,9 +447,9 @@ pub(crate) fn start_jobs(db: &Connection, project_id: i64) -> Result<usize, Stri
 /// недописанное описание пишется заново, а очередь после перезапуска ждёт нового согласия.
 pub(crate) fn recover_interrupted_jobs(db: &Connection) {
     for sql in [
-        "UPDATE publish_jobs SET state = 'needs_check', error = 'Выкладка прервана: приложение было закрыто. Проверь в TikTok Studio, вышел ли ролик, прежде чем отправлять ещё раз.' WHERE state = 'sending'",
-        "UPDATE publish_jobs SET state = 'failed', error = 'Описание не дописано: приложение было закрыто. Нажми «Составить описания» ещё раз.' WHERE state = 'drafting'",
-        "UPDATE publish_jobs SET state = 'ready' WHERE state = 'queued'",
+        "UPDATE publications SET state = 'needs_check', error = 'Выкладка прервана: приложение было закрыто. Проверь в TikTok Studio, вышел ли ролик, прежде чем отправлять ещё раз.' WHERE legacy=1 AND state = 'sending'",
+        "UPDATE publications SET state = 'failed', error = 'Описание не дописано: приложение было закрыто. Нажми «Сгенерировать хэштеги» ещё раз.' WHERE legacy=1 AND state = 'drafting'",
+        "UPDATE publications SET state = 'ready' WHERE legacy=1 AND state = 'queued'",
     ] {
         let _ = db.execute(sql, []);
     }
@@ -417,13 +536,18 @@ fn day_start(now: i64, offset: i64) -> i64 {
 
 /// Смещение местного времени от UTC на момент `now`, секунды.
 fn local_offset(now: i64) -> i64 {
-    Local.timestamp_opt(now, 0).single().map_or(0, |t| t.offset().local_minus_utc() as i64)
+    Local
+        .timestamp_opt(now, 0)
+        .single()
+        .map_or(0, |t| t.offset().local_minus_utc() as i64)
 }
 
 /// Что делать очереди сейчас. `queued` — задачи в порядке выкладки. Сначала окно публикации, потом аккаунт, потом пауза.
 /// Аккаунт не занят, пока у него не выбран суточный лимит; за выбор аккаунта отвечает `pick_account`.
 pub fn next_action(plan: &Plan, queued: &[QueuedJob]) -> Action {
-    let Some(first) = queued.first() else { return Action::Idle };
+    let Some(first) = queued.first() else {
+        return Action::Idle;
+    };
     if plan.accounts.is_empty() {
         return Action::NoAccounts;
     }
@@ -431,7 +555,10 @@ pub fn next_action(plan: &Plan, queued: &[QueuedJob]) -> Action {
         return Action::OutsideWindow(next_open(plan));
     }
     // выбранный вручную аккаунт: ролик ждёт своего аккаунта, а не уходит на другой (кроме отключённого аккаунта)
-    let account = match first.wanted.filter(|w| plan.accounts.iter().any(|t| t.id == *w)) {
+    let account = match first
+        .wanted
+        .filter(|w| plan.accounts.iter().any(|t| t.id == *w))
+    {
         Some(wanted) if under_limit(plan, wanted) => wanted,
         Some(_) => return Action::LimitReached((plan.day_start() + DAY).max(first.not_before)),
         None => match pick_account(plan) {
@@ -442,26 +569,39 @@ pub fn next_action(plan: &Plan, queued: &[QueuedJob]) -> Action {
     if first.not_before > plan.now {
         return Action::WaitUntil(first.not_before);
     }
-    Action::Send { job: first.id, account }
+    Action::Send {
+        job: first.id,
+        account,
+    }
 }
 
 /// У аккаунта за местные сутки ещё нет полного лимита выкладок.
 fn under_limit(plan: &Plan, account: i64) -> bool {
     let day = plan.day_start();
     let limit = plan.daily_limit.max(1) as usize;
-    plan.accounts.iter().find(|a| a.id == account).is_some_and(|a| a.sent.iter().filter(|t| **t >= day).count() < limit)
+    plan.accounts
+        .iter()
+        .find(|a| a.id == account)
+        .is_some_and(|a| a.sent.iter().filter(|t| **t >= day).count() < limit)
 }
 
 /// Когда окно откроется в следующий раз: сегодня или завтра.
 fn next_open(plan: &Plan) -> i64 {
     let at = plan.day_start() + plan.window_start * 60;
-    if at > plan.now { at } else { at + DAY }
+    if at > plan.now {
+        at
+    } else {
+        at + DAY
+    }
 }
 
 /// Аккаунт для следующей выкладки: по кругу после выложившего последним, пропуская тех, у кого лимит на сутки выбран.
 fn pick_account(plan: &Plan) -> Option<i64> {
     let n = plan.accounts.len();
-    let first = plan.last.and_then(|last| plan.accounts.iter().position(|a| a.id == last)).map_or(0, |i| i + 1);
+    let first = plan
+        .last
+        .and_then(|last| plan.accounts.iter().position(|a| a.id == last))
+        .map_or(0, |i| i + 1);
     let (day, limit) = (plan.day_start(), plan.daily_limit.max(1) as usize);
     (0..n)
         .map(|k| &plan.accounts[(first + k) % n])
@@ -473,7 +613,11 @@ fn pick_account(plan: &Plan) -> Option<i64> {
 pub(crate) fn make_plan(db: &Connection, now: i64) -> Plan {
     let settings = load_settings(db);
     let offset = local_offset(now);
-    let mut accounts: Vec<Turn> = accounts::enabled_ids(db).unwrap_or_default().into_iter().map(|id| Turn { id, sent: vec![] }).collect();
+    let mut accounts: Vec<Turn> = accounts::enabled_ids(db)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| Turn { id, sent: vec![] })
+        .collect();
     for (account, at) in accounts::sent_since(db, day_start(now, offset)).unwrap_or_default() {
         if let Some(turn) = accounts.iter_mut().find(|t| t.id == account) {
             turn.sent.push(at);
@@ -491,16 +635,25 @@ pub(crate) fn make_plan(db: &Connection, now: i64) -> Plan {
 }
 
 fn queued_jobs(db: &Connection, project_id: i64) -> Vec<QueuedJob> {
+    if crate::factory::rights::require_project(db, project_id).is_err() {
+        return vec![];
+    }
     let Ok(mut st) = db.prepare(
-        "SELECT j.id, j.not_before, j.wanted_account_id FROM publish_jobs j
+        "SELECT j.id, j.not_before, j.wanted_account_id FROM publications j
          LEFT JOIN drafts d ON d.id = j.draft_id LEFT JOIN moments m ON m.id = d.moment_id LEFT JOIN ready_videos r ON r.id = j.ready_id
-         WHERE COALESCE(m.project_id, r.project_id) = ?1 AND j.state = 'queued' ORDER BY COALESCE(d.part, 1000000), j.id",
+         WHERE j.legacy=1 AND COALESCE(m.project_id, r.project_id) = ?1 AND j.state = 'queued' ORDER BY COALESCE(d.part, 1000000), j.id",
     ) else {
         return vec![];
     };
-    st.query_map([project_id], |r| Ok(QueuedJob { id: r.get(0)?, not_before: r.get(1)?, wanted: r.get(2)? }))
-        .map(|r| r.flatten().collect())
-        .unwrap_or_default()
+    st.query_map([project_id], |r| {
+        Ok(QueuedJob {
+            id: r.get(0)?,
+            not_before: r.get(1)?,
+            wanted: r.get(2)?,
+        })
+    })
+    .map(|r| r.flatten().collect())
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- события
@@ -524,7 +677,12 @@ pub(crate) fn changed(app: &AppHandle, project_id: i64) {
 
 // ---------------------------------------------------------------- описания
 
-async fn generate_all(app: &AppHandle, project_id: i64, todo: Vec<Todo>, cancel: watch::Receiver<bool>) {
+async fn generate_all(
+    app: &AppHandle,
+    project_id: i64,
+    todo: Vec<Todo>,
+    cancel: watch::Receiver<bool>,
+) {
     let state = app.state::<AppState>();
     let models = ModelPaths::in_dir(&state.models_dir());
     let opt = Options::default();
@@ -536,6 +694,15 @@ async fn generate_all(app: &AppHandle, project_id: i64, todo: Vec<Todo>, cancel:
         }
     };
 
+    let mut gate_cancel = cancel.clone();
+    let _ml_permit = tokio::select! {
+        p = state.ml_gate.clone().acquire_owned() => p.ok(),
+        _ = gate_cancel.changed() => { fail_rest(0, "Подбор хэштегов остановлен"); return; }
+    };
+    if *cancel.borrow() {
+        fail_rest(0, "Подбор хэштегов остановлен");
+        return;
+    }
     let started = match LlmClient::start(&models.llm, opt.threads, gpu).await {
         Err(_) if gpu > 0 => {
             gpu = 0;
@@ -551,38 +718,30 @@ async fn generate_all(app: &AppHandle, project_id: i64, todo: Vec<Todo>, cancel:
         }
     };
 
-    // сходство проверяем и с описаниями, которые уже есть у проекта
-    let mut prior: Vec<String> = jobs_for_project(&state.db.0.lock().unwrap(), project_id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|j| ["ready", "queued", "sending", "done"].contains(&j.state.as_str()) && !j.caption.is_empty())
-        .map(|j| j.caption)
-        .collect();
-
     for (i, t) in todo.iter().enumerate() {
         if *cancel.borrow() {
-            fail_rest(i, "Остановлено: описание не написано. Нажми «Составить описания» ещё раз.");
+            fail_rest(
+                i,
+                "Подбор хэштегов остановлен. Можно повторить или ввести их вручную.",
+            );
             break;
         }
-        let mut seed = 1000u32.wrapping_add((t.draft_id as u32).wrapping_mul(31));
-        let (mut tries, mut fell_back) = (0, false);
-        let outcome: Result<describe::Description, String> = loop {
-            let Some(c) = client.as_mut() else { break Err("Языковая модель остановилась".into()) };
-            let (app2, did) = (app.clone(), t.draft_id);
-            let r = describe::describe(c, &t.title, &t.transcript, seed, &mut move |m| {
-                let _ = app2.emit("queue-text", TextEvent { draft_id: did, message: m.to_string() });
-            })
-            .await;
+        let seed = 1000u32.wrapping_add((t.draft_id as u32).wrapping_mul(31));
+        let mut fell_back = false;
+        let outcome: Result<Vec<String>, String> = loop {
+            let Some(c) = client.as_mut() else {
+                break Err("Языковая модель остановилась".into());
+            };
+            let _ = app.emit(
+                "queue-text",
+                TextEvent {
+                    draft_id: t.draft_id,
+                    message: "Подбираю хэштеги".into(),
+                },
+            );
+            let r = crate::caption::generate::tags(c, &t.title, &t.transcript, seed).await;
             match r {
-                Ok(d) => {
-                    // ролики из одного видео похожи, и модель с одним зерном может написать почти то же самое
-                    if tries < 2 && prior.iter().any(|p| describe::similarity(p, &d.caption) > 0.5) {
-                        tries += 1;
-                        seed = seed.wrapping_add(101);
-                        continue;
-                    }
-                    break Ok(d);
-                }
+                Ok(tags) => break Ok(tags),
                 Err(e) => {
                     // видеокарта могла не потянуть запрос, а воркер мог упасть: поднимаем заново, сперва на процессоре
                     if let Some(c) = client.take() {
@@ -601,9 +760,17 @@ async fn generate_all(app: &AppHandle, project_id: i64, todo: Vec<Todo>, cancel:
         };
         {
             let db = state.db.0.lock().unwrap();
-            match outcome.and_then(|d| validate_generated(&d.caption, &d.hashtags).map(|(tags, _)| (d.caption, tags))) {
+            match outcome.and_then(|tags| {
+                let caption: String = db
+                    .query_row(
+                        "SELECT caption FROM publications WHERE legacy=1 AND draft_id=?1",
+                        [t.draft_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(err)?;
+                validate_job(&caption, &tags).map(|(tags, _)| (caption, tags))
+            }) {
                 Ok((caption, tags)) => {
-                    prior.push(caption.clone());
                     let _ = store_ready(&db, t.draft_id, &caption, &tags);
                 }
                 Err(e) => store_text_failed(&db, t.draft_id, &e),
@@ -616,8 +783,12 @@ async fn generate_all(app: &AppHandle, project_id: i64, todo: Vec<Todo>, cancel:
     }
 }
 
-#[tauri::command]
-pub async fn queue_prepare(app: AppHandle, state: State<'_, AppState>, project_id: i64) -> CmdResult<()> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn queue_prepare(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: i64,
+) -> CmdResult<()> {
     let models = ModelPaths::in_dir(&state.models_dir());
     if !models.llm.is_file() {
         return Err(format!("Языковая модель ещё не скачана ({}). Дождись загрузки моделей или нажми «Скачать модели»", models.llm.display()));
@@ -629,7 +800,7 @@ pub async fn queue_prepare(app: AppHandle, state: State<'_, AppState>, project_i
     {
         let mut g = state.drafting.lock().unwrap();
         if g.is_some() {
-            return Err("Описания уже пишутся".into());
+            return Err("Хэштеги уже подбираются".into());
         }
         *g = Some(tx);
     }
@@ -637,7 +808,7 @@ pub async fn queue_prepare(app: AppHandle, state: State<'_, AppState>, project_i
         Ok(t) if !t.is_empty() => t,
         Ok(_) => {
             *state.drafting.lock().unwrap() = None;
-            return Err("У всех готовых роликов уже есть описание, либо готовых роликов нет".into());
+            return Err("Нет готовых роликов для подбора хэштегов".into());
         }
         Err(e) => {
             *state.drafting.lock().unwrap() = None;
@@ -645,7 +816,7 @@ pub async fn queue_prepare(app: AppHandle, state: State<'_, AppState>, project_i
         }
     };
     let app2 = app.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::host::spawn(async move {
         generate_all(&app2, project_id, todo, rx).await;
         *app2.state::<AppState>().drafting.lock().unwrap() = None;
         changed(&app2, project_id);
@@ -655,12 +826,25 @@ pub async fn queue_prepare(app: AppHandle, state: State<'_, AppState>, project_i
 }
 
 /// «Свой текст на все»: модель не запускается, одно описание и хэштеги получают все готовые ролики, которым это можно.
-#[tauri::command]
-pub fn queue_apply_text(app: AppHandle, state: State<'_, AppState>, project_id: i64, caption: String, hashtags: Vec<String>) -> CmdResult<usize> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn queue_apply_text(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: i64,
+    caption: String,
+    hashtags: Vec<String>,
+    preserve_hashtags: Option<bool>,
+) -> CmdResult<usize> {
     if state.drafting.lock().unwrap().is_some() {
-        return Err("Подожди, пока модель допишет описания, или останови её".into());
+        return Err("Подожди, пока модель подберёт хэштеги, или останови её".into());
     }
-    let n = apply_text(&state.db.0.lock().unwrap(), project_id, &caption, &hashtags)?;
+    let db = state.db.0.lock().unwrap();
+    let n = if preserve_hashtags.unwrap_or(false) {
+        apply_text_with_tags(&db, project_id, &caption, None)
+    } else {
+        apply_text(&db, project_id, &caption, &hashtags)
+    }?;
+    drop(db);
     if n == 0 {
         return Err("Нет роликов, которым можно назначить текст: все уже в очереди, выложены или ждут проверки".into());
     }
@@ -668,7 +852,7 @@ pub fn queue_apply_text(app: AppHandle, state: State<'_, AppState>, project_id: 
     Ok(n)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn queue_prepare_cancel(state: State<'_, AppState>) {
     if let Some(tx) = state.drafting.lock().unwrap().as_ref() {
         let _ = tx.send(true);
@@ -678,93 +862,130 @@ pub fn queue_prepare_cancel(state: State<'_, AppState>) {
 // ---------------------------------------------------------------- выкладка
 
 fn fail_job(db: &Connection, job_id: i64, message: String) -> String {
-    let _ = db.execute("UPDATE publish_jobs SET state = 'failed', error = ?2, updated_at = unixepoch() WHERE id = ?1", params![job_id, message]);
+    let _ = db.execute("UPDATE publications SET state = 'failed', error = ?2, updated_at = unixepoch() WHERE id = ?1", params![job_id, message]);
     message
-}
-
-/// Файл для пула: копия финала без надписи «Часть N». Собирается заново, только если финал новее копии.
-async fn pool_file(app: &AppHandle, draft_id: i64, final_file: &Path) -> anyhow::Result<PathBuf> {
-    let state = app.state::<AppState>();
-    let out = state.data_dir.join("pool").join(format!("draft_{draft_id}.mp4"));
-    if !(out.is_file() && is_newer(&out, final_file)) {
-        let reporter = app.clone();
-        render_pool_copy(app, draft_id, &out, move |fraction| {
-            let _ = reporter.emit("post-progress", PostProgress { draft_id, fraction, message: "Готовлю ролик без надписи «Часть» для пула".into() });
-        })
-        .await?;
-    }
-    Ok(out)
-}
-
-/// `a` записан не раньше `b`. Если времени не узнать, считаем, что не новее.
-fn is_newer(a: &Path, b: &Path) -> bool {
-    let at = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    matches!((at(a), at(b)), (Some(x), Some(y)) if x >= y)
 }
 
 /// Выкладывает одну задачу с выбранного аккаунта. `Err` — очередь надо остановить; текст ошибки идёт в панель.
 async fn send_job(app: &AppHandle, job_id: i64, account: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
     // `draft_id` здесь — ключ ролика: номер черновика, а у готового ролика из папки отрицательный номер готового файла
-    let (draft_id, project_id, file, caption, post_id, profile, pool) = {
+    let (draft_id, project_id, file, caption, post_id, profile) = {
         let db = state.db.0.lock().unwrap();
         let (draft_id, ready_id, caption, tags_json): (Option<i64>, Option<i64>, String, String) = db
             .query_row(
-                "SELECT draft_id, ready_id, caption, hashtags FROM publish_jobs WHERE id = ?1 AND state = 'queued'",
+                "SELECT draft_id, ready_id, caption, hashtags FROM publications WHERE legacy=1 AND id = ?1 AND state = 'queued'",
                 [job_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .map_err(|_| "Задача пропала из очереди".to_string())?;
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        let (key, project_id, file, pool) = match (draft_id, ready_id) {
+        let (key, project_id, file) = match (draft_id, ready_id) {
             (Some(draft), _) => {
                 let d = get_draft(&db, draft)?;
                 let file = match d.final_path.clone().filter(|_| d.status == "final_done") {
                     Some(p) => PathBuf::from(p),
-                    None => return Err(fail_job(&db, job_id, "У ролика нет готового файла".into())),
+                    None => {
+                        return Err(fail_job(&db, job_id, "У ролика нет готового файла".into()))
+                    }
                 };
                 if !file.is_file() {
-                    return Err(fail_job(&db, job_id, format!("Файл не найден: {}", file.display())));
+                    return Err(fail_job(
+                        &db,
+                        job_id,
+                        format!("Файл не найден: {}", file.display()),
+                    ));
                 }
-                // два и больше включённых аккаунта — пул: ролик выходит без надписи «Часть N»
-                let pool = accounts::enabled_ids(&db).map_err(err)?.len() > 1;
-                (draft, d.project_id, file, pool)
+                (draft, d.project_id, file)
             }
             (None, Some(ready)) => {
                 let (path, project_id): (String, i64) = db
-                    .query_row("SELECT path, project_id FROM ready_videos WHERE id = ?1", [ready], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .query_row(
+                        "SELECT path, project_id FROM ready_videos WHERE id = ?1",
+                        [ready],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
                     .map_err(|_| fail_job(&db, job_id, "Готовый ролик пропал из проекта".into()))?;
                 let file = PathBuf::from(path);
                 if !file.is_file() {
-                    return Err(fail_job(&db, job_id, format!("Файл не найден: {}", file.display())));
+                    return Err(fail_job(
+                        &db,
+                        job_id,
+                        format!("Файл не найден: {}", file.display()),
+                    ));
                 }
                 // надпись «Часть N» у готового ролика уже запечена, а перерисовать его без исходника нельзя: пул его не трогает
-                (-ready, project_id, file, false)
+                (-ready, project_id, file)
             }
             (None, None) => return Err(fail_job(&db, job_id, "Задача без ролика".into())),
         };
+        crate::factory::rights::require_project(&db, project_id)?;
         if let Err(e) = validate_job(&caption, &tags) {
             return Err(fail_job(&db, job_id, e));
         }
         if state.posting.lock().unwrap().contains(&key) {
-            return Err(fail_job(&db, job_id, "Этот ролик уже отправляется другим способом".into()));
+            return Err(fail_job(
+                &db,
+                job_id,
+                "Этот ролик уже отправляется другим способом".into(),
+            ));
         }
-        let profile = accounts::profile_dir(&db, &state.data_dir, Some(account)).map_err(|e| fail_job(&db, job_id, e))?;
-        db.execute("UPDATE publish_jobs SET state = 'sending', attempts = attempts + 1, account_id = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![job_id, account]).map_err(err)?;
+        let profile = accounts::profile_dir(&db, &state.data_dir, Some(account))
+            .map_err(|e| fail_job(&db, job_id, e))?;
+        db.execute("UPDATE publications SET state = 'sending', attempts = attempts + 1, account_id = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![job_id, account]).map_err(err)?;
         let post_id = match (draft_id, ready_id) {
             (Some(draft), _) => begin_post(&db, draft, "browser", "browser"),
             (None, Some(ready)) => begin_ready_post(&db, ready, "browser", "browser"),
             (None, None) => return Err(fail_job(&db, job_id, "Задача без ролика".into())),
         }
         .map_err(err)?;
-        (key, project_id, file, make_caption(&caption, &tags, CAPTION_LIMIT), post_id, profile, pool)
+        (
+            key,
+            project_id,
+            file,
+            make_caption(&caption, &tags, CAPTION_LIMIT),
+            post_id,
+            profile,
+        )
     };
     state.posting.lock().unwrap().insert(draft_id);
     changed(app, project_id);
 
     let result = async {
-        let file = if pool { pool_file(app, draft_id, &file).await.map_err(|e| e.context("не собрался ролик без надписи «Часть» для пула"))? } else { file };
-        run_browser_post(app, draft_id, BrowserPost { file, caption, auto_publish: true, require_confirmation: true, close_on_success: true, profile }).await
+        let file = if draft_id > 0 {
+            crate::publish::output::prepare(
+                app,
+                draft_id,
+                crate::publish::PlatformId::Tiktok,
+                Some(job_id),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?
+            .0
+        } else {
+            crate::publish::output::prepare_ready(
+                app,
+                -draft_id,
+                &file,
+                crate::publish::PlatformId::Tiktok,
+                Some(job_id),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?
+        };
+        run_browser_post(
+            app,
+            draft_id,
+            BrowserPost {
+                file,
+                caption,
+                auto_publish: true,
+                require_confirmation: true,
+                close_on_success: true,
+                profile,
+            },
+        )
+        .await
     }
     .await;
     state.posting.lock().unwrap().remove(&draft_id);
@@ -777,9 +998,12 @@ async fn send_job(app: &AppHandle, job_id: i64, account: i64) -> Result<(), Stri
                 let now = now_unix();
                 finish_post(&db, post_id, &Ok((detail.clone(), None)));
                 mark_sent(&db, post_id, Some(account));
-                let _ = db.execute("UPDATE publish_jobs SET state = 'done', sent_at = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![job_id, now]);
+                let _ = db.execute("UPDATE publications SET state = 'done', sent_at = ?2, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![job_id, now]);
                 // пауза отсчитывается от выхода этого ролика и сдвигает остальных
-                let _ = db.execute("UPDATE publish_jobs SET not_before = ?1 WHERE state = 'queued'", [now + load_settings(&db).pause_min * 60]);
+                let _ = db.execute(
+                    "UPDATE publications SET not_before = ?1 WHERE legacy=1 AND state = 'queued'",
+                    [now + load_settings(&db).pause_min * 60],
+                );
             }
             let _ = app.emit("post-done", PostDone { draft_id, detail });
             changed(app, project_id);
@@ -787,16 +1011,26 @@ async fn send_job(app: &AppHandle, job_id: i64, account: i64) -> Result<(), Stri
         }
         other => {
             let (message, after_click) = match other {
-                Ok(_) => ("TikTok не подтвердил публикацию. Проверь в TikTok Studio, вышел ли ролик".to_string(), true),
+                Ok(_) => (
+                    "TikTok не подтвердил публикацию. Проверь в TikTok Studio, вышел ли ролик"
+                        .to_string(),
+                    true,
+                ),
                 Err(e) => (format!("{e:#}"), e.downcast_ref::<AfterClick>().is_some()),
             };
             {
                 let db = state.db.0.lock().unwrap();
                 finish_post(&db, post_id, &Err(message.clone()));
                 let new_state = if after_click { "needs_check" } else { "failed" };
-                let _ = db.execute("UPDATE publish_jobs SET state = ?2, error = ?3, updated_at = unixepoch() WHERE id = ?1", params![job_id, new_state, message]);
+                let _ = db.execute("UPDATE publications SET state = ?2, error = ?3, updated_at = unixepoch() WHERE id = ?1", params![job_id, new_state, message]);
             }
-            let _ = app.emit("post-error", PostFailed { draft_id, message: message.clone() });
+            let _ = app.emit(
+                "post-error",
+                PostFailed {
+                    draft_id,
+                    message: message.clone(),
+                },
+            );
             changed(app, project_id);
             Err(message)
         }
@@ -813,13 +1047,37 @@ async fn run_queue(app: AppHandle, project_id: i64, mut stop: watch::Receiver<bo
         let now = now_unix();
         let action = {
             let db = state.db.0.lock().unwrap();
-            next_action(&make_plan(&db, now), &queued_jobs(&db, project_id))
+            if project_id == 0 {
+                match crate::publish::calendar::next_due(&db, now) {
+                    Ok(a) => a,
+                    Err(e) => break Some(e),
+                }
+            } else {
+                next_action(&make_plan(&db, now), &queued_jobs(&db, project_id))
+            }
         };
         match action {
+            Action::Idle if project_id == 0 => {
+                // Новые финалы могут получить слоты позже. Раннер сохраняет намерение
+                // пользователя, а при пустой очереди блокировка сна освобождается.
+                tokio::select! {
+                    r = stop.changed() => { if r.is_err() { break None; } }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+            }
             Action::Idle => break None,
-            Action::NoAccounts => break Some("Нет включённых аккаунтов: включи хотя бы один в списке аккаунтов".into()),
+            Action::NoAccounts => {
+                break Some(
+                    "Нет включённых аккаунтов: включи хотя бы один в списке аккаунтов".into(),
+                )
+            }
             Action::Send { job, account } => {
-                if let Err(message) = send_job(&app, job, account).await {
+                let sent = if project_id == 0 {
+                    crate::publish::calendar::send(&app, job, account).await
+                } else {
+                    send_job(&app, job, account).await
+                };
+                if let Err(message) = sent {
                     break Some(format!("Очередь остановлена: {message}"));
                 }
             }
@@ -838,9 +1096,87 @@ async fn run_queue(app: AppHandle, project_id: i64, mut stop: watch::Receiver<bo
             }
         }
     };
+    if let Some(message) = &note {
+        let db = state.db.0.lock().unwrap();
+        let _ = kv_set(&db, "publisher_armed", "0");
+        let _ = kv_set(&db, "publisher_note", message);
+        drop(db);
+        crate::notifications::attention(&app,"publisher:attention".into(),"Публикации приостановлены","Открой календарь: проверь ошибку, капчу или квоту аккаунта. Для продолжения нужно твоё действие.");
+    }
     *state.queue_note.lock().unwrap() = note;
     *state.publisher.lock().unwrap() = None;
     changed(&app, project_id);
+    crate::publish::calendar::changed(&app);
+}
+
+/// Календарь использует тот же раннер и mutex, что очередь Студии. Нулевой
+/// project_id означает общий охват; SQLite id реальных проектов положительные.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn publications_start(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    let mut publisher = state.publisher.lock().unwrap();
+    if publisher.is_some() {
+        return Err("Очередь публикаций уже работает".into());
+    }
+    arm(&state.db.0.lock().unwrap(), 0)?;
+    let (tx, rx) = watch::channel(false);
+    *publisher = Some(tx);
+    drop(publisher);
+    *state.queue_note.lock().unwrap() = None;
+    crate::host::spawn(run_queue(app.clone(), 0, rx));
+    crate::publish::calendar::changed(&app);
+    Ok(())
+}
+
+fn arm(db: &Connection, project: i64) -> CmdResult<()> {
+    let tx = db.unchecked_transaction().map_err(err)?;
+    kv_set(&tx, "publisher_armed", "1").map_err(err)?;
+    kv_set(&tx, "publisher_scope", &project.to_string()).map_err(err)?;
+    kv_set(&tx, "publisher_note", "").map_err(err)?;
+    tx.commit().map_err(err)
+}
+
+fn resume_scope(db: &Connection) -> CmdResult<Option<i64>> {
+    if !crate::factory::resources::load(db).resume_on_start
+        || kv_get(db, "publisher_armed").as_deref() != Some("1")
+    {
+        return Ok(None);
+    }
+    let uncertain: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM publications WHERE state='needs_check')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    if uncertain {
+        kv_set(db, "publisher_armed", "0").map_err(err)?;
+        kv_set(
+            db,
+            "publisher_note",
+            "Отправка требует проверки. Открой календарь перед возобновлением",
+        )
+        .map_err(err)?;
+        return Ok(None);
+    }
+    Ok(kv_get(db, "publisher_scope")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0))
+}
+
+pub(crate) fn resume(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let result = resume_scope(&state.db.0.lock().unwrap());
+    *state.queue_note.lock().unwrap() =
+        kv_get(&state.db.0.lock().unwrap(), "publisher_note").filter(|s| !s.is_empty());
+    match result {
+        Ok(Some(project)) => {
+            let (tx, rx) = watch::channel(false);
+            *state.publisher.lock().unwrap() = Some(tx);
+            crate::host::spawn(run_queue(app.clone(), project, rx));
+        }
+        Err(e) => tracing::error!("Не возобновить публикации: {e}"),
+        Ok(None) => {}
+    }
 }
 
 // ---------------------------------------------------------------- команды
@@ -878,8 +1214,17 @@ fn build_state(state: &AppState, project_id: i64) -> CmdResult<QueueDto> {
     let action = next_action(&plan, &queued_jobs(&db, project_id));
     let (next_at, limit_note) = match action {
         Action::WaitUntil(t) => (Some(t), None),
-        Action::OutsideWindow(t) => (Some(t), Some("Сейчас вне окна публикации: очередь ждёт, когда окно откроется.".to_string())),
-        Action::LimitReached(t) => (Some(t), Some(format!("Суточный лимит на аккаунт ({}) выбран: очередь продолжится с полуночи.", settings.daily_limit))),
+        Action::OutsideWindow(t) => (
+            Some(t),
+            Some("Сейчас вне окна публикации: очередь ждёт, когда окно откроется.".to_string()),
+        ),
+        Action::LimitReached(t) => (
+            Some(t),
+            Some(format!(
+                "Суточный лимит на аккаунт ({}) выбран: очередь продолжится с полуночи.",
+                settings.daily_limit
+            )),
+        ),
         _ => (None, None),
     };
     let pool_accounts = accounts::list(&db, plan.day_start()).map_err(err)?;
@@ -893,7 +1238,7 @@ fn build_state(state: &AppState, project_id: i64) -> CmdResult<QueueDto> {
         generating,
         next_at: if running { next_at } else { None },
         note: kept_note.or(if running { limit_note } else { None }),
-        window_min: MIN_LEN,
+        window_min: 0,
         window_max: MAX_LEN,
         max_tags: MAX_TAGS,
         caption_limit: CAPTION_LIMIT,
@@ -901,51 +1246,74 @@ fn build_state(state: &AppState, project_id: i64) -> CmdResult<QueueDto> {
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn queue_state(state: State<'_, AppState>, project_id: i64) -> CmdResult<QueueDto> {
     build_state(&state, project_id)
 }
 
-#[tauri::command]
-pub fn queue_job_update(state: State<'_, AppState>, id: i64, caption: String, hashtags: Vec<String>) -> CmdResult<JobDto> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn queue_job_update(
+    state: State<'_, AppState>,
+    id: i64,
+    caption: String,
+    hashtags: Vec<String>,
+) -> CmdResult<JobDto> {
     update_job(&state.db.0.lock().unwrap(), id, &caption, &hashtags)
 }
 
 /// Выбирает аккаунт для ролика вручную (`None` — снова по кругу). Пока ролик не ушёл в работу.
-#[tauri::command]
-pub fn queue_job_account(app: AppHandle, state: State<'_, AppState>, id: i64, account: Option<i64>) -> CmdResult<()> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn queue_job_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    account: Option<i64>,
+) -> CmdResult<()> {
     let db = state.db.0.lock().unwrap();
     let (job_state, project_id): (String, i64) = db
         .query_row(
-            "SELECT j.state, COALESCE(m.project_id, r.project_id) FROM publish_jobs j
+            "SELECT j.state, COALESCE(m.project_id, r.project_id) FROM publications j
              LEFT JOIN drafts d ON d.id = j.draft_id LEFT JOIN moments m ON m.id = d.moment_id LEFT JOIN ready_videos r ON r.id = j.ready_id
-             WHERE j.id = ?1",
+             WHERE j.legacy=1 AND j.id = ?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|_| "Задача не найдена".to_string())?;
     if ["sending", "done", "needs_check"].contains(&job_state.as_str()) {
-        return Err("Аккаунт уже не поменять: ролик выкладывается, выложен или ждёт проверки".into());
+        return Err(
+            "Аккаунт уже не поменять: ролик выкладывается, выложен или ждёт проверки".into(),
+        );
     }
     if let Some(a) = account {
-        let exists: i64 = db.query_row("SELECT COUNT(*) FROM accounts WHERE id = ?1", [a], |r| r.get(0)).map_err(err)?;
+        let exists: i64 = db
+            .query_row("SELECT COUNT(*) FROM accounts WHERE id = ?1", [a], |r| {
+                r.get(0)
+            })
+            .map_err(err)?;
         if exists == 0 {
             return Err("Такого аккаунта нет".into());
         }
     }
-    db.execute("UPDATE publish_jobs SET wanted_account_id = ?2, updated_at = unixepoch() WHERE id = ?1", params![id, account]).map_err(err)?;
+    db.execute(
+        "UPDATE publications SET wanted_account_id = ?2, updated_at = unixepoch() WHERE id = ?1",
+        params![id, account],
+    )
+    .map_err(err)?;
     drop(db);
     changed(&app, project_id);
     Ok(())
 }
 
-#[tauri::command]
-pub fn queue_job_resolve(app: AppHandle, state: State<'_, AppState>, id: i64, action: String) -> CmdResult<()> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn queue_job_resolve(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    action: String,
+) -> CmdResult<()> {
     let project_id: Option<i64> = {
         let db = state.db.0.lock().unwrap();
-        let project_id = db
-            .query_row("SELECT m.project_id FROM publish_jobs j JOIN drafts d ON d.id = j.draft_id JOIN moments m ON m.id = d.moment_id WHERE j.id = ?1", [id], |r| r.get(0))
-            .ok();
+        let project_id = job_project(&db, id).ok();
         resolve_job(&db, id, &action)?;
         project_id
     };
@@ -957,18 +1325,53 @@ pub fn queue_job_resolve(app: AppHandle, state: State<'_, AppState>, id: i64, ac
     Ok(())
 }
 
-#[tauri::command]
-pub fn queue_settings_set(state: State<'_, AppState>, pause_min: i64, daily_limit: i64, window_start: i64, window_end: i64) -> CmdResult<QueueSettings> {
+fn job_project(db: &Connection, id: i64) -> rusqlite::Result<i64> {
+    db.query_row(
+        "SELECT COALESCE(m.project_id, r.project_id) FROM publications j
+         LEFT JOIN drafts d ON d.id = j.draft_id LEFT JOIN moments m ON m.id = d.moment_id
+         LEFT JOIN ready_videos r ON r.id = j.ready_id WHERE j.legacy=1 AND j.id = ?1",
+        [id],
+        |r| r.get(0),
+    )
+}
+
+fn stop_jobs(db: &Connection, project_id: i64) -> rusqlite::Result<usize> {
+    db.execute(
+        "UPDATE publications SET state = 'ready', updated_at = unixepoch() WHERE legacy=1 AND state = 'queued'
+         AND (draft_id IN (SELECT d.id FROM drafts d JOIN moments m ON m.id = d.moment_id WHERE m.project_id = ?1)
+              OR ready_id IN (SELECT id FROM ready_videos WHERE project_id = ?1))",
+        [project_id],
+    )
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn queue_settings_set(
+    state: State<'_, AppState>,
+    pause_min: i64,
+    daily_limit: i64,
+    window_start: i64,
+    window_end: i64,
+) -> CmdResult<QueueSettings> {
     let db = state.db.0.lock().unwrap();
     kv_set(&db, K_PAUSE, &pause_min.clamp(1, 1440).to_string()).map_err(err)?;
     kv_set(&db, K_LIMIT, &daily_limit.clamp(1, 50).to_string()).map_err(err)?;
-    kv_set(&db, K_WINDOW_START, &window_start.clamp(0, DAY_MIN).to_string()).map_err(err)?;
+    kv_set(
+        &db,
+        K_WINDOW_START,
+        &window_start.clamp(0, DAY_MIN).to_string(),
+    )
+    .map_err(err)?;
     kv_set(&db, K_WINDOW_END, &window_end.clamp(0, DAY_MIN).to_string()).map_err(err)?;
     Ok(load_settings(&db))
 }
 
-#[tauri::command]
-pub fn queue_start(app: AppHandle, state: State<'_, AppState>, project_id: i64, confirmed: bool) -> CmdResult<()> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn queue_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: i64,
+    confirmed: bool,
+) -> CmdResult<()> {
     // выкладка без присмотра меняет настоящий аккаунт: без явного согласия из окна ничего не стартует
     if !confirmed {
         return Err("Нужно подтверждение запуска".into());
@@ -979,44 +1382,44 @@ pub fn queue_start(app: AppHandle, state: State<'_, AppState>, project_id: i64, 
     if state.drafting.lock().unwrap().is_some() {
         return Err("Подожди, пока модель допишет описания".into());
     }
-    if state.publisher.lock().unwrap().is_some() {
+    let mut publisher = state.publisher.lock().unwrap();
+    if publisher.is_some() {
         return Err("Очередь уже идёт".into());
     }
-    let has_accounts = !accounts::enabled_ids(&state.db.0.lock().unwrap()).map_err(err)?.is_empty();
+    let has_accounts = !accounts::enabled_ids(&state.db.0.lock().unwrap())
+        .map_err(err)?
+        .is_empty();
     if !has_accounts {
         return Err("Нет включённых аккаунтов: включи хотя бы один в списке аккаунтов".into());
     }
     start_jobs(&state.db.0.lock().unwrap(), project_id)?;
+    arm(&state.db.0.lock().unwrap(), project_id)?;
     let (tx, rx) = watch::channel(false);
-    *state.publisher.lock().unwrap() = Some(tx);
+    *publisher = Some(tx);
+    drop(publisher);
     *state.queue_note.lock().unwrap() = None;
-    tauri::async_runtime::spawn(run_queue(app.clone(), project_id, rx));
+    crate::host::spawn(run_queue(app.clone(), project_id, rx));
     changed(&app, project_id);
     Ok(())
 }
 
 /// Останавливает цикл. Ролик, который выкладывается прямо сейчас, цикл доводит до конца: прервать публикацию на середине нельзя.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn queue_pause(state: State<'_, AppState>) {
+    let db = state.db.0.lock().unwrap();
+    if let Err(e) = kv_set(&db, "publisher_armed", "0") {
+        tracing::error!("Не сохранить паузу публикаций: {e}");
+    }
+    drop(db);
     if let Some(tx) = state.publisher.lock().unwrap().as_ref() {
         let _ = tx.send(true);
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn queue_stop(app: AppHandle, state: State<'_, AppState>, project_id: i64) -> CmdResult<()> {
     queue_pause(state.clone());
-    state
-        .db
-        .0
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE publish_jobs SET state = 'ready', updated_at = unixepoch() WHERE state = 'queued'
-             AND draft_id IN (SELECT d.id FROM drafts d JOIN moments m ON m.id = d.moment_id WHERE m.project_id = ?1)",
-            [project_id],
-        )
-        .map_err(err)?;
+    stop_jobs(&state.db.0.lock().unwrap(), project_id).map_err(err)?;
     changed(&app, project_id);
     Ok(())
 }
@@ -1025,8 +1428,44 @@ pub fn queue_stop(app: AppHandle, state: State<'_, AppState>, project_id: i64) -
 mod tests {
     use super::*;
 
+    #[test]
+    fn resume_requires_saved_start_respects_pause_settings_and_uncertain_send() {
+        let db = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&db).unwrap();
+        assert_eq!(resume_scope(&db).unwrap(), None);
+        arm(&db, 0).unwrap();
+        assert_eq!(resume_scope(&db).unwrap(), Some(0));
+        kv_set(&db, "publisher_armed", "0").unwrap();
+        assert_eq!(resume_scope(&db).unwrap(), None);
+        arm(&db, 8).unwrap();
+        kv_set(&db, "factory_settings", r#"{"resumeOnStart":false}"#).unwrap();
+        assert_eq!(resume_scope(&db).unwrap(), None);
+        kv_set(&db, "factory_settings", r#"{"resumeOnStart":true}"#).unwrap();
+        assert_eq!(resume_scope(&db).unwrap(), Some(8));
+        db.execute("INSERT INTO projects(path,hash,title,duration,width,height,fps,has_audio) VALUES('/tmp/resume','resume','Resume',5,1080,1920,30,1)",[]).unwrap();
+        db.execute(
+            "INSERT INTO ready_videos(project_id,path,name)VALUES(1,'/tmp/ready','Ready')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO publications(ready_id,state)VALUES(1,'needs_check')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(resume_scope(&db).unwrap(), None);
+        assert_eq!(kv_get(&db, "publisher_armed").as_deref(), Some("0"));
+        db.execute("UPDATE publications SET state='done'", [])
+            .unwrap();
+        assert_eq!(resume_scope(&db).unwrap(), None);
+    }
+
     fn q(id: i64, not_before: i64) -> QueuedJob {
-        QueuedJob { id, not_before, wanted: None }
+        QueuedJob {
+            id,
+            not_before,
+            wanted: None,
+        }
     }
 
     /// План без окна и с часовым поясом UTC. `accounts` — круг: (аккаунт, его выкладки).
@@ -1037,68 +1476,164 @@ mod tests {
             window_start: 0,
             window_end: DAY_MIN,
             daily_limit: limit,
-            accounts: accounts.into_iter().map(|(id, sent)| Turn { id, sent }).collect(),
+            accounts: accounts
+                .into_iter()
+                .map(|(id, sent)| Turn { id, sent })
+                .collect(),
             last,
         }
     }
 
     /// То же окно, что и `plan`, но с заданными границами (минуты от полуночи).
     fn windowed(now: i64, start: i64, end: i64) -> Plan {
-        Plan { window_start: start, window_end: end, ..plan(now, vec![(1, vec![])], None, 5) }
+        Plan {
+            window_start: start,
+            window_end: end,
+            ..plan(now, vec![(1, vec![])], None, 5)
+        }
     }
 
     #[test]
     fn an_empty_queue_is_idle_and_no_accounts_is_its_own_answer() {
-        assert_eq!(next_action(&plan(1000, vec![(1, vec![])], None, 5), &[]), Action::Idle);
-        assert_eq!(next_action(&plan(1000, vec![], None, 5), &[q(7, 0)]), Action::NoAccounts);
+        assert_eq!(
+            next_action(&plan(1000, vec![(1, vec![])], None, 5), &[]),
+            Action::Idle
+        );
+        assert_eq!(
+            next_action(&plan(1000, vec![], None, 5), &[q(7, 0)]),
+            Action::NoAccounts
+        );
     }
 
     #[test]
     fn a_free_account_sends_the_first_job_in_time() {
         let p = plan(1000, vec![(1, vec![])], None, 5);
-        assert_eq!(next_action(&p, &[q(7, 0), q(8, 0)]), Action::Send { job: 7, account: 1 });
-        assert_eq!(next_action(&p, &[q(7, 1000)]), Action::Send { job: 7, account: 1 }, "ровно в срок — уже можно");
+        assert_eq!(
+            next_action(&p, &[q(7, 0), q(8, 0)]),
+            Action::Send { job: 7, account: 1 }
+        );
+        assert_eq!(
+            next_action(&p, &[q(7, 1000)]),
+            Action::Send { job: 7, account: 1 },
+            "ровно в срок — уже можно"
+        );
     }
 
     #[test]
     fn the_pause_between_videos_is_waited_out() {
-        assert_eq!(next_action(&plan(1000, vec![(1, vec![])], Some(2), 5), &[q(7, 1900), q(8, 0)]), Action::WaitUntil(1900));
-        assert_eq!(next_action(&plan(1900, vec![(1, vec![])], Some(2), 5), &[q(7, 1900)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(
+            next_action(
+                &plan(1000, vec![(1, vec![])], Some(2), 5),
+                &[q(7, 1900), q(8, 0)]
+            ),
+            Action::WaitUntil(1900)
+        );
+        assert_eq!(
+            next_action(&plan(1900, vec![(1, vec![])], Some(2), 5), &[q(7, 1900)]),
+            Action::Send { job: 7, account: 1 }
+        );
     }
 
     #[test]
     fn the_videos_go_round_the_pool_and_skip_an_account_at_its_limit() {
         let now = 10 * DAY + 3600;
         // после аккаунта 1 идёт 2
-        assert_eq!(next_action(&plan(now, vec![(1, vec![]), (2, vec![]), (3, vec![])], Some(1), 1), &[q(7, 0)]), Action::Send { job: 7, account: 2 });
+        assert_eq!(
+            next_action(
+                &plan(now, vec![(1, vec![]), (2, vec![]), (3, vec![])], Some(1), 1),
+                &[q(7, 0)]
+            ),
+            Action::Send { job: 7, account: 2 }
+        );
         // у 2 лимит выбран, очередь переходит к 3
-        assert_eq!(next_action(&plan(now, vec![(1, vec![]), (2, vec![now - 60]), (3, vec![])], Some(1), 1), &[q(7, 0)]), Action::Send { job: 7, account: 3 });
+        assert_eq!(
+            next_action(
+                &plan(
+                    now,
+                    vec![(1, vec![]), (2, vec![now - 60]), (3, vec![])],
+                    Some(1),
+                    1
+                ),
+                &[q(7, 0)]
+            ),
+            Action::Send { job: 7, account: 3 }
+        );
         // за последним идёт первый
-        assert_eq!(next_action(&plan(now, vec![(1, vec![]), (2, vec![])], Some(2), 1), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(
+            next_action(
+                &plan(now, vec![(1, vec![]), (2, vec![])], Some(2), 1),
+                &[q(7, 0)]
+            ),
+            Action::Send { job: 7, account: 1 }
+        );
         // без истории, или если последний аккаунт уже не в круге, начинаем с первого
-        assert_eq!(next_action(&plan(now, vec![(4, vec![]), (5, vec![])], None, 1), &[q(7, 0)]), Action::Send { job: 7, account: 4 });
-        assert_eq!(next_action(&plan(now, vec![(4, vec![]), (5, vec![])], Some(99), 1), &[q(7, 0)]), Action::Send { job: 7, account: 4 });
+        assert_eq!(
+            next_action(
+                &plan(now, vec![(4, vec![]), (5, vec![])], None, 1),
+                &[q(7, 0)]
+            ),
+            Action::Send { job: 7, account: 4 }
+        );
+        assert_eq!(
+            next_action(
+                &plan(now, vec![(4, vec![]), (5, vec![])], Some(99), 1),
+                &[q(7, 0)]
+            ),
+            Action::Send { job: 7, account: 4 }
+        );
     }
 
     #[test]
     fn the_daily_limit_is_per_account_and_waits_for_midnight_when_everyone_is_at_it() {
         let now = 10 * DAY + 12 * 3600;
         let midnight = 11 * DAY;
-        assert_eq!(next_action(&plan(now, vec![(1, vec![now - 3000]), (2, vec![now - 2000])], None, 1), &[q(7, 0)]), Action::LimitReached(midnight));
+        assert_eq!(
+            next_action(
+                &plan(
+                    now,
+                    vec![(1, vec![now - 3000]), (2, vec![now - 2000])],
+                    None,
+                    1
+                ),
+                &[q(7, 0)]
+            ),
+            Action::LimitReached(midnight)
+        );
         // лимит 2: у первого две выкладки, у второго одна — второй ещё может
         let uneven = vec![(1, vec![now - 3000, now - 2500]), (2, vec![now - 2000])];
-        assert_eq!(next_action(&plan(now, uneven, None, 2), &[q(7, 0)]), Action::Send { job: 7, account: 2 });
+        assert_eq!(
+            next_action(&plan(now, uneven, None, 2), &[q(7, 0)]),
+            Action::Send { job: 7, account: 2 }
+        );
         // пауза позже полуночи: ждём её
-        assert_eq!(next_action(&plan(now, vec![(1, vec![now - 3000])], None, 1), &[q(7, now + 2 * DAY)]), Action::LimitReached(now + 2 * DAY));
+        assert_eq!(
+            next_action(
+                &plan(now, vec![(1, vec![now - 3000])], None, 1),
+                &[q(7, now + 2 * DAY)]
+            ),
+            Action::LimitReached(now + 2 * DAY)
+        );
     }
 
     #[test]
     fn a_day_is_a_calendar_day_so_yesterdays_posts_do_not_count() {
         let now = 10 * DAY + 60;
         // вчера в 23:59 — не в счёт, хотя с той выкладки прошло меньше суток
-        assert_eq!(next_action(&plan(now, vec![(1, vec![10 * DAY - 60])], None, 1), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(
+            next_action(
+                &plan(now, vec![(1, vec![10 * DAY - 60])], None, 1),
+                &[q(7, 0)]
+            ),
+            Action::Send { job: 7, account: 1 }
+        );
         // сегодня в 00:00:30 — в счёт
-        assert_eq!(next_action(&plan(now, vec![(1, vec![10 * DAY + 30])], None, 1), &[q(7, 0)]), Action::LimitReached(11 * DAY));
+        assert_eq!(
+            next_action(
+                &plan(now, vec![(1, vec![10 * DAY + 30])], None, 1),
+                &[q(7, 0)]
+            ),
+            Action::LimitReached(11 * DAY)
+        );
     }
 
     #[test]
@@ -1106,38 +1641,89 @@ mod tests {
         // Москва, UTC+3: местная полночь 10-го дня наступает раньше, чем в UTC
         let offset = 3 * 3600;
         let now = 10 * DAY - offset + 1800; // 00:30 по местному времени
-        let p = Plan { now, offset, ..plan(now, vec![(1, vec![10 * DAY - offset - 1800])], None, 1) };
-        assert_eq!(next_action(&p, &[q(7, 0)]), Action::Send { job: 7, account: 1 }, "23:30 вчера по местному — не сегодня");
-        let p = Plan { accounts: vec![Turn { id: 1, sent: vec![now - 10] }], ..p };
-        assert_eq!(next_action(&p, &[q(7, 0)]), Action::LimitReached(11 * DAY - offset), "следующая местная полночь");
+        let p = Plan {
+            now,
+            offset,
+            ..plan(now, vec![(1, vec![10 * DAY - offset - 1800])], None, 1)
+        };
+        assert_eq!(
+            next_action(&p, &[q(7, 0)]),
+            Action::Send { job: 7, account: 1 },
+            "23:30 вчера по местному — не сегодня"
+        );
+        let p = Plan {
+            accounts: vec![Turn {
+                id: 1,
+                sent: vec![now - 10],
+            }],
+            ..p
+        };
+        assert_eq!(
+            next_action(&p, &[q(7, 0)]),
+            Action::LimitReached(11 * DAY - offset),
+            "следующая местная полночь"
+        );
     }
 
     #[test]
     fn the_window_holds_the_queue_outside_it_and_opens_it_on_time() {
         let at = |h: i64| 10 * DAY + h * 3600;
         // окно 10:00–22:00
-        assert_eq!(next_action(&windowed(at(12), 600, 1320), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
-        assert_eq!(next_action(&windowed(at(10), 600, 1320), &[q(7, 0)]), Action::Send { job: 7, account: 1 }, "ровно в начало — уже можно");
-        assert_eq!(next_action(&windowed(at(9), 600, 1320), &[q(7, 0)]), Action::OutsideWindow(at(10)), "до открытия — сегодняшнее открытие");
-        assert_eq!(next_action(&windowed(at(22), 600, 1320), &[q(7, 0)]), Action::OutsideWindow(11 * DAY + 10 * 3600), "после закрытия — завтрашнее");
+        assert_eq!(
+            next_action(&windowed(at(12), 600, 1320), &[q(7, 0)]),
+            Action::Send { job: 7, account: 1 }
+        );
+        assert_eq!(
+            next_action(&windowed(at(10), 600, 1320), &[q(7, 0)]),
+            Action::Send { job: 7, account: 1 },
+            "ровно в начало — уже можно"
+        );
+        assert_eq!(
+            next_action(&windowed(at(9), 600, 1320), &[q(7, 0)]),
+            Action::OutsideWindow(at(10)),
+            "до открытия — сегодняшнее открытие"
+        );
+        assert_eq!(
+            next_action(&windowed(at(22), 600, 1320), &[q(7, 0)]),
+            Action::OutsideWindow(11 * DAY + 10 * 3600),
+            "после закрытия — завтрашнее"
+        );
         // одинаковые начало и конец — без ограничения
-        assert_eq!(next_action(&windowed(at(3), 600, 600), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
+        assert_eq!(
+            next_action(&windowed(at(3), 600, 600), &[q(7, 0)]),
+            Action::Send { job: 7, account: 1 }
+        );
     }
 
     #[test]
     fn a_window_past_midnight_covers_the_night() {
         let at = |h: i64| 10 * DAY + h * 3600;
         // окно 22:00–06:00
-        assert_eq!(next_action(&windowed(at(23), 1320, 360), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
-        assert_eq!(next_action(&windowed(at(3), 1320, 360), &[q(7, 0)]), Action::Send { job: 7, account: 1 });
-        assert_eq!(next_action(&windowed(at(12), 1320, 360), &[q(7, 0)]), Action::OutsideWindow(at(22)));
+        assert_eq!(
+            next_action(&windowed(at(23), 1320, 360), &[q(7, 0)]),
+            Action::Send { job: 7, account: 1 }
+        );
+        assert_eq!(
+            next_action(&windowed(at(3), 1320, 360), &[q(7, 0)]),
+            Action::Send { job: 7, account: 1 }
+        );
+        assert_eq!(
+            next_action(&windowed(at(12), 1320, 360), &[q(7, 0)]),
+            Action::OutsideWindow(at(22))
+        );
     }
 
     #[test]
     fn after_the_computer_sleeps_the_queue_just_sees_the_new_time() {
         let jobs = [q(1, 5000)];
-        assert_eq!(next_action(&plan(1000, vec![(1, vec![])], None, 5), &jobs), Action::WaitUntil(5000));
-        assert_eq!(next_action(&plan(900_000, vec![(1, vec![])], None, 5), &jobs), Action::Send { job: 1, account: 1 });
+        assert_eq!(
+            next_action(&plan(1000, vec![(1, vec![])], None, 5), &jobs),
+            Action::WaitUntil(5000)
+        );
+        assert_eq!(
+            next_action(&plan(900_000, vec![(1, vec![])], None, 5), &jobs),
+            Action::Send { job: 1, account: 1 }
+        );
     }
 
     fn db() -> Connection {
@@ -1148,15 +1734,27 @@ mod tests {
             c.execute("INSERT INTO projects (id, path, hash, title, duration, width, height, fps, has_audio) VALUES (?1, '/v', ?2, 'v', 100, 1, 1, 30, 1)", params![pid, h]).unwrap();
         }
         // ролики 1 и 2 проекта 1 (части 2 и 1), ролик 3 — проекта 2; готовы все, кроме 4
-        for (id, pid, part, status) in [(1, 1, 2, "final_done"), (2, 1, 1, "final_done"), (3, 2, 1, "final_done"), (4, 1, 3, "ready")] {
+        for (id, pid, part, status) in [
+            (1, 1, 2, "final_done"),
+            (2, 1, 1, "final_done"),
+            (3, 2, 1, "final_done"),
+            (4, 1, 3, "ready"),
+        ] {
             c.execute("INSERT INTO moments (id, project_id, start, \"end\", status, title, transcript) VALUES (?1, ?2, 0, 30, 'accepted', ?3, 'речь')", params![id, pid, format!("Ролик {id}")]).unwrap();
-            c.execute("INSERT INTO drafts (id, moment_id, part, status) VALUES (?1, ?1, ?2, ?3)", params![id, part, status]).unwrap();
+            c.execute(
+                "INSERT INTO drafts (id, moment_id, part, status) VALUES (?1, ?1, ?2, ?3)",
+                params![id, part, status],
+            )
+            .unwrap();
         }
         c
     }
 
     fn good_text(extra_tag_len: usize) -> (String, Vec<String>) {
-        let tags: Vec<String> = ["юмор", "сериал", "тикток"].iter().map(|s| s.to_string()).collect();
+        let tags: Vec<String> = ["юмор", "сериал", "тикток"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let tag_part = make_caption("", &tags, usize::MAX);
         let want = 3995usize.saturating_sub(tag_part.encode_utf16().count() + 1 + extra_tag_len);
         ("а".repeat(want), tags)
@@ -1165,26 +1763,59 @@ mod tests {
     #[test]
     fn migration_creates_jobs_that_vanish_with_their_draft() {
         let c = db();
-        c.execute("INSERT INTO publish_jobs (draft_id) VALUES (1)", []).unwrap();
-        assert!(c.execute("INSERT INTO publish_jobs (draft_id) VALUES (1)", []).is_err(), "одна задача на ролик");
+        c.execute("INSERT INTO publications (draft_id) VALUES (1)", [])
+            .unwrap();
+        assert!(
+            c.execute("INSERT INTO publications (draft_id) VALUES (1)", [])
+                .is_err(),
+            "одна задача на ролик"
+        );
         c.execute("DELETE FROM drafts WHERE id = 1", []).unwrap();
-        assert_eq!(c.query_row::<i64, _, _>("SELECT count(*) FROM publish_jobs", [], |r| r.get(0)).unwrap(), 0);
+        assert_eq!(
+            c.query_row::<i64, _, _>("SELECT count(*) FROM publications", [], |r| r.get(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
     fn only_finished_unwritten_videos_of_the_project_get_a_drafting_job() {
         let c = db();
         let todo = create_drafting_jobs(&c, 1).unwrap();
-        assert_eq!(todo.iter().map(|t| t.draft_id).collect::<Vec<_>>(), vec![2, 1], "по порядку частей, без неготового и чужого проекта");
-        assert_eq!((todo[0].title.as_str(), todo[0].transcript.as_str()), ("Ролик 2", "речь"));
-        assert!(create_drafting_jobs(&c, 1).unwrap().is_empty(), "повторный вызов ничего не создаёт");
+        assert_eq!(
+            todo.iter().map(|t| t.draft_id).collect::<Vec<_>>(),
+            vec![2, 1],
+            "по порядку частей, без неготового и чужого проекта"
+        );
+        assert_eq!(
+            (todo[0].title.as_str(), todo[0].transcript.as_str()),
+            ("Ролик 2", "речь")
+        );
+        assert!(
+            create_drafting_jobs(&c, 1).unwrap().is_empty(),
+            "повторный вызов ничего не создаёт"
+        );
         // упавшее описание пишется заново, готовое не трогаем
         store_ready(&c, 2, "текст", &["#а".into()]).unwrap();
         store_text_failed(&c, 1, "сбой");
         let again = create_drafting_jobs(&c, 1).unwrap();
-        assert_eq!(again.iter().map(|t| t.draft_id).collect::<Vec<_>>(), vec![1]);
-        let by_draft = |d: i64| jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.draft_id == Some(d)).unwrap();
-        assert_eq!(by_draft(2).state, "ready", "готовое описание не переписывается");
+        assert_eq!(
+            again.iter().map(|t| t.draft_id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        let by_draft = |d: i64| {
+            jobs_for_project(&c, 1)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.draft_id == Some(d))
+                .unwrap()
+        };
+        assert_eq!(by_draft(2).state, "drafting");
+        assert_eq!(
+            by_draft(2).caption,
+            "текст",
+            "подбор тегов сохраняет ручной текст"
+        );
         assert_eq!(by_draft(1).state, "drafting", "упавшее пишется заново");
     }
 
@@ -1192,11 +1823,22 @@ mod tests {
     fn videos_already_published_by_hand_are_skipped_but_inbox_drafts_are_not() {
         let c = db();
         let p = begin_post(&c, 1, "browser", "browser").unwrap();
-        finish_post(&c, p, &Ok(("Нажата кнопка «Опубликовать» в окне TikTok. Проверь, что ролик вышел.".into(), None)));
+        finish_post(
+            &c,
+            p,
+            &Ok((
+                "Нажата кнопка «Опубликовать» в окне TikTok. Проверь, что ролик вышел.".into(),
+                None,
+            )),
+        );
         let p = begin_post(&c, 2, "api", "inbox").unwrap();
         finish_post(&c, p, &Ok(("Ролик в черновиках TikTok.".into(), None)));
         let todo = create_drafting_jobs(&c, 1).unwrap();
-        assert_eq!(todo.iter().map(|t| t.draft_id).collect::<Vec<_>>(), vec![2], "в черновиках — это ещё не выложено");
+        assert_eq!(
+            todo.iter().map(|t| t.draft_id).collect::<Vec<_>>(),
+            vec![2],
+            "в черновиках — это ещё не выложено"
+        );
     }
 
     #[test]
@@ -1205,33 +1847,47 @@ mod tests {
         let (norm, len) = validate_job(&text, &tags).unwrap();
         assert_eq!((norm.len(), len), (3, 3995));
         // свой текст может быть любой длины, лишь бы влезал в страницу
-        assert_eq!(validate_job("Коротко", &["#а".to_string()]).unwrap().1, 7 + 1 + 2);
+        assert_eq!(
+            validate_job("Коротко", &["#а".to_string()]).unwrap().1,
+            7 + 1 + 2
+        );
         // подпись = текст + перевод строки + «#а»: 3 лишних символа
-        assert_eq!(validate_job(&"а".repeat(CAPTION_LIMIT - 3), &["#а".to_string()]).unwrap().1, CAPTION_LIMIT, "верхняя граница включена");
+        assert_eq!(
+            validate_job(&"а".repeat(CAPTION_LIMIT - 3), &["#а".to_string()])
+                .unwrap()
+                .1,
+            CAPTION_LIMIT,
+            "верхняя граница включена"
+        );
         for (cap, tags, needle) in [
-            ("а".repeat(CAPTION_LIMIT - 2), vec!["#а".to_string()], "не больше 4000"),
-            ("   ".to_string(), vec!["#а".to_string()], "пустое"),
-            (text.clone(), vec![], "хотя бы один"),
-            (text.clone(), (0..6).map(|i| format!("тег{i}")).collect(), "не больше 5"),
+            (
+                "а".repeat(CAPTION_LIMIT - 2),
+                vec!["#а".to_string()],
+                "не больше 4000",
+            ),
+            (
+                text.clone(),
+                (0..6).map(|i| format!("тег{i}")).collect(),
+                "не больше 5",
+            ),
         ] {
             let e = validate_job(&cap, &tags).unwrap_err();
             assert!(e.contains(needle), "{e}");
         }
         // повторы и регистр не считаются разными хэштегами: «#а», «а» и «А» — один (в подписи остаётся «#а»)
-        assert_eq!(validate_job(&text, &["#а".into(), "а".into(), "А".into()]).unwrap().1, 3973 + 1 + 2);
+        assert_eq!(
+            validate_job(&text, &["#а".into(), "а".into(), "А".into()])
+                .unwrap()
+                .1,
+            3973 + 1 + 2
+        );
     }
 
     #[test]
-    fn model_text_must_land_in_the_window() {
-        let (text, tags) = good_text(0);
-        assert_eq!(validate_generated(&text, &tags).unwrap().1, 3995);
-        // подпись = текст + перевод строки + «#а»: 3 лишних символа
-        assert_eq!(validate_generated(&"а".repeat(3999 - 3), &["#а".to_string()]).unwrap().1, 3999, "верхняя граница включена");
-        assert_eq!(validate_generated(&"а".repeat(3990 - 3), &["#а".to_string()]).unwrap().1, 3990, "нижняя граница включена");
-        for (cap, needle) in [("а".repeat(3999 - 2), "нужно 3990–3999"), ("а".repeat(3990 - 4), "нужно 3990–3999"), ("а".repeat(CAPTION_LIMIT), "не больше 4000")] {
-            let e = validate_generated(&cap, &["#а".to_string()]).unwrap_err();
-            assert!(e.contains(needle), "{e}");
-        }
+    fn text_and_tags_are_independently_optional() {
+        assert_eq!(validate_job("", &[]).unwrap().1, 0);
+        assert_eq!(validate_job("Мой текст", &[]).unwrap().1, 9);
+        assert_eq!(validate_job("", &["#заезд".into()]).unwrap().1, 6);
     }
 
     #[test]
@@ -1239,16 +1895,42 @@ mod tests {
         let c = db();
         create_drafting_jobs(&c, 1).unwrap();
         let (text, tags) = good_text(0);
-        let id = job_by_id(&c, jobs_for_project(&c, 1).unwrap()[0].id).unwrap().id;
-        assert!(update_job(&c, id, &text, &tags).unwrap_err().contains("Сейчас править нельзя"), "пока модель пишет — нельзя");
+        let id = job_by_id(&c, jobs_for_project(&c, 1).unwrap()[0].id)
+            .unwrap()
+            .id;
+        assert!(
+            update_job(&c, id, &text, &tags)
+                .unwrap_err()
+                .contains("Сейчас править нельзя"),
+            "пока модель пишет — нельзя"
+        );
         store_ready(&c, 2, "черновой", &["#а".into()]).unwrap();
-        assert!(update_job(&c, id, &"а".repeat(4001), &tags).unwrap_err().contains("не больше 4000"));
-        assert!(update_job(&c, id, "  ", &tags).unwrap_err().contains("пустое"));
-        assert_eq!(update_job(&c, id, "Свой короткий текст", &tags).unwrap().state, "ready", "свой текст окну не подчиняется");
+        assert!(update_job(&c, id, &"а".repeat(4001), &tags)
+            .unwrap_err()
+            .contains("не больше 4000"));
+        assert!(update_job(&c, id, "  ", &[]).unwrap().caption.is_empty());
+        assert_eq!(
+            update_job(&c, id, "Свой короткий текст", &tags)
+                .unwrap()
+                .state,
+            "ready",
+            "свой текст окну не подчиняется"
+        );
         let j = update_job(&c, id, &format!("  {text}  "), &tags).unwrap();
-        assert_eq!((j.state.as_str(), j.len, j.caption.len() == text.len()), ("ready", 3995, true), "пробелы по краям убраны");
-        c.execute("UPDATE publish_jobs SET state = 'queued' WHERE id = ?1", [id]).unwrap();
-        assert!(update_job(&c, id, &text, &tags).is_err(), "в очереди — нельзя");
+        assert_eq!(
+            (j.state.as_str(), j.len, j.caption.len() == text.len()),
+            ("ready", 3995, true),
+            "пробелы по краям убраны"
+        );
+        c.execute(
+            "UPDATE publications SET state = 'queued' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        assert!(
+            update_job(&c, id, &text, &tags).is_err(),
+            "в очереди — нельзя"
+        );
     }
 
     #[test]
@@ -1256,21 +1938,54 @@ mod tests {
         let c = db();
         create_drafting_jobs(&c, 1).unwrap();
         create_drafting_jobs(&c, 2).unwrap();
-        assert!(start_jobs(&c, 1).unwrap_err().contains("Нет роликов с готовым описанием"));
+        assert!(start_jobs(&c, 1).unwrap_err().contains("Нет готовых задач"));
         let (text, tags) = good_text(0);
         for d in [1, 2, 3] {
             store_ready(&c, d, &text, &normalize_hashtags(&tags)).unwrap();
         }
         assert_eq!(start_jobs(&c, 1).unwrap(), 2);
-        let states: Vec<_> = jobs_for_project(&c, 1).unwrap().iter().map(|j| (j.draft_id.unwrap(), j.state.clone())).collect();
-        assert_eq!(states, vec![(2, "queued".into()), (1, "queued".into())], "в порядке частей");
-        assert_eq!(jobs_for_project(&c, 2).unwrap()[0].state, "ready", "чужой проект не тронут");
-        assert_eq!(queued_jobs(&c, 1).iter().map(|j| j.id).collect::<Vec<_>>().len(), 2);
+        let states: Vec<_> = jobs_for_project(&c, 1)
+            .unwrap()
+            .iter()
+            .map(|j| (j.draft_id.unwrap(), j.state.clone()))
+            .collect();
+        assert_eq!(
+            states,
+            vec![(2, "queued".into()), (1, "queued".into())],
+            "в порядке частей"
+        );
+        assert_eq!(
+            jobs_for_project(&c, 2).unwrap()[0].state,
+            "ready",
+            "чужой проект не тронут"
+        );
+        let job = jobs_for_project(&c, 1).unwrap()[0].id;
+        let frozen = kv_get(&c, &format!("publication_output:{job}")).unwrap();
+        kv_set(
+            &c,
+            "output_profile:tiktok",
+            r#"{"platform":"tiktok","limits":{"maxSeconds":10,"videoKbps":800,"audioKbps":96}}"#,
+        )
+        .unwrap();
+        start_jobs(&c, 1).unwrap();
+        assert_eq!(
+            kv_get(&c, &format!("publication_output:{job}")).unwrap(),
+            frozen,
+            "повторный старт не меняет уже зафиксированный профиль"
+        );
+        assert_eq!(
+            queued_jobs(&c, 1)
+                .iter()
+                .map(|j| j.id)
+                .collect::<Vec<_>>()
+                .len(),
+            2
+        );
 
         // испорченный текст в базе не уйдёт в очередь
         let c = db();
         create_drafting_jobs(&c, 1).unwrap();
-        store_ready(&c, 1, "", &["#а".into()]).unwrap();
+        store_ready(&c, 1, &"а".repeat(CAPTION_LIMIT + 1), &[]).unwrap();
         assert!(start_jobs(&c, 1).unwrap_err().contains("не подходит"));
     }
 
@@ -1278,77 +1993,226 @@ mod tests {
     fn one_text_goes_to_every_finished_video_that_can_take_it() {
         let c = db();
         let tags = vec!["юмор".to_string(), "#сериал".to_string()];
-        assert_eq!(apply_text(&c, 1, "Один текст на всех", &tags).unwrap(), 2, "готовые ролики проекта 1: 2 и 1, неготовый 4 и чужой 3 не берём");
+        assert_eq!(
+            apply_text(&c, 1, "Один текст на всех", &tags).unwrap(),
+            2,
+            "готовые ролики проекта 1: 2 и 1, неготовый 4 и чужой 3 не берём"
+        );
         let jobs = jobs_for_project(&c, 1).unwrap();
-        assert_eq!(jobs.iter().map(|j| (j.draft_id.unwrap(), j.state.as_str())).collect::<Vec<_>>(), vec![(2, "ready"), (1, "ready")], "в порядке частей");
-        assert!(jobs.iter().all(|j| j.caption == "Один текст на всех" && j.hashtags == ["#юмор", "#сериал"]));
-        assert!(jobs_for_project(&c, 2).unwrap().is_empty(), "другой проект не тронут");
-        assert_eq!(jobs[0].len, "Один текст на всех\n#юмор #сериал".chars().count());
+        assert_eq!(
+            jobs.iter()
+                .map(|j| (j.draft_id.unwrap(), j.state.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "ready"), (1, "ready")],
+            "в порядке частей"
+        );
+        assert!(jobs
+            .iter()
+            .all(|j| j.caption == "Один текст на всех" && j.hashtags == ["#юмор", "#сериал"]));
+        assert!(
+            jobs_for_project(&c, 2).unwrap().is_empty(),
+            "другой проект не тронут"
+        );
+        assert_eq!(
+            jobs[0].len,
+            "Один текст на всех\n#юмор #сериал".chars().count()
+        );
 
         // новый текст заменяет прежний у готовых и упавших; идущие в работу и выложенные не трогаем
-        let by_draft = |d: i64| jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.draft_id == Some(d)).unwrap();
-        c.execute("UPDATE publish_jobs SET state = 'queued' WHERE draft_id = 1", []).unwrap();
+        let by_draft = |d: i64| {
+            jobs_for_project(&c, 1)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.draft_id == Some(d))
+                .unwrap()
+        };
+        c.execute(
+            "UPDATE publications SET state = 'queued' WHERE draft_id = 1",
+            [],
+        )
+        .unwrap();
         assert_eq!(apply_text(&c, 1, "Новый текст", &tags).unwrap(), 1);
-        assert_eq!((by_draft(2).caption.as_str(), by_draft(2).state.as_str()), ("Новый текст", "ready"));
-        assert_eq!((by_draft(1).caption.as_str(), by_draft(1).state.as_str()), ("Один текст на всех", "queued"), "в очереди остаётся со своим текстом");
+        assert_eq!(
+            (by_draft(2).caption.as_str(), by_draft(2).state.as_str()),
+            ("Новый текст", "ready")
+        );
+        assert_eq!(
+            (by_draft(1).caption.as_str(), by_draft(1).state.as_str()),
+            ("Один текст на всех", "queued"),
+            "в очереди остаётся со своим текстом"
+        );
         for state in ["sending", "done", "needs_check", "drafting"] {
-            c.execute("UPDATE publish_jobs SET state = ?1 WHERE draft_id = 2", [state]).unwrap();
-            c.execute("UPDATE publish_jobs SET state = 'queued' WHERE draft_id = 1", []).unwrap();
-            assert_eq!(apply_text(&c, 1, "Ещё текст", &tags).unwrap(), 0, "ролик в состоянии «{state}» не трогаем");
+            c.execute(
+                "UPDATE publications SET state = ?1 WHERE draft_id = 2",
+                [state],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE publications SET state = 'queued' WHERE draft_id = 1",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                apply_text(&c, 1, "Ещё текст", &tags).unwrap(),
+                0,
+                "ролик в состоянии «{state}» не трогаем"
+            );
             assert_eq!(by_draft(2).caption, "Новый текст");
         }
-        c.execute("UPDATE publish_jobs SET state = 'failed', error = 'сбой' WHERE draft_id = 2", []).unwrap();
+        c.execute(
+            "UPDATE publications SET state = 'failed', error = 'сбой' WHERE draft_id = 2",
+            [],
+        )
+        .unwrap();
         assert_eq!(apply_text(&c, 1, "После сбоя", &tags).unwrap(), 1);
-        assert_eq!((by_draft(2).state.as_str(), by_draft(2).error), ("ready", None), "упавший снова готов, ошибка сброшена");
+        assert_eq!(
+            (by_draft(2).state.as_str(), by_draft(2).error),
+            ("ready", None),
+            "упавший снова готов, ошибка сброшена"
+        );
+    }
+
+    #[test]
+    fn body_only_bulk_preserves_individual_tags_and_rolls_back_if_one_does_not_fit() {
+        let c = db();
+        with_ready_video(&c, 50, 1);
+        c.execute("UPDATE moments SET hashtags='[\"#момент\"]' WHERE id=1", [])
+            .unwrap();
+        assert_eq!(apply_text_with_tags(&c, 1, "Общий текст", None).unwrap(), 3);
+        let jobs = jobs_for_project(&c, 1).unwrap();
+        let first = jobs.iter().find(|j| j.draft_id == Some(1)).unwrap();
+        assert_eq!(first.hashtags, vec!["#момент"]);
+        let ready = jobs.iter().find(|j| j.ready_id == Some(50)).unwrap();
+        c.execute(
+            "UPDATE publications SET hashtags='[\"#отдельный\"]' WHERE id=?1",
+            [ready.id],
+        )
+        .unwrap();
+        assert_eq!(apply_text_with_tags(&c, 1, "", None).unwrap(), 3);
+        assert_eq!(
+            job_by_id(&c, ready.id).unwrap().hashtags,
+            vec!["#отдельный"]
+        );
+        assert_eq!(job_by_id(&c, first.id).unwrap().hashtags, first.hashtags);
+        assert!(apply_text_with_tags(&c, 1, &"я".repeat(CAPTION_LIMIT - 3), None).is_err());
+        assert!(
+            jobs_for_project(&c, 1)
+                .unwrap()
+                .iter()
+                .all(|j| j.caption.is_empty()),
+            "ошибка позднего ролика откатывает всю пачку"
+        );
+        c.execute(
+            "UPDATE publications SET state='queued' WHERE id=?1",
+            [ready.id],
+        )
+        .unwrap();
+        assert_eq!(apply_text_with_tags(&c, 1, "Новый текст", None).unwrap(), 2);
+        assert!(job_by_id(&c, ready.id).unwrap().caption.is_empty());
+        assert!(jobs_for_project(&c, 2).unwrap().is_empty());
     }
 
     #[test]
     fn the_shared_text_follows_the_same_rules_and_changes_nothing_when_it_is_bad() {
         let c = db();
         for (cap, tags, needle) in [
-            ("".to_string(), vec!["а".to_string()], "пустое"),
-            ("Текст".to_string(), vec![], "хотя бы один"),
-            ("Текст".to_string(), (0..6).map(|i| format!("тег{i}")).collect(), "не больше 5"),
+            (
+                "Текст".to_string(),
+                (0..6).map(|i| format!("тег{i}")).collect(),
+                "не больше 5",
+            ),
             ("а".repeat(4000), vec!["а".to_string()], "не больше 4000"),
         ] {
             let e = apply_text(&c, 1, &cap, &tags).unwrap_err();
             assert!(e.contains(needle), "{e}");
         }
-        assert!(jobs_for_project(&c, 1).unwrap().is_empty(), "после отказа задач не появилось");
+        assert!(
+            jobs_for_project(&c, 1).unwrap().is_empty(),
+            "после отказа задач не появилось"
+        );
     }
 
     #[test]
     fn videos_published_by_hand_do_not_get_the_shared_text() {
         let c = db();
         let p = begin_post(&c, 1, "browser", "browser").unwrap();
-        finish_post(&c, p, &Ok(("Нажата кнопка «Опубликовать» в окне TikTok.".into(), None)));
+        finish_post(
+            &c,
+            p,
+            &Ok(("Нажата кнопка «Опубликовать» в окне TikTok.".into(), None)),
+        );
         assert_eq!(apply_text(&c, 1, "Текст", &["а".to_string()]).unwrap(), 1);
-        assert_eq!(jobs_for_project(&c, 1).unwrap().iter().map(|j| j.draft_id.unwrap()).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            jobs_for_project(&c, 1)
+                .unwrap()
+                .iter()
+                .map(|j| j.draft_id.unwrap())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]
     fn resolving_a_stuck_job_retries_marks_it_done_or_removes_it() {
         let c = db();
         create_drafting_jobs(&c, 1).unwrap();
-        let ids: Vec<i64> = jobs_for_project(&c, 1).unwrap().iter().map(|j| j.id).collect();
-        c.execute("UPDATE publish_jobs SET state = 'needs_check', error = 'проверь' WHERE id = ?1", [ids[0]]).unwrap();
-        c.execute("UPDATE publish_jobs SET state = 'failed', error = 'сбой' WHERE id = ?1", [ids[1]]).unwrap();
+        let ids: Vec<i64> = jobs_for_project(&c, 1)
+            .unwrap()
+            .iter()
+            .map(|j| j.id)
+            .collect();
+        c.execute(
+            "UPDATE publications SET state = 'needs_check', error = 'проверь' WHERE id = ?1",
+            [ids[0]],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE publications SET state = 'failed', error = 'сбой' WHERE id = ?1",
+            [ids[1]],
+        )
+        .unwrap();
 
         resolve_job(&c, ids[0], "retry").unwrap();
         let j = job_by_id(&c, ids[0]).unwrap();
-        assert_eq!((j.state.as_str(), j.error, j.not_before), ("queued", None, 0));
+        assert_eq!(
+            (j.state.as_str(), j.error, j.not_before),
+            ("queued", None, 0)
+        );
 
         resolve_job(&c, ids[1], "mark_done").unwrap();
         assert_eq!(job_by_id(&c, ids[1]).unwrap().state, "done");
-        assert_eq!(make_plan(&c, now_unix()).accounts[0].sent.len(), 1, "«он вышел» входит в суточный счёт основного аккаунта");
+        assert_eq!(
+            make_plan(&c, now_unix()).accounts[0].sent.len(),
+            1,
+            "«он вышел» входит в суточный счёт основного аккаунта"
+        );
         let posts = latest_posts(&c, 1).unwrap();
-        assert!(posts.iter().any(|p| p.draft_id == 1 && p.status == "done" && was_published(p)), "{posts:?}");
+        assert!(
+            posts
+                .iter()
+                .any(|p| p.draft_id == 1 && p.status == "done" && was_published(p)),
+            "{posts:?}"
+        );
 
-        assert!(resolve_job(&c, ids[0], "mark_done").is_err(), "из очереди так нельзя");
+        assert!(
+            resolve_job(&c, ids[0], "mark_done").is_err(),
+            "из очереди так нельзя"
+        );
         assert!(resolve_job(&c, ids[0], "что-то").is_err());
-        c.execute("UPDATE publish_jobs SET state = 'sending' WHERE id = ?1", [ids[0]]).unwrap();
-        assert!(resolve_job(&c, ids[0], "remove").is_err(), "выкладываемую убрать нельзя");
-        c.execute("UPDATE publish_jobs SET state = 'failed' WHERE id = ?1", [ids[0]]).unwrap();
+        c.execute(
+            "UPDATE publications SET state = 'sending' WHERE id = ?1",
+            [ids[0]],
+        )
+        .unwrap();
+        assert!(
+            resolve_job(&c, ids[0], "remove").is_err(),
+            "выкладываемую убрать нельзя"
+        );
+        c.execute(
+            "UPDATE publications SET state = 'failed' WHERE id = ?1",
+            [ids[0]],
+        )
+        .unwrap();
         resolve_job(&c, ids[0], "remove").unwrap();
         assert_eq!(jobs_for_project(&c, 1).unwrap().len(), 1);
     }
@@ -1358,17 +2222,40 @@ mod tests {
         let c = db();
         create_drafting_jobs(&c, 1).unwrap();
         create_drafting_jobs(&c, 2).unwrap();
-        let ids: Vec<i64> = jobs_for_project(&c, 1).unwrap().iter().map(|j| j.id).collect();
-        c.execute("UPDATE publish_jobs SET state = 'sending' WHERE id = ?1", [ids[0]]).unwrap();
-        c.execute("UPDATE publish_jobs SET state = 'queued' WHERE id = ?1", [ids[1]]).unwrap();
+        let ids: Vec<i64> = jobs_for_project(&c, 1)
+            .unwrap()
+            .iter()
+            .map(|j| j.id)
+            .collect();
+        c.execute(
+            "UPDATE publications SET state = 'sending' WHERE id = ?1",
+            [ids[0]],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE publications SET state = 'queued' WHERE id = ?1",
+            [ids[1]],
+        )
+        .unwrap();
         recover_interrupted_jobs(&c);
         let a = job_by_id(&c, ids[0]).unwrap();
         assert_eq!(a.state, "needs_check");
         assert!(a.error.unwrap().contains("Проверь в TikTok Studio"));
-        assert_eq!(job_by_id(&c, ids[1]).unwrap().state, "ready", "очередь без присмотра сама не стартует");
+        assert_eq!(
+            job_by_id(&c, ids[1]).unwrap().state,
+            "ready",
+            "очередь без присмотра сама не стартует"
+        );
         let other = &jobs_for_project(&c, 2).unwrap()[0];
-        assert_eq!(other.state, "failed", "недописанное описание пишется заново");
-        assert!(other.error.as_deref().unwrap().contains("Описание не дописано"));
+        assert_eq!(
+            other.state, "failed",
+            "недописанное описание пишется заново"
+        );
+        assert!(other
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Описание не дописано"));
     }
 
     #[test]
@@ -1378,7 +2265,10 @@ mod tests {
         let (text, tags) = good_text(0);
         store_ready(&c, 1, &text, &normalize_hashtags(&tags)).unwrap();
         let jobs = jobs_for_project(&c, 1).unwrap();
-        assert_eq!(jobs.iter().map(|j| j.draft_id.unwrap()).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(
+            jobs.iter().map(|j| j.draft_id.unwrap()).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
         let j = jobs.iter().find(|j| j.draft_id == Some(1)).unwrap();
         assert_eq!(j.len, 3995);
         assert_eq!(j.len, validate_job(&j.caption, &j.hashtags).unwrap().1);
@@ -1388,39 +2278,93 @@ mod tests {
     #[test]
     fn settings_default_to_a_cautious_pace_and_clamp_garbage() {
         let c = db();
-        assert_eq!(load_settings(&c), QueueSettings { pause_min: 45, daily_limit: 5, window_start: 0, window_end: DAY_MIN });
+        assert_eq!(
+            load_settings(&c),
+            QueueSettings {
+                pause_min: 45,
+                daily_limit: 5,
+                window_start: 0,
+                window_end: DAY_MIN
+            }
+        );
         kv_set(&c, K_PAUSE, "0").unwrap();
         kv_set(&c, K_LIMIT, "9999").unwrap();
         kv_set(&c, K_WINDOW_START, "-5").unwrap();
         kv_set(&c, K_WINDOW_END, "99999").unwrap();
-        assert_eq!(load_settings(&c), QueueSettings { pause_min: 1, daily_limit: 50, window_start: 0, window_end: DAY_MIN });
+        assert_eq!(
+            load_settings(&c),
+            QueueSettings {
+                pause_min: 1,
+                daily_limit: 50,
+                window_start: 0,
+                window_end: DAY_MIN
+            }
+        );
         kv_set(&c, K_PAUSE, "не число").unwrap();
         assert_eq!(load_settings(&c).pause_min, 45);
     }
 
     fn with_ready_video(c: &Connection, id: i64, project: i64) {
-        c.execute("INSERT INTO ready_videos (id, project_id, path, name) VALUES (?1, ?2, ?3, ?4)", params![id, project, format!("/г/{id}.mp4"), format!("{id}.mp4")]).unwrap();
-        c.execute("INSERT INTO publish_jobs (ready_id, state) VALUES (?1, 'drafting')", [id]).unwrap();
+        c.execute(
+            "INSERT INTO ready_videos (id, project_id, path, name) VALUES (?1, ?2, ?3, ?4)",
+            params![id, project, format!("/г/{id}.mp4"), format!("{id}.mp4")],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO publications (ready_id, state) VALUES (?1, 'drafting')",
+            [id],
+        )
+        .unwrap();
     }
 
     #[test]
     fn a_chosen_account_takes_its_video_even_when_the_circle_points_elsewhere() {
         // по кругу следующим идёт аккаунт 2, а ролик выбрал аккаунт 1
         let p = plan(1000, vec![(1, vec![]), (2, vec![])], Some(1), 5);
-        assert_eq!(next_action(&p, &[QueuedJob { id: 7, not_before: 0, wanted: Some(1) }]), Action::Send { job: 7, account: 1 });
+        assert_eq!(
+            next_action(
+                &p,
+                &[QueuedJob {
+                    id: 7,
+                    not_before: 0,
+                    wanted: Some(1)
+                }]
+            ),
+            Action::Send { job: 7, account: 1 }
+        );
     }
 
     #[test]
     fn a_video_whose_chosen_account_is_at_its_limit_waits_instead_of_moving_to_another_account() {
         let p = plan(1000, vec![(1, vec![999]), (2, vec![])], None, 1);
-        let queue = [QueuedJob { id: 7, not_before: 0, wanted: Some(1) }, q(8, 0)];
-        assert!(matches!(next_action(&p, &queue), Action::LimitReached(_)), "ролик 7 ждёт аккаунт 1, ролик 8 за ним");
+        let queue = [
+            QueuedJob {
+                id: 7,
+                not_before: 0,
+                wanted: Some(1),
+            },
+            q(8, 0),
+        ];
+        assert!(
+            matches!(next_action(&p, &queue), Action::LimitReached(_)),
+            "ролик 7 ждёт аккаунт 1, ролик 8 за ним"
+        );
     }
 
     #[test]
     fn a_chosen_account_that_is_switched_off_falls_back_to_the_circle() {
         let p = plan(1000, vec![(2, vec![])], None, 5);
-        assert_eq!(next_action(&p, &[QueuedJob { id: 7, not_before: 0, wanted: Some(9) }]), Action::Send { job: 7, account: 2 });
+        assert_eq!(
+            next_action(
+                &p,
+                &[QueuedJob {
+                    id: 7,
+                    not_before: 0,
+                    wanted: Some(9)
+                }]
+            ),
+            Action::Send { job: 7, account: 2 }
+        );
     }
 
     #[test]
@@ -1429,8 +2373,14 @@ mod tests {
         with_ready_video(&c, 1, 1);
         let jobs = jobs_for_project(&c, 1).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!((jobs[0].draft_id, jobs[0].ready_id, jobs[0].name.as_str()), (None, Some(1), "1.mp4"));
-        assert!(jobs_for_project(&c, 2).unwrap().is_empty(), "чужой проект ролик не видит");
+        assert_eq!(
+            (jobs[0].draft_id, jobs[0].ready_id, jobs[0].name.as_str()),
+            (None, Some(1), "1.mp4")
+        );
+        assert!(
+            jobs_for_project(&c, 2).unwrap().is_empty(),
+            "чужой проект ролик не видит"
+        );
     }
 
     #[test]
@@ -1440,14 +2390,73 @@ mod tests {
         let (caption, tags) = good_text(0);
         // два готовых финала проекта 1 (черновик 4 ещё не готов, черновик 3 — чужой проект) и готовый ролик
         assert_eq!(apply_text(&c, 1, &caption, &tags).unwrap(), 3);
-        let job = jobs_for_project(&c, 1).unwrap().into_iter().find(|j| j.ready_id == Some(1)).unwrap();
+        let job = jobs_for_project(&c, 1)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.ready_id == Some(1))
+            .unwrap();
         assert_eq!(job.state, "ready");
-        assert_eq!(start_jobs(&c, 1).unwrap(), 3, "в очередь ушли и два финала, и готовый ролик");
+        assert_eq!(
+            start_jobs(&c, 1).unwrap(),
+            3,
+            "в очередь ушли и два финала, и готовый ролик"
+        );
+    }
+
+    #[test]
+    fn resolve_targets_the_ready_videos_project_even_when_removing_the_job() {
+        let c = db();
+        with_ready_video(&c, 50, 2);
+        let id: i64 = c
+            .query_row("SELECT id FROM publications WHERE ready_id=50", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(job_project(&c, id).unwrap(), 2);
+        c.execute(
+            "UPDATE publications SET state='needs_check' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        resolve_job(&c, id, "mark_done").unwrap();
+        assert_eq!(job_by_id(&c, id).unwrap().state, "done");
+        resolve_job(&c, id, "remove").unwrap();
+        assert!(job_project(&c, id).is_err());
+    }
+
+    #[test]
+    fn stop_returns_both_types_to_ready_and_preserves_sending_and_other_projects() {
+        let c = db();
+        create_drafting_jobs(&c, 1).unwrap();
+        create_drafting_jobs(&c, 2).unwrap();
+        with_ready_video(&c, 50, 1);
+        with_ready_video(&c, 51, 1);
+        with_ready_video(&c, 52, 2);
+        c.execute("UPDATE publications SET state='queued'", [])
+            .unwrap();
+        c.execute(
+            "UPDATE publications SET state='sending' WHERE ready_id=51",
+            [],
+        )
+        .unwrap();
+        assert_eq!(stop_jobs(&c, 1).unwrap(), 3);
+        assert!(jobs_for_project(&c, 1).unwrap().iter().all(|j| j.state
+            == if j.ready_id == Some(51) {
+                "sending"
+            } else {
+                "ready"
+            }));
+        assert!(jobs_for_project(&c, 2)
+            .unwrap()
+            .iter()
+            .all(|j| j.state == "queued"));
     }
 
     #[test]
     fn a_job_must_point_at_a_draft_or_a_ready_video() {
         let c = db();
-        assert!(c.execute("INSERT INTO publish_jobs (state) VALUES ('ready')", []).is_err());
+        assert!(c
+            .execute("INSERT INTO publications (state) VALUES ('ready')", [])
+            .is_err());
     }
 }

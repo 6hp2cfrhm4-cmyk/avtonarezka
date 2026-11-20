@@ -3,7 +3,7 @@ import { api, errText, type ModelsErrorEvent, type ModelsProgressEvent, type Mod
 import { onEvent } from "../lib/events";
 import { useUi } from "../store";
 
-/** Полоса наверху: докачка моделей при запуске, ошибка загрузки или кнопка, если моделей не хватает. Когда всё на месте, её нет. */
+/** Загрузка моделей только по кнопке пользователя. Когда всё на месте, полосы нет. */
 export default function ModelsBanner() {
   const notify = useUi((s) => s.notify);
   const [status, setStatus] = useState<ModelsStatus | null>(null);

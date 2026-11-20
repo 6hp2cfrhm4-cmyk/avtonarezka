@@ -17,7 +17,11 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
 
 /// Подсказка к ошибке «не удалось открыть» (на Windows системный обработчик есть всегда).
-pub const OPENER_HINT: &str = if cfg!(windows) { "" } else { " (установлен ли xdg-open?)" };
+pub const OPENER_HINT: &str = if cfg!(windows) {
+    ""
+} else {
+    " (установлен ли xdg-open?)"
+};
 
 /// Папка `tools` рядом с исполняемым файлом, если она есть.
 pub fn tools_dir() -> Option<&'static Path> {
@@ -36,7 +40,9 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
         return Some(p);
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(&file)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(&file))
+        .find(|p| p.is_file())
 }
 
 /// PATH с `dir` в начале: дочерний процесс (yt-dlp) находит там же ffmpeg и deno.
@@ -79,7 +85,11 @@ pub fn home_dir() -> Option<PathBuf> {
 pub fn default_models_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("app.avtonarezka.desktop").join("models"))
+        std::env::var_os("LOCALAPPDATA").map(|d| {
+            PathBuf::from(d)
+                .join("app.avtonarezka.desktop")
+                .join("models")
+        })
     }
     #[cfg(not(windows))]
     {
@@ -89,7 +99,11 @@ pub fn default_models_dir() -> Option<PathBuf> {
 
 /// Запускает и не ждёт завершения; процесс дожидается в фоне, чтобы не копить зомби.
 fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -113,7 +127,8 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     let cmd = {
         use std::os::windows::process::CommandExt;
         let mut c = std::process::Command::new("rundll32.exe");
-        c.args(["url.dll,FileProtocolHandler", url]).creation_flags(CREATE_NO_WINDOW);
+        c.args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(CREATE_NO_WINDOW);
         c
     };
     #[cfg(not(windows))]
@@ -134,13 +149,23 @@ mod tests {
         let old = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
         let joined = path_with(Path::new("/opt/app/tools"), Some(old)).unwrap();
         let parts: Vec<PathBuf> = std::env::split_paths(&joined).collect();
-        assert_eq!(parts, [PathBuf::from("/opt/app/tools"), PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        assert_eq!(
+            parts,
+            [
+                PathBuf::from("/opt/app/tools"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin")
+            ]
+        );
     }
 
     #[test]
     fn empty_path_still_gets_the_tools_dir() {
         let joined = path_with(Path::new("/opt/app/tools"), None).unwrap();
-        assert_eq!(std::env::split_paths(&joined).next(), Some(PathBuf::from("/opt/app/tools")));
+        assert_eq!(
+            std::env::split_paths(&joined).next(),
+            Some(PathBuf::from("/opt/app/tools"))
+        );
     }
 
     #[test]

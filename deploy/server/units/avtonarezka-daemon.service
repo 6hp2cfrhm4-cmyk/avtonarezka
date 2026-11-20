@@ -1,0 +1,56 @@
+[Unit]
+Description=Автонарезка: безголовый демон фабрики
+Documentation=file:///opt/avtonarezka/README
+After=network-online.target var-lib-avtonarezka.mount
+Wants=network-online.target
+Requires=var-lib-avtonarezka.mount
+
+[Service]
+Type=simple
+Slice=avtonarezka.slice
+User=avtonarezka
+Group=avtonarezka
+ExecStart=/opt/avtonarezka/bin/avtonarezka-daemon
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+Environment=AVTO_DATA_DIR=/var/lib/avtonarezka
+Environment=PATH=/opt/avtonarezka/bin:/usr/bin:/bin
+Environment=TMPDIR=/var/lib/avtonarezka/tmp
+Environment=DENO_DIR=/var/lib/avtonarezka/tmp/deno
+# На сервере без видеокарты распознавание речи идёт моделью поменьше (устанавливается шагом models).
+Environment=AVTO_WHISPER_MODEL=/var/lib/avtonarezka/models/whisper-small-q5_1/ggml-small-q5_1.bin
+# Ключ шифрования секретов выдаёт systemd, он лежит вне данных проекта.
+LoadCredential=secrets-key:/etc/avtonarezka/secrets.key
+
+# Лимиты (G3)
+Nice=19
+IOSchedulingClass=idle
+IOWeight=10
+CPUWeight=10
+CPUQuota=100%
+MemoryHigh=1100M
+MemoryMax=1400M
+MemorySwapMax=0
+TasksMax=300
+OOMScoreAdjust=1000
+
+# Изоляция
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/avtonarezka
+ReadOnlyPaths=/opt/avtonarezka
+
+[Install]
+WantedBy=multi-user.target

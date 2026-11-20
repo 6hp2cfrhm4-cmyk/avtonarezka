@@ -1,16 +1,19 @@
 # Пакет из уже собранных файлов (ничего не компилируется): его запускает scripts/make-arch-package.sh,
 # который задаёт PROJECT_DIR. Для обычной сборки из исходников этот файл не предназначен.
 pkgname=avtonarezka
-pkgver=0.3.0
+pkgver=0.4.2
 pkgrel=1
-pkgdesc='Вертикальные рекламные ролики из длинного видео, всё считается локально'
+pkgdesc='Локальная фабрика вертикальных роликов: источники, монтаж и календарь'
 arch=('x86_64')
 license=('custom')
 depends=('webkit2gtk-4.1' 'gtk3' 'ffmpeg' 'libsecret' 'vulkan-icd-loader' 'xdg-utils' 'yt-dlp' 'deno')
 optdepends=(
   'chromium: заливка в TikTok через браузер'
-  'gnome-keyring: хранилище ключей и входа TikTok'
+  'gnome-keyring: хранилище ключей аккаунтов площадок'
   'vulkan-driver: ускорение анализа на видеокарте'
+  'libnotify: уведомления рабочего стола через notify-send'
+  'systemd: блокировка сна во время работы через systemd-inhibit'
+  'libappindicator-gtk3: необязательный значок в трее'
 )
 # бинарники уже собраны в release-режиме и очищены
 options=('!strip' '!debug' '!lto')
@@ -29,4 +32,7 @@ package() {
   install -Dm644 "$icons/icon.png"    "$pkgdir/usr/share/icons/hicolor/512x512/apps/avtonarezka.png"
   install -Dm644 "$PROJECT_DIR/assets/fonts/OFL.txt" "$pkgdir/usr/share/licenses/$pkgname/OFL-Montserrat.txt"
   install -Dm755 "$PROJECT_DIR/scripts/fetch-models.sh" "$pkgdir/usr/share/$pkgname/fetch-models.sh"
+  install -Dm644 "$PROJECT_DIR/docs/FACTORY_GUIDE.md" "$pkgdir/usr/share/doc/$pkgname/FACTORY_GUIDE.md"
+  install -Dm644 "$PROJECT_DIR/docs/PLATFORM_AUDIT.md" "$pkgdir/usr/share/doc/$pkgname/PLATFORM_AUDIT.md"
+  install -Dm644 "$PROJECT_DIR/FACTORY_PROGRESS.md" "$pkgdir/usr/share/doc/$pkgname/FACTORY_PROGRESS.md"
 }

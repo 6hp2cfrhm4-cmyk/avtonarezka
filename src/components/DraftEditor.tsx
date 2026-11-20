@@ -163,6 +163,7 @@ export default function DraftEditor({ draft, onClose }: { draft: Draft; onClose:
               </Section>
 
               <Section title="Субтитры">
+                <Row label="Заголовок LLM в первые 3 секунды" value={style.hookEnabled ?? false} onChange={(v) => set((c) => void (c.style.hookEnabled = v))} />
                 <Row label="Показывать субтитры" value={style.subtitles.enabled} onChange={(v) => set((c) => void (c.style.subtitles.enabled = v))} />
                 <Slide label="Размер" value={style.subtitles.size} min={40} max={140} step={2} onChange={(v) => set((c) => void (c.style.subtitles.size = v))} />
                 <Seg value={style.subtitles.wordsPerLine} options={[2, 3, 4, 5].map((n) => ({ v: n, l: `${n} слова` }))} onChange={(v) => set((c) => void (c.style.subtitles.wordsPerLine = v))} />

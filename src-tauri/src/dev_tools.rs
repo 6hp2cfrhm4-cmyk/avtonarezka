@@ -6,7 +6,23 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Экраны, на которые разрешено переключаться извне.
-const SCREENS: [&str; 5] = ["import", "analysis", "moments", "drafts", "final"];
+const SCREENS: [&str; 15] = [
+    "import",
+    "analysis",
+    "moments",
+    "drafts",
+    "final",
+    "factory",
+    "channels",
+    "templates",
+    "campaigns",
+    "calendar",
+    "analytics",
+    "accounts",
+    "studio",
+    "settings",
+    "disk",
+];
 
 pub fn go(app: &AppHandle, screen: &str) -> Result<(), String> {
     if !SCREENS.contains(&screen) {
@@ -18,7 +34,10 @@ pub fn go(app: &AppHandle, screen: &str) -> Result<(), String> {
 /// Импортирует видео так же, как кнопка «Выбрать файл».
 pub async fn import(app: &AppHandle, path: String) -> Result<String, String> {
     let p = std::path::Path::new(&path);
-    let ok = p.is_file() && p.extension().and_then(|e| e.to_str()).is_some_and(|e| ["mp4", "mov", "mkv", "webm"].contains(&e.to_lowercase().as_str()));
+    let ok = p.is_file()
+        && p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ["mp4", "mov", "mkv", "webm"].contains(&e.to_lowercase().as_str()));
     if !ok {
         return Err("нужен существующий видеофайл".into());
     }
@@ -33,7 +52,10 @@ pub async fn yt_analyze(app: &AppHandle, url: String) -> Result<String, String> 
 }
 
 /// Скачивание с YouTube, как кнопка «Скачать»: сначала читаем сведения о ролике, потом ставим загрузку в очередь.
-pub async fn yt_download(app: &AppHandle, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
+pub async fn yt_download(
+    app: &AppHandle,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
     let url = q.get("url").cloned().ok_or("нужен ?url=<ссылка>")?;
     let info = crate::youtube_cmds::youtube_analyze(app.state(), url.clone()).await?;
     let args = crate::youtube_cmds::StartArgs {
@@ -71,7 +93,10 @@ pub fn accept_all(app: &AppHandle, project_id: i64) -> Result<String, String> {
         .0
         .lock()
         .unwrap()
-        .execute("UPDATE moments SET status = 'accepted' WHERE project_id = ?1 AND status = 'candidate'", [project_id])
+        .execute(
+            "UPDATE moments SET status = 'accepted' WHERE project_id = ?1 AND status = 'candidate'",
+            [project_id],
+        )
         .map_err(|e| e.to_string())?;
     Ok(format!("принято моментов: {n}"))
 }
@@ -94,13 +119,18 @@ pub fn finals(app: &AppHandle, project_id: i64) -> Result<String, String> {
 }
 
 /// Настройки TikTok, как кнопка «Сохранить» (только для проверки на макете).
-pub async fn tiktok_settings(app: &AppHandle, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
+pub async fn tiktok_settings(
+    app: &AppHandle,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
     use crate::tiktok_cmds::{tiktok_save_settings, SettingsArgs};
     let get = |k: &str, d: &str| q.get(k).cloned().unwrap_or_else(|| d.to_string());
     let args = SettingsArgs {
         client_key: get("key", ""),
         client_secret: q.get("secret").cloned(),
-        port: get("port", "38475").parse().map_err(|_| "port".to_string())?,
+        port: get("port", "38475")
+            .parse()
+            .map_err(|_| "port".to_string())?,
         mode: get("mode", "inbox"),
         method: get("method", "api"),
         privacy: get("privacy", "SELF_ONLY"),
@@ -111,22 +141,34 @@ pub async fn tiktok_settings(app: &AppHandle, q: &std::collections::HashMap<Stri
 }
 
 pub async fn tiktok_status(app: &AppHandle) -> Result<String, String> {
-    serde_json::to_string(&crate::tiktok_cmds::tiktok_status(app.state())).map_err(|e| e.to_string())
+    serde_json::to_string(&crate::tiktok_cmds::tiktok_status(app.state()))
+        .map_err(|e| e.to_string())
 }
 
 /// Кнопка «Подключить аккаунт».
 pub async fn tiktok_login(app: &AppHandle) -> Result<String, String> {
-    crate::tiktok_cmds::tiktok_login_start(app.clone(), app.state()).await.map(|_| "вход запущен".into())
+    crate::tiktok_cmds::tiktok_login_start(app.clone(), app.state())
+        .await
+        .map(|_| "вход запущен".into())
 }
 
 /// Кнопка «Отправить в TikTok» в диалоге.
-pub async fn tiktok_publish(app: &AppHandle, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
+pub async fn tiktok_publish(
+    app: &AppHandle,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
     use crate::tiktok_cmds::{tiktok_publish, PublishArgs};
     let get = |k: &str, d: &str| q.get(k).cloned().unwrap_or_else(|| d.to_string());
     let args = PublishArgs {
-        draft_id: get("draft", "0").parse().map_err(|_| "нужен ?draft=<id>".to_string())?,
+        draft_id: get("draft", "0")
+            .parse()
+            .map_err(|_| "нужен ?draft=<id>".to_string())?,
         caption: get("caption", ""),
-        hashtags: get("tags", "").split(',').filter(|t| !t.is_empty()).map(str::to_string).collect(),
+        hashtags: get("tags", "")
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect(),
         privacy: get("privacy", "SELF_ONLY"),
         allow_comment: get("comment", "0") == "1",
         allow_duet: false,
@@ -144,27 +186,68 @@ pub fn queue_state(app: &AppHandle, project_id: i64) -> Result<String, String> {
 }
 
 pub async fn queue_prepare(app: &AppHandle, project_id: i64) -> Result<String, String> {
-    crate::publish_queue::queue_prepare(app.clone(), app.state(), project_id).await.map(|_| "описания пишутся".into())
+    crate::publish_queue::queue_prepare(app.clone(), app.state(), project_id)
+        .await
+        .map(|_| "описания пишутся".into())
 }
 
 pub fn queue_start(app: &AppHandle, project_id: i64) -> Result<String, String> {
-    crate::publish_queue::queue_start(app.clone(), app.state(), project_id, true).map(|_| "очередь запущена".into())
+    crate::publish_queue::queue_start(app.clone(), app.state(), project_id, true)
+        .map(|_| "очередь запущена".into())
 }
 
 pub fn queue_stop(app: &AppHandle, project_id: i64) -> Result<String, String> {
-    crate::publish_queue::queue_stop(app.clone(), app.state(), project_id).map(|_| "очередь остановлена".into())
+    crate::publish_queue::queue_stop(app.clone(), app.state(), project_id)
+        .map(|_| "очередь остановлена".into())
 }
 
-pub fn queue_apply_text(app: &AppHandle, project_id: i64, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
-    let tags = q.get("tags").map(|t| t.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect()).unwrap_or_default();
-    crate::publish_queue::queue_apply_text(app.clone(), app.state(), project_id, q.get("text").cloned().unwrap_or_default(), tags).map(|n| format!("текст назначен роликам: {n}"))
+pub fn queue_apply_text(
+    app: &AppHandle,
+    project_id: i64,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    let tags = q
+        .get("tags")
+        .map(|t| {
+            t.split(',')
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::publish_queue::queue_apply_text(
+        app.clone(),
+        app.state(),
+        project_id,
+        q.get("text").cloned().unwrap_or_default(),
+        tags,
+        q.get("preserveTags").map(|v| v == "1"),
+    )
+    .map(|n| format!("текст назначен роликам: {n}"))
 }
 
-pub fn queue_settings(app: &AppHandle, q: &std::collections::HashMap<String, String>) -> Result<String, String> {
-    let get = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok()).ok_or_else(|| format!("нужен ?{k}=<число>"));
+pub fn queue_settings(
+    app: &AppHandle,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    let get = |k: &str| {
+        q.get(k)
+            .and_then(|v| v.parse::<i64>().ok())
+            .ok_or_else(|| format!("нужен ?{k}=<число>"))
+    };
     // окно необязательно: без него публикация идёт весь день
-    let opt = |k: &str, default: i64| q.get(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(default);
-    let s = crate::publish_queue::queue_settings_set(app.state(), get("pause")?, get("limit")?, opt("from", 0), opt("to", 1440))?;
+    let opt = |k: &str, default: i64| {
+        q.get(k)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(default)
+    };
+    let s = crate::publish_queue::queue_settings_set(
+        app.state(),
+        get("pause")?,
+        get("limit")?,
+        opt("from", 0),
+        opt("to", 1440),
+    )?;
     serde_json::to_string(&s).map_err(|e| e.to_string())
 }
 
@@ -172,7 +255,12 @@ pub fn queue_settings(app: &AppHandle, q: &std::collections::HashMap<String, Str
 pub async fn tiktok_reset(app: &AppHandle) -> Result<String, String> {
     let st = app.state::<crate::state::AppState>();
     crate::tiktok_cmds::tiktok_forget_secret(app.state()).await?;
-    st.db.0.lock().unwrap().execute("DELETE FROM kv WHERE key LIKE 'tiktok_%'", []).map_err(|e| e.to_string())?;
+    st.db
+        .0
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM kv WHERE key LIKE 'tiktok_%'", [])
+        .map_err(|e| e.to_string())?;
     Ok("TikTok сброшен".into())
 }
 
@@ -183,7 +271,67 @@ pub fn edit(app: &AppHandle, draft_id: i64) -> Result<(), String> {
 
 /// Выбирает проект в интерфейсе (как клик по карточке).
 pub fn select(app: &AppHandle, project_id: i64) -> Result<(), String> {
-    app.emit("dev-select", project_id).map_err(|e| e.to_string())
+    app.emit("dev-select", project_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Читаем настоящее DOM-состояние WebKit, чтобы тест не принимал успешный emit
+/// за готовый интерфейс. Значения password-полей никогда не возвращаются.
+#[cfg(target_os = "linux")]
+#[allow(deprecated)] // run_javascript доступен во всех поддерживаемых WebKitGTK 2.x.
+pub async fn ui_state(app: &AppHandle) -> Result<String, String> {
+    ui_state_window(app, "main").await
+}
+#[cfg(target_os = "linux")]
+#[allow(deprecated)]
+pub async fn ui_state_window(app: &AppHandle, label: &str) -> Result<String, String> {
+    use webkit2gtk::{gio, WebViewExt};
+    let win = app.get_webview_window(label).ok_or("Нет окна")?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    win.with_webview(move|wv|{wv.inner().run_javascript("JSON.stringify({ready:document.readyState,title:document.querySelector('h1')?.textContent,pageOpacity:document.querySelector('main>div')?getComputedStyle(document.querySelector('main>div')).opacity:null,text:document.body.innerText,images:[...document.querySelectorAll('img')].map(i=>({src:i.currentSrc,alt:i.alt,loaded:i.complete&&i.naturalWidth>0})),invalid:[...document.querySelectorAll('input,select,textarea')].filter(e=>!e.validity.valid).map(e=>({label:e.closest('label')?.firstElementChild?.textContent,message:e.validationMessage})),fields:[...document.querySelectorAll('label')].map(l=>{let e=l.querySelector('input,select,textarea');return {label:l.firstElementChild?.textContent,value:e?.type==='password'?undefined:e?.value,checked:e?.checked};})})",gio::Cancellable::NONE,move|result|{let value=result.map_err(|e|e.to_string()).and_then(|r|r.js_value().map(|v|v.to_string()).ok_or("Нет DOM-результата".into()));let _=tx.send(value);});}).map_err(|e|e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+        .await
+        .map_err(|_| "WebKit не ответил")?
+        .map_err(|e| e.to_string())?
+}
+#[cfg(not(target_os = "linux"))]
+pub async fn ui_state_window(_app: &AppHandle, _label: &str) -> Result<String, String> {
+    Err("DOM-проба реализована для Linux".into())
+}
+#[cfg(not(target_os = "linux"))]
+pub async fn ui_state(_app: &AppHandle) -> Result<String, String> {
+    Err("DOM-проба реализована для Linux".into())
+}
+
+/// Прокрутить длинный экран к конкретному заголовку для native screenshot.
+#[cfg(target_os = "linux")]
+#[allow(deprecated)]
+pub async fn ui_scroll(app: &AppHandle, heading: String) -> Result<String, String> {
+    use webkit2gtk::{gio, WebViewExt};
+    let win = app.get_webview_window("main").ok_or("Нет окна")?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let heading = serde_json::to_string(&heading).map_err(|e| e.to_string())?;
+    let script=format!("(()=>{{const e=[...document.querySelectorAll('h1,h2,h3')].find(e=>e.textContent.trim()==={heading});if(e)e.scrollIntoView({{block:'start',behavior:'instant'}});return JSON.stringify(!!e)}})()");
+    win.with_webview(move |wv| {
+        wv.inner()
+            .run_javascript(&script, gio::Cancellable::NONE, move |result| {
+                let value = result.map_err(|e| e.to_string()).and_then(|r| {
+                    r.js_value()
+                        .map(|v| v.to_string())
+                        .ok_or("Нет DOM-результата".into())
+                });
+                let _ = tx.send(value);
+            });
+    })
+    .map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+        .await
+        .map_err(|_| "WebKit не ответил")?
+        .map_err(|e| e.to_string())?
+}
+#[cfg(not(target_os = "linux"))]
+pub async fn ui_scroll(_app: &AppHandle, _heading: String) -> Result<String, String> {
+    Err("Прокрутка реализована для Linux".into())
 }
 
 /// Запускает анализ так же, как кнопка «Начать анализ» (настройки по умолчанию).
@@ -194,9 +342,13 @@ pub fn analyze(app: &AppHandle, project_id: i64) -> Result<(), String> {
 /// PNG видимой области веб-вью. Снимает сам WebKitGTK, так что WebGL и backdrop-filter видны как есть.
 #[cfg(target_os = "linux")]
 pub async fn snapshot(app: &AppHandle, path: PathBuf) -> Result<(), String> {
+    snapshot_window(app, path, "main").await
+}
+#[cfg(target_os = "linux")]
+pub async fn snapshot_window(app: &AppHandle, path: PathBuf, label: &str) -> Result<(), String> {
     use webkit2gtk::{gio, SnapshotOptions, SnapshotRegion, WebViewExt};
 
-    let win = app.get_webview_window("main").ok_or("окно main не найдено")?;
+    let win = app.get_webview_window(label).ok_or("окно не найдено")?;
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     win.with_webview(move |wv| {
         wv.inner().snapshot(
@@ -219,13 +371,25 @@ pub async fn snapshot(app: &AppHandle, path: PathBuf) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
+pub async fn snapshot_window(_app: &AppHandle, _path: PathBuf, _label: &str) -> Result<(), String> {
+    Err("снимок окна реализован только для Linux".into())
+}
+#[cfg(not(target_os = "linux"))]
 pub async fn snapshot(_app: &AppHandle, _path: PathBuf) -> Result<(), String> {
     Err("снимок окна реализован только для Linux".into())
 }
 
 /// Пачка для проверки: один файл за вызов, как «Добавить файлы в пачку».
 pub fn batch_add(app: &AppHandle, path: String, precut: bool) -> Result<String, String> {
-    let item = crate::batch::NewItem { kind: "file".into(), source: path, title: String::new(), preset: "1080".into(), precut };
+    let item = crate::batch::NewItem {
+        kind: "file".into(),
+        source: path,
+        title: String::new(),
+        preset: "1080".into(),
+        precut,
+        channel_id: None,
+        priority: 0,
+    };
     let n = crate::batch::batch_add(app.clone(), app.state(), vec![item])?;
     Ok(format!("в пачке: {n}"))
 }
@@ -243,4 +407,46 @@ pub fn batch_approve(app: &AppHandle) -> Result<String, String> {
 
 pub fn batch_list(app: &AppHandle) -> Result<String, String> {
     serde_json::to_string(&crate::batch::batch_list(app.state())?).map_err(|e| e.to_string())
+}
+
+/// Проверяет настоящий WebKit print-сигнал без задания системному принтеру.
+#[cfg(target_os = "linux")]
+#[allow(deprecated)]
+pub async fn report_print_probe(app: &AppHandle, label: String) -> Result<String, String> {
+    use webkit2gtk::{gio, glib::prelude::ObjectExt, WebViewExt};
+    let win = app.get_webview_window(&label).ok_or("Нет отчёта")?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    win.with_webview(move |wv| {
+        let view = wv.inner();
+        let sink = std::rc::Rc::new(std::cell::RefCell::new(Some(tx)));
+        let print_sink = sink.clone();
+        let handler = view.connect_print(move |_, _| {
+            if let Some(tx) = print_sink.borrow_mut().take() {
+                let _ = tx.send(Ok("WebKit print signal".to_string()));
+            }
+            true
+        });
+        let target = view.clone();
+        view.run_javascript(
+            "document.querySelector('button.print').click()",
+            gio::Cancellable::NONE,
+            move |result| {
+                target.disconnect(handler);
+                if let Err(e) = result {
+                    if let Some(tx) = sink.borrow_mut().take() {
+                        let _ = tx.send(Err(e.to_string()));
+                    }
+                }
+            },
+        );
+    })
+    .map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+        .await
+        .map_err(|_| "Нет сигнала печати")?
+        .map_err(|e| e.to_string())?
+}
+#[cfg(not(target_os = "linux"))]
+pub async fn report_print_probe(_app: &AppHandle, _label: String) -> Result<String, String> {
+    Err("Проба печати реализована для Linux".into())
 }

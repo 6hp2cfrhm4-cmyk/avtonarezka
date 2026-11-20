@@ -3,9 +3,9 @@
 
 use std::path::Path;
 
+use crate::host::{AppHandle, State};
 use rusqlite::params;
 use serde::Serialize;
-use tauri::{AppHandle, State};
 
 use crate::{media, publish_queue, state::AppState};
 
@@ -24,12 +24,20 @@ pub struct ReadyDto {
 }
 
 fn name_of(path: &str) -> String {
-    Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// Добавляет выбранные файлы в проект. Файл, который уже лежит в проекте, не дублируется.
-#[tauri::command]
-pub async fn ready_add(app: AppHandle, state: State<'_, AppState>, project_id: i64, paths: Vec<String>) -> CmdResult<Vec<ReadyDto>> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn ready_add(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: i64,
+    paths: Vec<String>,
+) -> CmdResult<Vec<ReadyDto>> {
     let mut added = Vec::new();
     for path in paths {
         let info = media::probe(Path::new(&path))
@@ -45,33 +53,60 @@ pub async fn ready_add(app: AppHandle, state: State<'_, AppState>, project_id: i
             )
             .map_err(|e| e.to_string())?;
             let id: i64 = db
-                .query_row("SELECT id FROM ready_videos WHERE project_id = ?1 AND path = ?2", params![project_id, path], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM ready_videos WHERE project_id = ?1 AND path = ?2",
+                    params![project_id, path],
+                    |r| r.get(0),
+                )
                 .map_err(|e| e.to_string())?;
             // задача без текста: его зададут «один текст на все» или вручную; уже существующую не трогаем
-            db.execute("INSERT INTO publish_jobs (ready_id, state) VALUES (?1, 'drafting') ON CONFLICT(ready_id) DO NOTHING", [id])
+            db.execute("INSERT INTO publications (ready_id, state) VALUES (?1, 'ready') ON CONFLICT(ready_id) WHERE legacy=1 DO NOTHING", [id])
                 .map_err(|e| e.to_string())?;
             id
         };
         let vertical = info.width * 16 == info.height * 9;
-        let warning = (!vertical).then(|| format!("кадр {}×{}, а нужен вертикальный 9:16 (1080×1920)", info.width, info.height));
-        added.push(ReadyDto { id, name, duration: info.duration, width: info.width, height: info.height, warning });
+        let warning = (!vertical).then(|| {
+            format!(
+                "кадр {}×{}, а нужен вертикальный 9:16 (1080×1920)",
+                info.width, info.height
+            )
+        });
+        added.push(ReadyDto {
+            id,
+            name,
+            duration: info.duration,
+            width: info.width,
+            height: info.height,
+            warning,
+        });
     }
     publish_queue::changed(&app, project_id);
     Ok(added)
 }
 
 /// Убирает готовый ролик из проекта. Выложенный и уходящий сейчас не трогаем: иначе сбился бы суточный лимит аккаунта.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn ready_remove(app: AppHandle, state: State<'_, AppState>, id: i64) -> CmdResult<()> {
     let db = state.db.0.lock().unwrap();
     let project_id: i64 = db
-        .query_row("SELECT project_id FROM ready_videos WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT project_id FROM ready_videos WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .map_err(|_| "Ролик не найден".to_string())?;
-    let job_state: Option<String> = db.query_row("SELECT state FROM publish_jobs WHERE ready_id = ?1", [id], |r| r.get(0)).ok();
+    let job_state: Option<String> = db
+        .query_row(
+            "SELECT state FROM publications WHERE legacy=1 AND ready_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .ok();
     if matches!(job_state.as_deref(), Some("sending") | Some("done")) {
         return Err("Этот ролик уже выкладывается или выложен: убрать его нельзя".into());
     }
-    db.execute("DELETE FROM ready_videos WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
+    db.execute("DELETE FROM ready_videos WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
     drop(db);
     publish_queue::changed(&app, project_id);
     Ok(())

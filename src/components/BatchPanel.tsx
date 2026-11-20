@@ -12,6 +12,10 @@ const input =
 const VIDEO = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts", "mpg", "mpeg"];
 
 const STAGE_LABEL: Record<BatchStage, string> = {
+  discovered: "Обнаружено", fetching: "Получаю видео", scouting: "Ищу моменты", selecting: "Отбираю",
+  awaiting_selection: "Выбор в Студии", qc: "Проверяю качество", auto_approved: "Одобрено автоматически",
+  rendering_final: "Рендер финала", captioning: "Подпись", ready_to_schedule: "Готово к планированию",
+  scheduled: "В календаре", publishing: "Публикую", published: "Опубликовано", measured: "Есть метрики", completed: "Готово", needs_check: "Нужна проверка",
   queued: "В очереди",
   downloading: "Скачивается",
   importing: "Добавляю в проекты",
@@ -31,12 +35,12 @@ const PRESETS: [string, string][] = [
 ];
 
 /** Стадии, в которых пачка уже что-то делает: такой элемент нельзя убрать. */
-const BUSY: BatchStage[] = ["downloading", "importing", "analyzing", "drafting"];
+const BUSY: BatchStage[] = ["fetching", "scouting", "selecting", "qc", "rendering_final","downloading", "importing", "analyzing", "drafting"];
 
 const card = "rounded-2xl border border-white/10 bg-white/[0.04]";
 
 /**
- * Пачка: вставь много ссылок или добавь файлы, нажми «Запустить» — дальше каждый ролик проходит
+ * Пачка: до 5 роликов на источник. Другой потолок задаётся в профиле канала. Вставь много ссылок или добавь файлы, нажми «Запустить» — дальше каждый ролик проходит
  * скачивание, поиск моментов и черновики сам. Черновики одобряешь ты, финал запускается после одобрения.
  */
 export default function BatchPanel() {
@@ -132,6 +136,7 @@ export default function BatchPanel() {
 
   return (
     <div className="flex flex-col gap-4">
+      <p className="text-sm text-white/60">До 5 роликов на источник. Другой потолок задаётся в профиле канала на экране «Каналы».</p>
       <section className={`${card} flex flex-col gap-3 p-5`}>
         <div className="flex items-center gap-2 text-sm font-semibold text-white/80">
           <Link size={16} /> Ссылки YouTube (по одной в строке)
@@ -210,7 +215,7 @@ export default function BatchPanel() {
           <div className="flex flex-wrap gap-2">
             {running ? (
               <button className="btn" onClick={() => void cancel()}>
-                Остановить
+                Пауза
               </button>
             ) : (
               <button className="btn btn-primary" disabled={!queued} onClick={() => void start()}>

@@ -23,10 +23,39 @@ const N_CLASSES: usize = 521;
 
 /// Группы событий и их вес в интересе. Названия — из `yamnet_class_map.csv`.
 const GROUPS: &[(f32, &[&str])] = &[
-    (1.0, &["Laughter", "Giggle", "Chuckle, chortle", "Belly laugh", "Snicker", "Baby laughter"]),
-    (0.9, &["Screaming", "Shout", "Yell", "Whoop", "Children shouting", "Bellow"]),
+    (
+        1.0,
+        &[
+            "Laughter",
+            "Giggle",
+            "Chuckle, chortle",
+            "Belly laugh",
+            "Snicker",
+            "Baby laughter",
+        ],
+    ),
+    (
+        0.9,
+        &[
+            "Screaming",
+            "Shout",
+            "Yell",
+            "Whoop",
+            "Children shouting",
+            "Bellow",
+        ],
+    ),
     (0.8, &["Cheering", "Applause", "Clapping", "Crowd"]),
-    (0.6, &["Explosion", "Gunshot, gunfire", "Machine gun", "Boom", "Smash, crash"]),
+    (
+        0.6,
+        &[
+            "Explosion",
+            "Gunshot, gunfire",
+            "Machine gun",
+            "Boom",
+            "Smash, crash",
+        ],
+    ),
     (0.5, &["Gasp", "Groan", "Whistling"]),
 ];
 
@@ -48,7 +77,9 @@ pub fn parse_classes(csv: &str) -> Vec<String> {
 
 impl EventModel {
     pub fn load(onnx: &Path, classes_csv: &Path) -> anyhow::Result<Self> {
-        let classes = parse_classes(&std::fs::read_to_string(classes_csv).context("нет карты классов YAMNet")?);
+        let classes = parse_classes(
+            &std::fs::read_to_string(classes_csv).context("нет карты классов YAMNet")?,
+        );
         if classes.len() != N_CLASSES {
             bail!("в карте классов {} строк, ждали {N_CLASSES}", classes.len());
         }
@@ -57,7 +88,12 @@ impl EventModel {
             .map(|(w, names)| {
                 let idx = names
                     .iter()
-                    .map(|n| classes.iter().position(|c| c == n).with_context(|| format!("в YAMNet нет класса «{n}»")))
+                    .map(|n| {
+                        classes
+                            .iter()
+                            .position(|c| c == n)
+                            .with_context(|| format!("в YAMNet нет класса «{n}»"))
+                    })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 Ok((*w, idx))
             })
@@ -87,8 +123,17 @@ impl EventModel {
     }
 
     /// Кривая событий на сетке `HOP` в единицах 0..4 (как z-оценки остальных сигналов).
-    pub fn scan(&self, pcm: &[i16], threads: usize, progress: impl Fn(f64) + Sync) -> anyhow::Result<Vec<f32>> {
-        let n_frames = if pcm.len() < WIN { 1 } else { (pcm.len() - WIN) / STEP + 1 };
+    pub fn scan(
+        &self,
+        pcm: &[i16],
+        threads: usize,
+        progress: impl Fn(f64) + Sync,
+    ) -> anyhow::Result<Vec<f32>> {
+        let n_frames = if pcm.len() < WIN {
+            1
+        } else {
+            (pcm.len() - WIN) / STEP + 1
+        };
         let n_chunks = n_frames.div_ceil(FRAMES_PER_CHUNK);
         let next = AtomicUsize::new(0);
         let done = AtomicUsize::new(0);
@@ -110,9 +155,15 @@ impl EventModel {
                     match (self.run)(&wav) {
                         Ok(flat) => {
                             let valid = FRAMES_PER_CHUNK.min(n_frames - c * FRAMES_PER_CHUNK);
-                            let scores = flat.chunks_exact(N_CLASSES).take(valid).map(|f| self.frame_score(f)).collect();
+                            let scores = flat
+                                .chunks_exact(N_CLASSES)
+                                .take(valid)
+                                .map(|f| self.frame_score(f))
+                                .collect();
                             results.lock().unwrap().push((c, scores));
-                            progress((done.fetch_add(1, Ordering::Relaxed) + 1) as f64 / n_chunks as f64);
+                            progress(
+                                (done.fetch_add(1, Ordering::Relaxed) + 1) as f64 / n_chunks as f64,
+                            );
                         }
                         Err(e) => {
                             *failure.lock().unwrap() = Some(e);
@@ -128,7 +179,10 @@ impl EventModel {
         let mut chunks = results.into_inner().unwrap();
         chunks.sort_by_key(|(c, _)| *c);
         let frames: Vec<f32> = chunks.into_iter().flat_map(|(_, v)| v).collect();
-        Ok(frames_to_hops(&frames, (pcm.len() as f64 / SR as f64 / HOP).ceil() as usize))
+        Ok(frames_to_hops(
+            &frames,
+            (pcm.len() as f64 / SR as f64 / HOP).ceil() as usize,
+        ))
     }
 }
 
@@ -154,7 +208,10 @@ mod tests {
     #[test]
     fn class_names_with_commas_stay_whole() {
         let csv = "index,mid,display_name\r\n0,/m/09x0r,Speech\r\n1,/m/0ytgt,\"Child speech, kid speaking\"\r\n";
-        assert_eq!(parse_classes(csv), vec!["Speech", "Child speech, kid speaking"]);
+        assert_eq!(
+            parse_classes(csv),
+            vec!["Speech", "Child speech, kid speaking"]
+        );
     }
 
     #[test]
@@ -163,7 +220,12 @@ mod tests {
         let mut frames = vec![0.0; 20];
         frames[10] = 1.0;
         let hops = frames_to_hops(&frames, 20);
-        let peak = hops.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        let peak = hops
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
         assert!((10..=11).contains(&peak), "{peak}"); // 5.25 и 5.75 с — ближайшие к 5.29
         assert!((hops[peak] - 4.0).abs() < 1e-6);
     }

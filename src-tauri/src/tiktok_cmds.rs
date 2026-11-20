@@ -2,9 +2,9 @@
 
 use std::{path::PathBuf, time::Duration};
 
+use crate::host::{AppHandle, Emitter, Manager, State};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::{
@@ -36,7 +36,12 @@ const S_SECRET: &str = "tiktok_client_secret";
 const S_TOKENS: &str = "tiktok_tokens";
 
 pub const DEFAULT_PORT: u16 = 38475;
-const PRIVACY: [&str; 4] = ["SELF_ONLY", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR", "PUBLIC_TO_EVERYONE"];
+const PRIVACY: [&str; 4] = [
+    "SELF_ONLY",
+    "MUTUAL_FOLLOW_FRIENDS",
+    "FOLLOWER_OF_CREATOR",
+    "PUBLIC_TO_EVERYONE",
+];
 
 // ---------------------------------------------------------------- настройки
 
@@ -57,10 +62,18 @@ pub struct Settings {
 pub(crate) fn load_settings(db: &Connection) -> Settings {
     Settings {
         client_key: kv_get(db, K_KEY).unwrap_or_default(),
-        port: kv_get(db, K_PORT).and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PORT),
-        mode: kv_get(db, K_MODE).filter(|m| m == "direct").unwrap_or_else(|| "inbox".into()),
-        method: kv_get(db, K_METHOD).filter(|m| m == "browser").unwrap_or_else(|| "api".into()),
-        privacy: kv_get(db, K_PRIVACY).filter(|p| PRIVACY.contains(&p.as_str())).unwrap_or_else(|| "SELF_ONLY".into()),
+        port: kv_get(db, K_PORT)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PORT),
+        mode: kv_get(db, K_MODE)
+            .filter(|m| m == "direct")
+            .unwrap_or_else(|| "inbox".into()),
+        method: kv_get(db, K_METHOD)
+            .filter(|m| m == "browser")
+            .unwrap_or_else(|| "api".into()),
+        privacy: kv_get(db, K_PRIVACY)
+            .filter(|p| PRIVACY.contains(&p.as_str()))
+            .unwrap_or_else(|| "SELF_ONLY".into()),
         auto_publish: kv_get(db, K_AUTO).is_some_and(|v| v == "1"),
     }
 }
@@ -80,19 +93,29 @@ pub struct SettingsArgs {
 
 pub(crate) fn validate(a: &SettingsArgs) -> Result<(), String> {
     let key = a.client_key.trim();
-    if !key.is_empty() && !(4..=128).contains(&key.len()) || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !key.is_empty() && !(4..=128).contains(&key.len())
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err("Client key — это буквы и цифры из кабинета TikTok, без пробелов".into());
     }
     if let Some(s) = a.client_secret.as_deref().filter(|s| !s.is_empty()) {
         // секрет — латиница и цифры; байтовая длина у кириллицы вдвое больше, поэтому одной длины мало
         if !(8..=128).contains(&s.len()) || !s.chars().all(|c| c.is_ascii_graphic()) {
-            return Err("Client secret выглядит неверно: проверь, что скопирован целиком, без пробелов".into());
+            return Err(
+                "Client secret выглядит неверно: проверь, что скопирован целиком, без пробелов"
+                    .into(),
+            );
         }
     }
     if a.port < 1024 {
         return Err("Порт должен быть от 1024 до 65535".into());
     }
-    if !["inbox", "direct"].contains(&a.mode.as_str()) || !["api", "browser"].contains(&a.method.as_str()) || !PRIVACY.contains(&a.privacy.as_str()) {
+    if !["inbox", "direct"].contains(&a.mode.as_str())
+        || !["api", "browser"].contains(&a.method.as_str())
+        || !PRIVACY.contains(&a.privacy.as_str())
+    {
         return Err("Неизвестное значение в настройках".into());
     }
     Ok(())
@@ -142,7 +165,7 @@ fn status_of(state: &AppState) -> TikTokStatus {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn tiktok_status(state: State<'_, AppState>) -> TikTokStatus {
     status_of(&state)
 }
@@ -150,25 +173,48 @@ pub fn tiktok_status(state: State<'_, AppState>) -> TikTokStatus {
 /// Забывает вход (токены и сведения об аккаунте). Ключи приложения остаются.
 async fn forget_login(state: &AppState) {
     let _ = state.secrets.delete(S_TOKENS).await;
-    let _ = state.db.0.lock().unwrap().execute("DELETE FROM kv WHERE key = ?1", [K_ACCOUNT]);
+    let _ = state
+        .db
+        .0
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM kv WHERE key = ?1", [K_ACCOUNT]);
 }
 
-#[tauri::command]
-pub async fn tiktok_save_settings(state: State<'_, AppState>, args: SettingsArgs) -> CmdResult<TikTokStatus> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn tiktok_save_settings(
+    state: State<'_, AppState>,
+    args: SettingsArgs,
+) -> CmdResult<TikTokStatus> {
     validate(&args)?;
     let new_secret = args.client_secret.as_deref().filter(|s| !s.is_empty());
     // другой ключ, другой секрет или другой режим означают другие разрешения: прежний вход больше не годится
     let (relogin, _old) = {
         let db = state.db.0.lock().unwrap();
         let old = load_settings(&db);
-        (old.client_key != args.client_key.trim() || old.mode != args.mode || new_secret.is_some(), old)
+        (
+            old.client_key != args.client_key.trim()
+                || old.mode != args.mode
+                || new_secret.is_some(),
+            old,
+        )
     };
     if let Some(secret) = new_secret {
         state.secrets.set(S_SECRET, secret).await.map_err(err)?;
     }
     {
         let db = state.db.0.lock().unwrap();
-        for (k, v) in [(K_KEY, args.client_key.trim().to_string()), (K_PORT, args.port.to_string()), (K_MODE, args.mode), (K_METHOD, args.method), (K_PRIVACY, args.privacy), (K_AUTO, if args.auto_publish { "1" } else { "0" }.to_string())] {
+        for (k, v) in [
+            (K_KEY, args.client_key.trim().to_string()),
+            (K_PORT, args.port.to_string()),
+            (K_MODE, args.mode),
+            (K_METHOD, args.method),
+            (K_PRIVACY, args.privacy),
+            (
+                K_AUTO,
+                if args.auto_publish { "1" } else { "0" }.to_string(),
+            ),
+        ] {
             kv_set(&db, k, &v).map_err(err)?;
         }
         if new_secret.is_some() {
@@ -181,11 +227,16 @@ pub async fn tiktok_save_settings(state: State<'_, AppState>, args: SettingsArgs
     Ok(status_of(&state))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn tiktok_forget_secret(state: State<'_, AppState>) -> CmdResult<TikTokStatus> {
     state.secrets.delete(S_SECRET).await.map_err(err)?;
     forget_login(&state).await;
-    let _ = state.db.0.lock().unwrap().execute("DELETE FROM kv WHERE key = ?1", [K_HAS_SECRET]);
+    let _ = state
+        .db
+        .0
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM kv WHERE key = ?1", [K_HAS_SECRET]);
     Ok(status_of(&state))
 }
 
@@ -198,13 +249,24 @@ struct LoginEvent {
 }
 
 async fn save_tokens(state: &AppState, t: &Tokens) -> anyhow::Result<()> {
-    state.secrets.set(S_TOKENS, &serde_json::to_string(t)?).await?;
-    let acc = Account { connected_at: api::now_unix(), refresh_expires_at: t.refresh_expires_at, scope: t.scope.clone() };
-    kv_set(&state.db.0.lock().unwrap(), K_ACCOUNT, &serde_json::to_string(&acc)?)?;
+    state
+        .secrets
+        .set(S_TOKENS, &serde_json::to_string(t)?)
+        .await?;
+    let acc = Account {
+        connected_at: api::now_unix(),
+        refresh_expires_at: t.refresh_expires_at,
+        scope: t.scope.clone(),
+    };
+    kv_set(
+        &state.db.0.lock().unwrap(),
+        K_ACCOUNT,
+        &serde_json::to_string(&acc)?,
+    )?;
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn tiktok_login_start(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     if state.login.lock().unwrap().is_some() {
         return Err("Вход уже идёт: заверши его в браузере или отмени".into());
@@ -213,8 +275,18 @@ pub async fn tiktok_login_start(app: AppHandle, state: State<'_, AppState>) -> C
     if settings.client_key.is_empty() {
         return Err("Сначала укажи Client key приложения TikTok".into());
     }
-    let secret = state.secrets.get(S_SECRET).await.map_err(err)?.filter(|s| !s.is_empty()).ok_or("Сначала укажи Client secret приложения TikTok")?;
-    let mode = if settings.mode == "direct" { Mode::Direct } else { Mode::Inbox };
+    let secret = state
+        .secrets
+        .get(S_SECRET)
+        .await
+        .map_err(err)?
+        .filter(|s| !s.is_empty())
+        .ok_or("Сначала укажи Client secret приложения TikTok")?;
+    let mode = if settings.mode == "direct" {
+        Mode::Direct
+    } else {
+        Mode::Inbox
+    };
 
     // порт занимаем до открытия браузера: ответ не должен прийти раньше, чем мы готовы его принять
     let listener = oauth::bind(settings.port).await.map_err(err)?;
@@ -224,7 +296,15 @@ pub async fn tiktok_login_start(app: AppHandle, state: State<'_, AppState>) -> C
         (api::new_pkce(&mut rng), api::random_state(&mut rng))
     };
     let redirect = api::redirect_uri(settings.port);
-    let url = api::authorize_url(&ep, &settings.client_key, mode.scope(), &redirect, &st, &pkce.challenge).map_err(err)?;
+    let url = api::authorize_url(
+        &ep,
+        &settings.client_key,
+        mode.scope(),
+        &redirect,
+        &st,
+        &pkce.challenge,
+    )
+    .map_err(err)?;
 
     let (tx, rx) = watch::channel(false);
     *state.login.lock().unwrap() = Some(tx);
@@ -232,12 +312,27 @@ pub async fn tiktok_login_start(app: AppHandle, state: State<'_, AppState>) -> C
         *state.login.lock().unwrap() = None;
         return Err(err(e));
     }
-    let _ = app.emit("tiktok-login", LoginEvent { state: "waiting", message: "Подтверди доступ в открывшемся браузере".into() });
+    let _ = app.emit(
+        "tiktok-login",
+        LoginEvent {
+            state: "waiting",
+            message: "Подтверди доступ в открывшемся браузере".into(),
+        },
+    );
 
-    tauri::async_runtime::spawn(async move {
+    crate::host::spawn(async move {
         let result = async {
             let code = oauth::wait_for_code(listener, &st, Duration::from_secs(300), rx).await?;
-            let tokens = TikTok::new(ep)?.exchange_code(&settings.client_key, &secret, &code, &redirect, &pkce.verifier, api::now_unix()).await?;
+            let tokens = TikTok::new(ep)?
+                .exchange_code(
+                    &settings.client_key,
+                    &secret,
+                    &code,
+                    &redirect,
+                    &pkce.verifier,
+                    api::now_unix(),
+                )
+                .await?;
             save_tokens(&app.state::<AppState>(), &tokens).await?;
             anyhow::Ok(())
         }
@@ -246,22 +341,28 @@ pub async fn tiktok_login_start(app: AppHandle, state: State<'_, AppState>) -> C
         let _ = app.emit(
             "tiktok-login",
             match result {
-                Ok(()) => LoginEvent { state: "done", message: "Аккаунт подключён".into() },
-                Err(e) => LoginEvent { state: "error", message: err(e) },
+                Ok(()) => LoginEvent {
+                    state: "done",
+                    message: "Аккаунт подключён".into(),
+                },
+                Err(e) => LoginEvent {
+                    state: "error",
+                    message: err(e),
+                },
             },
         );
     });
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn tiktok_login_cancel(state: State<'_, AppState>) {
     if let Some(tx) = state.login.lock().unwrap().as_ref() {
         let _ = tx.send(true);
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn tiktok_logout(state: State<'_, AppState>) -> CmdResult<TikTokStatus> {
     forget_login(&state).await;
     Ok(status_of(&state))
@@ -283,40 +384,68 @@ pub struct PostDto {
     pub updated_at: i64,
 }
 
-pub(crate) fn begin_post(db: &Connection, draft_id: i64, method: &str, mode: &str) -> rusqlite::Result<i64> {
-    db.execute("INSERT INTO posts (draft_id, method, mode, status) VALUES (?1, ?2, ?3, 'uploading')", params![draft_id, method, mode])?;
+pub(crate) fn begin_post(
+    db: &Connection,
+    draft_id: i64,
+    method: &str,
+    mode: &str,
+) -> rusqlite::Result<i64> {
+    db.execute("INSERT INTO publication_attempts (draft_id, method, mode, status,publication_id) VALUES (?1, ?2, ?3, 'uploading',(SELECT id FROM publications WHERE legacy=1 AND draft_id=?1))", params![draft_id, method, mode])?;
     Ok(db.last_insert_rowid())
 }
 
 /// Выкладка готового ролика из папки. Записи без черновика не попадают в список «последние выкладки» по проекту,
 /// но учитываются в суточном лимите аккаунта (`sent_at`).
-pub(crate) fn begin_ready_post(db: &Connection, ready_id: i64, method: &str, mode: &str) -> rusqlite::Result<i64> {
-    db.execute("INSERT INTO posts (ready_id, method, mode, status) VALUES (?1, ?2, ?3, 'uploading')", params![ready_id, method, mode])?;
+pub(crate) fn begin_ready_post(
+    db: &Connection,
+    ready_id: i64,
+    method: &str,
+    mode: &str,
+) -> rusqlite::Result<i64> {
+    db.execute("INSERT INTO publication_attempts (ready_id, method, mode, status,publication_id) VALUES (?1, ?2, ?3, 'uploading',(SELECT id FROM publications WHERE legacy=1 AND ready_id=?1))", params![ready_id, method, mode])?;
     Ok(db.last_insert_rowid())
 }
 
-pub(crate) fn finish_post(db: &Connection, id: i64, result: &Result<(String, Option<String>), String>) {
+pub(crate) fn finish_post(
+    db: &Connection,
+    id: i64,
+    result: &Result<(String, Option<String>), String>,
+) {
     let _ = match result {
-        Ok((detail, publish_id)) => db.execute("UPDATE posts SET status = 'done', detail = ?2, publish_id = ?3, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![id, detail, publish_id]),
-        Err(e) => db.execute("UPDATE posts SET status = 'failed', error = ?2, updated_at = unixepoch() WHERE id = ?1", params![id, e]),
+        Ok((detail, publish_id)) => db.execute("UPDATE publication_attempts SET status = 'done', detail = ?2, publish_id = ?3, error = NULL, updated_at = unixepoch() WHERE id = ?1", params![id, detail, publish_id]),
+        Err(e) => db.execute("UPDATE publication_attempts SET status = 'failed', error = ?2, updated_at = unixepoch() WHERE id = ?1", params![id, e]),
     };
 }
 
 /// Ролик ушёл с аккаунта: время выкладки и аккаунт попадают в суточный лимит. `None` — основной аккаунт.
 pub(crate) fn mark_sent(db: &Connection, id: i64, account: Option<i64>) {
-    let _ = db.execute("UPDATE posts SET sent_at = unixepoch(), account_id = COALESCE(?2, account_id) WHERE id = ?1", params![id, account]);
+    let _ = db.execute("UPDATE publication_attempts SET sent_at = unixepoch(), account_id = COALESCE(?2, account_id) WHERE id = ?1", params![id, account]);
+    // Ручная браузерная отправка тоже появляется в общем календаре. Публикация
+    // создаётся только после подтверждённого результата, история попыток остаётся.
+    let _=db.execute("INSERT INTO publications(draft_id,ready_id,state,sent_at,account_id,external_id) SELECT draft_id,ready_id,'done',sent_at,account_id,publish_id FROM publication_attempts h WHERE h.id=?1 AND NOT EXISTS(SELECT 1 FROM publications j WHERE j.legacy=1 AND (j.draft_id=h.draft_id OR j.ready_id=h.ready_id))",[id]);
+    let _=db.execute("UPDATE publication_attempts SET publication_id=(SELECT j.id FROM publications j WHERE j.legacy=1 AND (j.draft_id=publication_attempts.draft_id OR j.ready_id=publication_attempts.ready_id)) WHERE id=?1",[id]);
+    let _=db.execute("UPDATE publications SET state='done',sent_at=unixepoch(),account_id=COALESCE(?2,account_id),external_id=COALESCE((SELECT publish_id FROM publication_attempts WHERE id=?1),external_id),updated_at=unixepoch() WHERE id=(SELECT publication_id FROM publication_attempts WHERE id=?1)",params![id,account]);
 }
 
 /// Последняя отправка каждого ролика проекта.
 pub(crate) fn latest_posts(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<PostDto>> {
     let mut st = db.prepare(
         "SELECT p.id, p.draft_id, p.method, p.mode, p.status, p.detail, p.error, p.updated_at
-         FROM posts p JOIN drafts d ON d.id = p.draft_id JOIN moments m ON m.id = d.moment_id
-         WHERE m.project_id = ?1 AND p.id = (SELECT MAX(id) FROM posts WHERE draft_id = p.draft_id)
+         FROM publication_attempts p JOIN drafts d ON d.id = p.draft_id JOIN moments m ON m.id = d.moment_id
+         WHERE p.platform='tiktok' AND m.project_id = ?1 AND p.id = (SELECT MAX(id) FROM publication_attempts WHERE platform='tiktok' AND draft_id = p.draft_id)
          ORDER BY p.draft_id",
     )?;
     let rows = st.query_map([project_id], |r| {
-        Ok(PostDto { id: r.get(0)?, draft_id: r.get(1)?, method: r.get(2)?, mode: r.get(3)?, status: r.get(4)?, detail: r.get(5)?, error: r.get(6)?, updated_at: r.get(7)? })
+        Ok(PostDto {
+            id: r.get(0)?,
+            draft_id: r.get(1)?,
+            method: r.get(2)?,
+            mode: r.get(3)?,
+            status: r.get(4)?,
+            detail: r.get(5)?,
+            error: r.get(6)?,
+            updated_at: r.get(7)?,
+        })
     })?;
     rows.collect()
 }
@@ -324,12 +453,12 @@ pub(crate) fn latest_posts(db: &Connection, project_id: i64) -> rusqlite::Result
 /// После перезапуска приложения незавершённые отправки прерваны. Файл мог уйти и после обрыва, поэтому честно просим проверить.
 pub(crate) fn recover_interrupted_posts(db: &Connection) {
     let _ = db.execute(
-        "UPDATE posts SET status = 'failed', error = 'Отправка прервана: приложение было закрыто. Проверь, не появился ли ролик в TikTok, прежде чем отправлять ещё раз.' WHERE status = 'uploading'",
+        "UPDATE publication_attempts SET status = 'failed', error = 'Отправка прервана: приложение было закрыто. Проверь, не появился ли ролик в TikTok, прежде чем отправлять ещё раз.' WHERE platform='tiktok' AND status = 'uploading'",
         [],
     );
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn posts_list(state: State<'_, AppState>, project_id: i64) -> CmdResult<Vec<PostDto>> {
     latest_posts(&state.db.0.lock().unwrap(), project_id).map_err(err)
 }
@@ -382,22 +511,48 @@ pub(crate) struct PostFailed {
 
 fn outcome_text(mode: Mode, o: &Outcome) -> String {
     match (mode, o.status.as_str()) {
-        (Mode::Inbox, _) => "Ролик в черновиках TikTok. Открой приложение TikTok, вставь подпись и опубликуй.".into(),
-        (Mode::Direct, "PUBLISH_COMPLETE") if !o.post_ids.is_empty() => format!("Опубликовано (id {})", o.post_ids.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")),
+        (Mode::Inbox, _) => {
+            "Ролик в черновиках TikTok. Открой приложение TikTok, вставь подпись и опубликуй."
+                .into()
+        }
+        (Mode::Direct, "PUBLISH_COMPLETE") if !o.post_ids.is_empty() => format!(
+            "Опубликовано (id {})",
+            o.post_ids
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         (Mode::Direct, _) => "Опубликовано".into(),
     }
 }
 
-#[tauri::command]
-pub async fn tiktok_publish(app: AppHandle, state: State<'_, AppState>, args: PublishArgs) -> CmdResult<PublishStart> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn tiktok_publish(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    args: PublishArgs,
+) -> CmdResult<PublishStart> {
     let (file, settings, previous) = {
         let db = state.db.0.lock().unwrap();
         let d = get_draft(&db, args.draft_id)?;
-        let file = PathBuf::from(d.final_path.filter(|_| d.status == "final_done").ok_or("Сначала нужен готовый финальный ролик")?);
+        crate::factory::rights::require_project(&db, d.project_id)?;
+        let scheduled:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM publications WHERE draft_id=?1 AND platform='tiktok' AND legacy=0 AND state IN ('scheduled','sending','done','needs_check') AND target_account_id=(SELECT id FROM accounts WHERE platform='tiktok' ORDER BY position,id LIMIT 1))",[args.draft_id],|r|r.get(0)).map_err(err)?;
+        if scheduled {
+            return Err("Этот ролик уже учтён для основного аккаунта TikTok в Календаре. Открой его перед ручной отправкой".into());
+        }
+        let file = PathBuf::from(
+            d.final_path
+                .filter(|_| d.status == "final_done")
+                .ok_or("Сначала нужен готовый финальный ролик")?,
+        );
         if !file.is_file() {
             return Err(format!("Файл не найден: {}", file.display()));
         }
-        let prev = latest_posts(&db, d.project_id).map_err(err)?.into_iter().find(|p| p.draft_id == args.draft_id);
+        let prev = latest_posts(&db, d.project_id)
+            .map_err(err)?
+            .into_iter()
+            .find(|p| p.draft_id == args.draft_id);
         (file, load_settings(&db), prev)
     };
     if !PRIVACY.contains(&args.privacy.as_str()) {
@@ -412,7 +567,11 @@ pub async fn tiktok_publish(app: AppHandle, state: State<'_, AppState>, args: Pu
         }
     }
 
-    let mode = if settings.mode == "direct" { Mode::Direct } else { Mode::Inbox };
+    let mode = if settings.mode == "direct" {
+        Mode::Direct
+    } else {
+        Mode::Inbox
+    };
     if settings.method == "browser" {
         return crate::tiktok::browser::start(app, state, args, file, settings.auto_publish).await;
     }
@@ -421,11 +580,26 @@ pub async fn tiktok_publish(app: AppHandle, state: State<'_, AppState>, args: Pu
     if settings.client_key.is_empty() {
         return Err("Сначала подключи аккаунт TikTok в настройках".into());
     }
-    let secret = state.secrets.get(S_SECRET).await.map_err(err)?.filter(|s| !s.is_empty()).ok_or("Сначала укажи Client secret приложения TikTok")?;
-    let tokens: Tokens = serde_json::from_str(&state.secrets.get(S_TOKENS).await.map_err(err)?.ok_or("Сначала подключи аккаунт TikTok")?).map_err(|_| "Вход в TikTok повреждён. Подключи аккаунт заново.".to_string())?;
+    let secret = state
+        .secrets
+        .get(S_SECRET)
+        .await
+        .map_err(err)?
+        .filter(|s| !s.is_empty())
+        .ok_or("Сначала укажи Client secret приложения TikTok")?;
+    let tokens: Tokens = serde_json::from_str(
+        &state
+            .secrets
+            .get(S_TOKENS)
+            .await
+            .map_err(err)?
+            .ok_or("Сначала подключи аккаунт TikTok")?,
+    )
+    .map_err(|_| "Вход в TikTok повреждён. Подключи аккаунт заново.".to_string())?;
 
     let post_id = {
         let db = state.db.0.lock().unwrap();
+        crate::factory::rights::require_clip(&db, args.draft_id)?;
         db.execute(
             "UPDATE moments SET caption = ?2, hashtags = ?3 WHERE id = (SELECT moment_id FROM drafts WHERE id = ?1)",
             params![args.draft_id, args.caption.trim(), serde_json::to_string(&api::normalize_hashtags(&args.hashtags)).unwrap_or_else(|_| "[]".into())],
@@ -435,9 +609,19 @@ pub async fn tiktok_publish(app: AppHandle, state: State<'_, AppState>, args: Pu
     };
     state.posting.lock().unwrap().insert(args.draft_id);
 
-    tauri::async_runtime::spawn(async move {
+    crate::host::spawn(async move {
         let draft_id = args.draft_id;
-        let result = run_api_post(&app, draft_id, mode, file, &settings.client_key, &secret, tokens, &args).await;
+        let result = run_api_post(
+            &app,
+            draft_id,
+            mode,
+            file,
+            &settings.client_key,
+            &secret,
+            tokens,
+            &args,
+        )
+        .await;
         let state = app.state::<AppState>();
         state.posting.lock().unwrap().remove(&draft_id);
         let stored = match &result {
@@ -450,14 +634,33 @@ pub async fn tiktok_publish(app: AppHandle, state: State<'_, AppState>, args: Pu
             Err(message) => app.emit("post-error", PostFailed { draft_id, message }),
         };
     });
-    Ok(PublishStart { post_id: Some(post_id), already_sent: None })
+    Ok(PublishStart {
+        post_id: Some(post_id),
+        already_sent: None,
+    })
 }
 
 fn already_sent(p: &PostDto) -> PublishStart {
-    PublishStart { post_id: None, already_sent: Some(if p.detail.is_empty() { "Ролик уже отправлялся".into() } else { p.detail.clone() }) }
+    PublishStart {
+        post_id: None,
+        already_sent: Some(if p.detail.is_empty() {
+            "Ролик уже отправлялся".into()
+        } else {
+            p.detail.clone()
+        }),
+    }
 }
 
-async fn run_api_post(app: &AppHandle, draft_id: i64, mode: Mode, file: PathBuf, key: &str, secret: &str, tokens: Tokens, args: &PublishArgs) -> anyhow::Result<Outcome> {
+async fn run_api_post(
+    app: &AppHandle,
+    draft_id: i64,
+    mode: Mode,
+    file: PathBuf,
+    key: &str,
+    secret: &str,
+    tokens: Tokens,
+    args: &PublishArgs,
+) -> anyhow::Result<Outcome> {
     let api = TikTok::new(Endpoints::from_env())?;
     let saver = app.clone();
     let tokens = api::ensure_fresh(&api, key, secret, tokens, api::now_unix(), &mut |t| {
@@ -478,9 +681,22 @@ async fn run_api_post(app: &AppHandle, draft_id: i64, mode: Mode, file: PathBuf,
         allow_stitch: args.allow_stitch,
     };
     let reporter = app.clone();
-    publish::publish(&api, &tokens.access_token, &req, &Timing::default(), &mut |p| {
-        let _ = reporter.emit("post-progress", PostProgress { draft_id, fraction: p.fraction, message: p.message });
-    })
+    publish::publish(
+        &api,
+        &tokens.access_token,
+        &req,
+        &Timing::default(),
+        &mut |p| {
+            let _ = reporter.emit(
+                "post-progress",
+                PostProgress {
+                    draft_id,
+                    fraction: p.fraction,
+                    message: p.message,
+                },
+            );
+        },
+    )
     .await
 }
 
@@ -489,27 +705,91 @@ mod tests {
     use super::*;
 
     fn args() -> SettingsArgs {
-        SettingsArgs { client_key: "aw1b2c3d4e5f".into(), client_secret: None, port: 38475, mode: "inbox".into(), method: "api".into(), privacy: "SELF_ONLY".into(), auto_publish: false }
+        SettingsArgs {
+            client_key: "aw1b2c3d4e5f".into(),
+            client_secret: None,
+            port: 38475,
+            mode: "inbox".into(),
+            method: "api".into(),
+            privacy: "SELF_ONLY".into(),
+            auto_publish: false,
+        }
     }
 
     #[test]
     fn valid_settings_pass_and_bad_ones_explain_themselves() {
         assert!(validate(&args()).is_ok());
-        assert!(validate(&SettingsArgs { client_key: String::new(), ..args() }).is_ok(), "пустой ключ — просто не настроено");
+        assert!(
+            validate(&SettingsArgs {
+                client_key: String::new(),
+                ..args()
+            })
+            .is_ok(),
+            "пустой ключ — просто не настроено"
+        );
         for (a, needle) in [
-            (SettingsArgs { client_key: "ключ с пробелом".into(), ..args() }, "Client key"),
-            (SettingsArgs { client_key: "ab".into(), ..args() }, "Client key"),
-            (SettingsArgs { client_secret: Some("коротко".into()), ..args() }, "Client secret"),
-            (SettingsArgs { client_secret: Some("secret with spaces here".into()), ..args() }, "Client secret"),
+            (
+                SettingsArgs {
+                    client_key: "ключ с пробелом".into(),
+                    ..args()
+                },
+                "Client key",
+            ),
+            (
+                SettingsArgs {
+                    client_key: "ab".into(),
+                    ..args()
+                },
+                "Client key",
+            ),
+            (
+                SettingsArgs {
+                    client_secret: Some("коротко".into()),
+                    ..args()
+                },
+                "Client secret",
+            ),
+            (
+                SettingsArgs {
+                    client_secret: Some("secret with spaces here".into()),
+                    ..args()
+                },
+                "Client secret",
+            ),
             (SettingsArgs { port: 80, ..args() }, "Порт"),
-            (SettingsArgs { mode: "hack".into(), ..args() }, "Неизвестное"),
-            (SettingsArgs { method: "x".into(), ..args() }, "Неизвестное"),
-            (SettingsArgs { privacy: "EVERYONE".into(), ..args() }, "Неизвестное"),
+            (
+                SettingsArgs {
+                    mode: "hack".into(),
+                    ..args()
+                },
+                "Неизвестное",
+            ),
+            (
+                SettingsArgs {
+                    method: "x".into(),
+                    ..args()
+                },
+                "Неизвестное",
+            ),
+            (
+                SettingsArgs {
+                    privacy: "EVERYONE".into(),
+                    ..args()
+                },
+                "Неизвестное",
+            ),
         ] {
             let e = validate(&a).unwrap_err();
             assert!(e.contains(needle), "{a:?}: {e}");
         }
-        assert!(validate(&SettingsArgs { client_secret: Some(String::new()), ..args() }).is_ok(), "пустой секрет — оставить прежний");
+        assert!(
+            validate(&SettingsArgs {
+                client_secret: Some(String::new()),
+                ..args()
+            })
+            .is_ok(),
+            "пустой секрет — оставить прежний"
+        );
     }
 
     fn db() -> Connection {
@@ -520,7 +800,11 @@ mod tests {
         c.execute("INSERT INTO projects (id, path, hash, title, duration, width, height, fps, has_audio) VALUES (2, '/w', 'h2', 'w', 100, 1, 1, 30, 1)", []).unwrap();
         for (mid, pid) in [(1, 1), (2, 1), (3, 2)] {
             c.execute("INSERT INTO moments (id, project_id, start, \"end\", status) VALUES (?1, ?2, 0, 30, 'accepted')", params![mid, pid]).unwrap();
-            c.execute("INSERT INTO drafts (id, moment_id, part) VALUES (?1, ?1, ?1)", [mid]).unwrap();
+            c.execute(
+                "INSERT INTO drafts (id, moment_id, part) VALUES (?1, ?1, ?1)",
+                [mid],
+            )
+            .unwrap();
         }
         c
     }
@@ -528,7 +812,16 @@ mod tests {
     #[test]
     fn defaults_are_the_safe_choices() {
         let s = load_settings(&db());
-        assert_eq!((s.mode.as_str(), s.method.as_str(), s.privacy.as_str(), s.port, s.auto_publish), ("inbox", "api", "SELF_ONLY", DEFAULT_PORT, false));
+        assert_eq!(
+            (
+                s.mode.as_str(),
+                s.method.as_str(),
+                s.privacy.as_str(),
+                s.port,
+                s.auto_publish
+            ),
+            ("inbox", "api", "SELF_ONLY", DEFAULT_PORT, false)
+        );
         assert_eq!(s.client_key, "");
     }
 
@@ -541,12 +834,24 @@ mod tests {
         kv_set(&c, K_PORT, "40001").unwrap();
         kv_set(&c, K_AUTO, "1").unwrap();
         let s = load_settings(&c);
-        assert_eq!((s.mode.as_str(), s.method.as_str(), s.privacy.as_str(), s.port, s.auto_publish), ("direct", "browser", "PUBLIC_TO_EVERYONE", 40001, true));
+        assert_eq!(
+            (
+                s.mode.as_str(),
+                s.method.as_str(),
+                s.privacy.as_str(),
+                s.port,
+                s.auto_publish
+            ),
+            ("direct", "browser", "PUBLIC_TO_EVERYONE", 40001, true)
+        );
         kv_set(&c, K_MODE, "что-то").unwrap();
         kv_set(&c, K_PRIVACY, "ALL").unwrap();
         kv_set(&c, K_PORT, "не число").unwrap();
         let s = load_settings(&c);
-        assert_eq!((s.mode.as_str(), s.privacy.as_str(), s.port), ("inbox", "SELF_ONLY", DEFAULT_PORT));
+        assert_eq!(
+            (s.mode.as_str(), s.privacy.as_str(), s.port),
+            ("inbox", "SELF_ONLY", DEFAULT_PORT)
+        );
     }
 
     #[test]
@@ -555,13 +860,30 @@ mod tests {
         let first = begin_post(&c, 1, "api", "inbox").unwrap();
         finish_post(&c, first, &Err("сеть".into()));
         let second = begin_post(&c, 1, "api", "inbox").unwrap();
-        finish_post(&c, second, &Ok(("в черновиках".into(), Some("v_inbox~1".into()))));
+        finish_post(
+            &c,
+            second,
+            &Ok(("в черновиках".into(), Some("v_inbox~1".into()))),
+        );
         begin_post(&c, 2, "api", "direct").unwrap();
         begin_post(&c, 3, "api", "inbox").unwrap(); // другой проект
 
         let posts = latest_posts(&c, 1).unwrap();
-        assert_eq!(posts.iter().map(|p| (p.draft_id, p.status.as_str())).collect::<Vec<_>>(), vec![(1, "done"), (2, "uploading")]);
-        assert_eq!((posts[0].id, posts[0].detail.as_str(), posts[0].error.as_deref()), (second, "в черновиках", None));
+        assert_eq!(
+            posts
+                .iter()
+                .map(|p| (p.draft_id, p.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "done"), (2, "uploading")]
+        );
+        assert_eq!(
+            (
+                posts[0].id,
+                posts[0].detail.as_str(),
+                posts[0].error.as_deref()
+            ),
+            (second, "в черновиках", None)
+        );
         let p3 = latest_posts(&c, 2).unwrap();
         assert_eq!(p3.len(), 1);
         assert_eq!(p3[0].draft_id, 3);
@@ -573,7 +895,10 @@ mod tests {
         let id = begin_post(&c, 1, "api", "inbox").unwrap();
         finish_post(&c, id, &Err("TikTok просит подождать".into()));
         let p = &latest_posts(&c, 1).unwrap()[0];
-        assert_eq!((p.status.as_str(), p.error.as_deref()), ("failed", Some("TikTok просит подождать")));
+        assert_eq!(
+            (p.status.as_str(), p.error.as_deref()),
+            ("failed", Some("TikTok просит подождать"))
+        );
         finish_post(&c, id, &Ok(("готово".into(), None)));
         let p = &latest_posts(&c, 1).unwrap()[0];
         assert_eq!((p.status.as_str(), p.error.as_deref()), ("done", None));
@@ -589,8 +914,16 @@ mod tests {
         let posts = latest_posts(&c, 1).unwrap();
         let pa = posts.iter().find(|p| p.id == a).unwrap();
         assert_eq!(pa.status, "failed");
-        assert!(pa.error.as_deref().unwrap().contains("Проверь, не появился ли"));
-        assert_eq!(posts.iter().find(|p| p.id == b).unwrap().status, "done", "завершённые не трогаем");
+        assert!(pa
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Проверь, не появился ли"));
+        assert_eq!(
+            posts.iter().find(|p| p.id == b).unwrap().status,
+            "done",
+            "завершённые не трогаем"
+        );
     }
 
     #[test]
@@ -598,14 +931,31 @@ mod tests {
         let c = db();
         begin_post(&c, 1, "api", "inbox").unwrap();
         c.execute("DELETE FROM drafts WHERE id = 1", []).unwrap();
-        assert_eq!(c.query_row::<i64, _, _>("SELECT count(*) FROM posts", [], |r| r.get(0)).unwrap(), 0);
+        assert_eq!(
+            c.query_row::<i64, _, _>("SELECT count(*) FROM publication_attempts", [], |r| r
+                .get(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
     fn outcome_texts_tell_the_user_what_to_do_next() {
-        let o = |s: &str, ids: Vec<i64>| Outcome { publish_id: "p".into(), status: s.into(), post_ids: ids };
-        assert!(outcome_text(Mode::Inbox, &o("SEND_TO_USER_INBOX", vec![])).contains("вставь подпись"));
-        assert_eq!(outcome_text(Mode::Direct, &o("PUBLISH_COMPLETE", vec![5, 6])), "Опубликовано (id 5, 6)");
-        assert_eq!(outcome_text(Mode::Direct, &o("PUBLISH_COMPLETE", vec![])), "Опубликовано");
+        let o = |s: &str, ids: Vec<i64>| Outcome {
+            publish_id: "p".into(),
+            status: s.into(),
+            post_ids: ids,
+        };
+        assert!(
+            outcome_text(Mode::Inbox, &o("SEND_TO_USER_INBOX", vec![])).contains("вставь подпись")
+        );
+        assert_eq!(
+            outcome_text(Mode::Direct, &o("PUBLISH_COMPLETE", vec![5, 6])),
+            "Опубликовано (id 5, 6)"
+        );
+        assert_eq!(
+            outcome_text(Mode::Direct, &o("PUBLISH_COMPLETE", vec![])),
+            "Опубликовано"
+        );
     }
 }

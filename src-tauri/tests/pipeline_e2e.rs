@@ -41,7 +41,10 @@ const SENTENCES: &[&str] = &[
 ];
 
 fn run(cmd: &str, args: &[&str]) {
-    let st = Command::new(cmd).args(args).status().unwrap_or_else(|e| panic!("{cmd}: {e}"));
+    let st = Command::new(cmd)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| panic!("{cmd}: {e}"));
     assert!(st.success(), "{cmd} {args:?}");
 }
 
@@ -50,7 +53,18 @@ fn make_video() -> (PathBuf, f64) {
     let tmp: PathBuf = std::env::temp_dir().join(format!("avto-pipe-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let (speech, video) = (tmp.join("speech.wav"), tmp.join("video.mp4"));
-    run("espeak-ng", &["-v", "ru", "-s", "150", "-w", speech.to_str().unwrap(), &SENTENCES.join(" ")]);
+    run(
+        "espeak-ng",
+        &[
+            "-v",
+            "ru",
+            "-s",
+            "150",
+            "-w",
+            speech.to_str().unwrap(),
+            &SENTENCES.join(" "),
+        ],
+    );
     // громкий всплеск на 60-й секунде: розовый шум 1.5 с поверх речи
     run("ffmpeg", &[
         "-y", "-v", "error", "-i", speech.to_str().unwrap(),
@@ -60,7 +74,18 @@ fn make_video() -> (PathBuf, f64) {
         "-map", "2:v", "-map", "[a]", "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac",
         video.to_str().unwrap(),
     ]);
-    let out = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"]).arg(&video).output().unwrap();
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&video)
+        .output()
+        .unwrap();
     let duration: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
     eprintln!("видео {duration:.0} с");
     assert!(duration > 80.0, "речь вышла короче 80 с: {duration}");
@@ -72,10 +97,15 @@ fn make_video() -> (PathBuf, f64) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "медленный: настоящие модели, около 2.5 минут"]
 async fn full_pipeline_finds_the_loud_moment_and_names_it() {
-    let Some(dir) = ModelPaths::default_dir() else { return };
+    let Some(dir) = ModelPaths::default_dir() else {
+        return;
+    };
     let models = ModelPaths::in_dir(&dir);
     let missing = models.missing();
-    if !missing.is_empty() || find_worker().is_none() || Command::new("espeak-ng").arg("--version").output().is_err() {
+    if !missing.is_empty()
+        || find_worker().is_none()
+        || Command::new("espeak-ng").arg("--version").output().is_err()
+    {
         eprintln!("не хватает {missing:?}, llm-worker или espeak-ng — тест пропущен");
         return;
     }
@@ -85,16 +115,27 @@ async fn full_pipeline_finds_the_loud_moment_and_names_it() {
     let opt = Options {
         threads: 8,
         llm_top: 3,
-        params: Params { min_len: 20.0, max_len: 40.0, top_k: 3, ..Default::default() },
+        params: Params {
+            min_len: 20.0,
+            max_len: 40.0,
+            top_k: 3,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let started = Instant::now();
     let log: Arc<Mutex<Vec<(f64, Progress)>>> = Arc::default();
     let sink = log.clone();
-    let report: pipeline::Report = Arc::new(move |p| sink.lock().unwrap().push((started.elapsed().as_secs_f64(), p)));
+    let report: pipeline::Report = Arc::new(move |p| {
+        sink.lock()
+            .unwrap()
+            .push((started.elapsed().as_secs_f64(), p))
+    });
     let (_tx, rx) = tokio::sync::watch::channel(false);
 
-    let a = pipeline::run(&video, duration, true, &models, &opt, rx, report).await.expect("конвейер упал");
+    let a = pipeline::run(&video, duration, true, &models, &opt, rx, report)
+        .await
+        .expect("конвейер упал");
     eprintln!("всего {:.0} с", started.elapsed().as_secs_f64());
 
     // время начала каждого этапа
@@ -107,22 +148,108 @@ async fn full_pipeline_finds_the_loud_moment_and_names_it() {
     }
     eprintln!("заметки: {:?}", a.notes);
     for m in &a.moments {
-        eprintln!("  {:.1}–{:.1} счёт {:.2} (сигн. {:.2}, LLM {:.2}) баннер {:.1} «{}» {:?}", m.start, m.end, m.score, m.signal_score, m.llm_score, m.climax, m.title, m.hashtags);
+        eprintln!(
+            "  {:.1}–{:.1} счёт {:.2} (сигн. {:.2}, LLM {:.2}) баннер {:.1} «{}» {:?}",
+            m.start, m.end, m.score, m.signal_score, m.llm_score, m.climax, m.title, m.hashtags
+        );
     }
 
     assert!(a.notes.is_empty(), "что-то пропущено: {:?}", a.notes);
     assert!(a.words.len() > 100, "распознано слов: {}", a.words.len());
-    assert!((1..=3).contains(&a.moments.len()), "моментов: {}", a.moments.len());
+    assert!(
+        (1..=3).contains(&a.moments.len()),
+        "моментов: {}",
+        a.moments.len()
+    );
     for m in &a.moments {
-        assert!(m.start >= 0.0 && m.end <= duration + 0.5 && m.end - m.start >= 19.0 && m.end - m.start <= 41.0, "{m:?}");
-        assert!(m.climax > m.start && m.climax < m.end, "баннер вне момента: {m:?}");
-        assert!(!m.title.is_empty() && m.llm_score > 0.0, "нет оценки LLM: {m:?}");
+        assert!(
+            m.start >= 0.0
+                && m.end <= duration + 0.5
+                && m.end - m.start >= 19.0
+                && m.end - m.start <= 41.0,
+            "{m:?}"
+        );
+        assert!(
+            m.climax > m.start && m.climax < m.end,
+            "баннер вне момента: {m:?}"
+        );
+        assert!(
+            !m.title.is_empty() && m.llm_score > 0.0,
+            "нет оценки LLM: {m:?}"
+        );
         assert!(!m.transcript.is_empty());
     }
-    assert!(a.moments.windows(2).all(|w| w[0].score >= w[1].score), "не по убыванию оценки");
+    assert!(
+        a.moments.windows(2).all(|w| w[0].score >= w[1].score),
+        "не по убыванию оценки"
+    );
     // момент со всплеском (59.5–61.5 с) должен попасть в выдачу
-    assert!(a.moments.iter().any(|m| m.start <= 60.0 && m.end >= 61.0), "момент со всплеском не найден");
+    assert!(
+        a.moments.iter().any(|m| m.start <= 60.0 && m.end >= 61.0),
+        "момент со всплеском не найден"
+    );
     // кривая громкости видит всплеск
     let i = (60.5 / 0.5) as usize;
-    assert!(a.signals.loudness[i] > 2.0, "всплеск не виден в громкости: {}", a.signals.loudness[i]);
+    assert!(
+        a.signals.loudness[i] > 2.0,
+        "всплеск не виден в громкости: {}",
+        a.signals.loudness[i]
+    );
+}
+
+/// Проверяет настоящий ffmpeg/конвейер без моделей и без сетевых обращений.
+#[tokio::test]
+async fn fixed_seconds_runs_end_to_end_without_models_and_keeps_every_part() {
+    let tmp = std::env::temp_dir().join(format!("avto-fixed-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let video = tmp.join("fixed.mp4");
+    run(
+        "ffmpeg",
+        &[
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=160x90:r=10:d=29",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=16000:duration=29",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            video.to_str().unwrap(),
+        ],
+    );
+    let models = ModelPaths::in_dir(&tmp.join("no-models"));
+    let opt = Options {
+        fixed_seconds: Some(10.0),
+        use_events: false,
+        use_speech: false,
+        use_llm: false,
+        llm_top: 1,
+        params: Params {
+            top_k: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let result = pipeline::run(&video, 29.0, true, &models, &opt, rx, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    let bounds: Vec<_> = result.moments.iter().map(|m| (m.start, m.end)).collect();
+    assert_eq!(bounds, vec![(0.0, 10.0), (10.0, 20.0), (20.0, 29.0)]);
+    assert!(result
+        .moments
+        .iter()
+        .all(|m| m.climax >= m.start && m.climax <= m.end));
+    assert!(result.words.is_empty());
+    std::fs::remove_dir_all(tmp).unwrap();
 }

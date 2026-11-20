@@ -24,8 +24,8 @@ use llama_cpp_2::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, LlamaModel},
-    LlamaBackendDeviceType,
     sampling::LlamaSampler,
+    LlamaBackendDeviceType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,11 +69,18 @@ struct Settings {
 
 fn parse_args() -> Result<Settings> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let get = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let get = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     Ok(Settings {
         model: get("--model").context("нужен --model <файл.gguf>")?,
         threads: get("--threads").and_then(|v| v.parse().ok()).unwrap_or(8),
-        gpu_layers: get("--gpu-layers").and_then(|v| v.parse().ok()).unwrap_or(0),
+        gpu_layers: get("--gpu-layers")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         ctx: get("--ctx").and_then(|v| v.parse().ok()).unwrap_or(4096),
     })
 }
@@ -82,18 +89,33 @@ fn parse_args() -> Result<Settings> {
 /// иначе встроенная. Без выбора llama.cpp раскидал бы слои по обеим картам, и работало бы медленнее.
 fn pick_gpu() -> Option<(usize, String)> {
     let devices = list_llama_ggml_backend_devices();
-    if let Some(i) = std::env::var("AVTO_GPU_DEVICE").ok().and_then(|v| v.parse::<usize>().ok()) {
-        return devices.iter().find(|d| d.index == i).map(|d| (d.index, d.description.clone()));
+    if let Some(i) = std::env::var("AVTO_GPU_DEVICE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return devices
+            .iter()
+            .find(|d| d.index == i)
+            .map(|d| (d.index, d.description.clone()));
     }
     devices
         .iter()
         .filter(|d| d.device_type == LlamaBackendDeviceType::Gpu)
         .max_by_key(|d| d.memory_total)
-        .or_else(|| devices.iter().find(|d| d.device_type == LlamaBackendDeviceType::IntegratedGpu))
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|d| d.device_type == LlamaBackendDeviceType::IntegratedGpu)
+        })
         .map(|d| (d.index, d.description.clone()))
 }
 
-fn generate(backend: &LlamaBackend, model: &LlamaModel, s: &Settings, req: &Request) -> Result<(String, usize, usize)> {
+fn generate(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    s: &Settings,
+    req: &Request,
+) -> Result<(String, usize, usize)> {
     const N_BATCH: usize = 512;
     let vocab = model.vocab();
     let tokens = vocab.tokenize(req.prompt.as_bytes(), true, true);
@@ -101,7 +123,12 @@ fn generate(backend: &LlamaBackend, model: &LlamaModel, s: &Settings, req: &Requ
         bail!("пустой запрос");
     }
     if tokens.len() + req.max_tokens as usize > s.ctx as usize {
-        bail!("запрос не помещается в контекст: {} + {} > {}", tokens.len(), req.max_tokens, s.ctx);
+        bail!(
+            "запрос не помещается в контекст: {} + {} > {}",
+            tokens.len(),
+            req.max_tokens,
+            s.ctx
+        );
     }
 
     let params = LlamaContextParams::default()
@@ -109,14 +136,19 @@ fn generate(backend: &LlamaBackend, model: &LlamaModel, s: &Settings, req: &Requ
         .with_n_batch(N_BATCH as u32)
         .with_n_threads(s.threads)
         .with_n_threads_batch(s.threads);
-    let mut ctx = model.new_context(backend, params).context("не удалось создать контекст")?;
+    let mut ctx = model
+        .new_context(backend, params)
+        .context("не удалось создать контекст")?;
 
     // Запрос читается пачками; логиты нужны только для последнего токена.
     let mut batch = LlamaBatch::new(N_BATCH, 1);
     let last = tokens.len() - 1;
     for start in (0..tokens.len()).step_by(N_BATCH) {
         batch.clear();
-        for (i, t) in tokens[start..(start + N_BATCH).min(tokens.len())].iter().enumerate() {
+        for (i, t) in tokens[start..(start + N_BATCH).min(tokens.len())]
+            .iter()
+            .enumerate()
+        {
             let pos = start + i;
             batch.add(*t, pos as i32, &[0], pos == last)?;
         }
@@ -132,7 +164,11 @@ fn generate(backend: &LlamaBackend, model: &LlamaModel, s: &Settings, req: &Requ
         chain.push(LlamaSampler::penalties(model.n_vocab(), 256, p, 0.0, 0.0));
     }
     if req.temperature > 0.0 {
-        chain.extend([LlamaSampler::top_k(20), LlamaSampler::temp(req.temperature), LlamaSampler::dist(req.seed.unwrap_or(1234))]);
+        chain.extend([
+            LlamaSampler::top_k(20),
+            LlamaSampler::temp(req.temperature),
+            LlamaSampler::dist(req.seed.unwrap_or(1234)),
+        ]);
     } else {
         chain.push(LlamaSampler::greedy());
     }
@@ -156,7 +192,11 @@ fn generate(backend: &LlamaBackend, model: &LlamaModel, s: &Settings, req: &Requ
         idx = 0;
         ctx.decode(&mut batch).context("ошибка генерации")?;
     }
-    Ok((String::from_utf8_lossy(&out).into_owned(), tokens.len(), generated))
+    Ok((
+        String::from_utf8_lossy(&out).into_owned(),
+        tokens.len(),
+        generated,
+    ))
 }
 
 fn main() -> Result<()> {
@@ -173,8 +213,13 @@ fn main() -> Result<()> {
     if s.gpu_layers > 0 {
         match pick_gpu() {
             Some((index, name)) => {
-                eprintln!("llm-worker: видеокарта {name} (устройство {index}), слоёв на ней: {}", s.gpu_layers);
-                params = params.with_devices(&[index]).context("не удалось выбрать видеокарту")?;
+                eprintln!(
+                    "llm-worker: видеокарта {name} (устройство {index}), слоёв на ней: {}",
+                    s.gpu_layers
+                );
+                params = params
+                    .with_devices(&[index])
+                    .context("не удалось выбрать видеокарту")?;
             }
             None => eprintln!("llm-worker: видеокарт нет, модель работает на процессоре"),
         }
@@ -200,9 +245,16 @@ fn main() -> Result<()> {
                     generated: Some(generated),
                     ..Default::default()
                 },
-                Err(e) => Response { id: req.id, error: Some(format!("{e:#}")), ..Default::default() },
+                Err(e) => Response {
+                    id: req.id,
+                    error: Some(format!("{e:#}")),
+                    ..Default::default()
+                },
             },
-            Err(e) => Response { error: Some(format!("неверный запрос: {e}")), ..Default::default() },
+            Err(e) => Response {
+                error: Some(format!("неверный запрос: {e}")),
+                ..Default::default()
+            },
         };
         writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
         stdout.flush()?;

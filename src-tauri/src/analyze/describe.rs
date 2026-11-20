@@ -13,9 +13,11 @@ use super::llm::{LlmClient, Sampling, MAX_TRANSCRIPT_CHARS};
 use crate::tiktok::api::{len_utf16, make_caption};
 
 /// Окно длины: подпись вместе с хэштегами, в единицах UTF-16.
+// Старый генератор описаний оставлен для совместимости тестовых данных.
+// Рабочая фабрика генерирует только теги; минимальной длины подписи нет.
 pub const MIN_LEN: usize = 3990;
-pub const MAX_LEN: usize = 3999;
-pub const MAX_TAGS: usize = 5;
+pub const MAX_LEN: usize = crate::caption::TIKTOK_MAX;
+pub const MAX_TAGS: usize = crate::caption::TIKTOK_TAGS;
 
 const MIN_SENTENCE: usize = 12;
 const MAX_SENTENCE: usize = 300;
@@ -60,7 +62,11 @@ pub fn clean(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut space = true;
     for c in raw.chars() {
-        let c = if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c };
+        let c = if matches!(c, '\n' | '\r' | '\t') {
+            ' '
+        } else {
+            c
+        };
         if !allowed(c) {
             continue;
         }
@@ -83,7 +89,11 @@ fn finalize(s: &str) -> Option<String> {
     let core = s.trim_end_matches(terminal).trim_end();
     let run = &s[core.len()..].trim_start();
     let first = run.chars().next()?;
-    let mark = if run.contains('…') || run.chars().filter(|c| *c == '.').count() >= 3 { '…' } else { first };
+    let mark = if run.contains('…') || run.chars().filter(|c| *c == '.').count() >= 3 {
+        '…'
+    } else {
+        first
+    };
     let n = len_utf16(core);
     if n + 1 < MIN_SENTENCE || n + 1 > MAX_SENTENCE || !core.chars().any(char::is_alphabetic) {
         return None;
@@ -127,13 +137,26 @@ pub fn parse_tags(raw: &str) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for w in &words {
-        let w: String = w.trim().trim_start_matches('#').chars().filter(|c| c.is_alphanumeric()).collect();
-        let cyr = w.chars().any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'));
+        let w: String = w
+            .trim()
+            .trim_start_matches('#')
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        let cyr = w
+            .chars()
+            .any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'));
         let lat = w.chars().any(|c| c.is_ascii_alphabetic());
         let lower = w.to_lowercase();
         // «#котнаплите» и «#котнаплитечайник» — один тег с хвостом: второй не нужен
-        let variant = kept.iter().any(|k| lower.starts_with(k.as_str()) || k.starts_with(&lower));
-        if (3..=24).contains(&w.chars().count()) && w.chars().all(allowed) && !(cyr && lat) && !variant {
+        let variant = kept
+            .iter()
+            .any(|k| lower.starts_with(k.as_str()) || k.starts_with(&lower));
+        if (3..=24).contains(&w.chars().count())
+            && w.chars().all(allowed)
+            && !(cyr && lat)
+            && !variant
+        {
             kept.push(lower);
             out.push(format!("#{w}"));
         }
@@ -203,7 +226,12 @@ fn combinations(n: usize, k: usize, cap: usize) -> Vec<Vec<usize>> {
 
 /// Какие предложения (кроме первого и последнего) убрать, чтобы оставшаяся стоимость попала в `[exact_lo - tune, hi]`.
 /// Убираем как можно меньше предложений и предпочитаем попадание без «растяжки». `None` — не выходит.
-fn choose_drops(costs: &[usize], exact_lo: i64, tune: i64, hi: i64) -> Option<Vec<usize>> {
+pub(crate) fn choose_drops(
+    costs: &[usize],
+    exact_lo: i64,
+    tune: i64,
+    hi: i64,
+) -> Option<Vec<usize>> {
     let total: usize = costs.iter().sum();
     let d_min = (total as i64 - hi).max(0) as usize;
     let d_max_i = total as i64 - (exact_lo - tune);
@@ -214,7 +242,11 @@ fn choose_drops(costs: &[usize], exact_lo: i64, tune: i64, hi: i64) -> Option<Ve
     if d_max < d_min {
         return None;
     }
-    let items: Vec<usize> = if costs.len() > 2 { (1..costs.len() - 1).collect() } else { vec![] };
+    let items: Vec<usize> = if costs.len() > 2 {
+        (1..costs.len() - 1).collect()
+    } else {
+        vec![]
+    };
     const INF: u16 = u16::MAX;
     let mut dp = vec![INF; d_max + 1];
     dp[0] = 0;
@@ -272,7 +304,12 @@ fn inflate(sentences: &mut [String], mut need: usize) -> Option<()> {
 /// какой её соберёт [`make_caption`], заняла [`MIN_LEN`]..=[`MAX_LEN`]. Предложения идут в исходном порядке,
 /// первое и последнее остаются всегда, секции — абзацы. Берётся до [`MAX_TAGS`] хэштегов.
 pub fn fit_description(sections: &[Vec<String>], tags: &[String]) -> Result<Description, FitError> {
-    let flat: Vec<(usize, &String)> = sections.iter().enumerate().flat_map(|(si, v)| v.iter().map(move |s| (si, s))).take(POOL_CAP).collect();
+    let flat: Vec<(usize, &String)> = sections
+        .iter()
+        .enumerate()
+        .flat_map(|(si, v)| v.iter().map(move |s| (si, s)))
+        .take(POOL_CAP)
+        .collect();
     // каждое предложение стоит свою длину и один разделитель; ещё один разделитель стоит перед хэштегами
     let costs: Vec<usize> = flat.iter().map(|(_, s)| len_utf16(s) + 1).collect();
     let total: usize = costs.iter().sum();
@@ -288,11 +325,24 @@ pub fn fit_description(sections: &[Vec<String>], tags: &[String]) -> Result<Desc
     for k in (1..=tags.len().min(MAX_TAGS)).rev() {
         for pick in combinations(tags.len(), k, 60) {
             let chosen: Vec<String> = pick.iter().map(|&i| tags[i].clone()).collect();
-            let tags_len: usize = chosen.iter().map(|t| len_utf16(t)).sum::<usize>() + chosen.len() - 1;
+            let tags_len: usize =
+                chosen.iter().map(|t| len_utf16(t)).sum::<usize>() + chosen.len() - 1;
             longest_possible = longest_possible.max(total + tags_len);
             for tune in [0, TUNE] {
-                let Some(dropped) = choose_drops(&costs, MIN_LEN as i64 - tags_len as i64, tune, MAX_LEN as i64 - tags_len as i64) else { continue };
-                let mut kept: Vec<(usize, String)> = flat.iter().enumerate().filter(|(i, _)| !dropped.contains(i)).map(|(_, (si, s))| (*si, (*s).clone())).collect();
+                let Some(dropped) = choose_drops(
+                    &costs,
+                    MIN_LEN as i64 - tags_len as i64,
+                    tune,
+                    MAX_LEN as i64 - tags_len as i64,
+                ) else {
+                    continue;
+                };
+                let mut kept: Vec<(usize, String)> = flat
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !dropped.contains(i))
+                    .map(|(_, (si, s))| (*si, (*s).clone()))
+                    .collect();
                 let render = |kept: &[(usize, String)]| {
                     let mut body = String::new();
                     for (n, (si, s)) in kept.iter().enumerate() {
@@ -315,13 +365,19 @@ pub fn fit_description(sections: &[Vec<String>], tags: &[String]) -> Result<Desc
                     len = len_utf16(&make_caption(&render(&kept), &chosen, usize::MAX));
                 }
                 if (MIN_LEN..=MAX_LEN).contains(&len) {
-                    return Ok(Description { caption: render(&kept), hashtags: chosen, len });
+                    return Ok(Description {
+                        caption: render(&kept),
+                        hashtags: chosen,
+                        len,
+                    });
                 }
             }
         }
     }
     if longest_possible + TUNE as usize * 2 < MIN_LEN {
-        Err(FitError::TooShort { have: longest_possible })
+        Err(FitError::TooShort {
+            have: longest_possible,
+        })
     } else {
         Err(FitError::NoFit)
     }
@@ -330,8 +386,18 @@ pub fn fit_description(sections: &[Vec<String>], tags: &[String]) -> Result<Desc
 // ---------------------------------------------------------------- сходство текстов
 
 fn trigrams(text: &str) -> std::collections::HashSet<(String, String, String)> {
-    let words: Vec<String> = text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()).filter(|w| !w.is_empty()).collect();
-    words.windows(3).map(|w| (w[0].clone(), w[1].clone(), w[2].clone())).collect()
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(3)
+        .map(|w| (w[0].clone(), w[1].clone(), w[2].clone()))
+        .collect()
 }
 
 /// Сходство двух текстов по словесным триграммам, 0..1. Больше половины — ролики получили почти одно и то же описание.
@@ -356,9 +422,16 @@ fn clip(text: &str, limit: usize) -> String {
 fn about(title: &str, transcript: &str) -> String {
     let t = transcript.trim();
     if t.is_empty() {
-        format!("Видео называется «{}». Расшифровки речи нет, опирайся на название.", title.trim())
+        format!(
+            "Видео называется «{}». Расшифровки речи нет, опирайся на название.",
+            title.trim()
+        )
     } else {
-        format!("Видео называется «{}». Расшифровка речи:\n{}", title.trim(), clip(t, MAX_TRANSCRIPT_CHARS))
+        format!(
+            "Видео называется «{}». Расшифровка речи:\n{}",
+            title.trim(),
+            clip(t, MAX_TRANSCRIPT_CHARS)
+        )
     }
 }
 
@@ -370,7 +443,14 @@ pub fn section_prompt(title: &str, transcript: &str, instruction: &str, written:
     );
     let w = written.trim();
     if !w.is_empty() {
-        let tail: String = w.chars().rev().take(500).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = w
+            .chars()
+            .rev()
+            .take(500)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         user.push_str(&format!("\n\nУже написано (не повторяй): …{tail}"));
     }
     chat("Ты автор описаний к коротким видео в TikTok. Пишешь по-русски, грамотно, живо и по делу, без эмодзи и хэштегов. Опираешься только на то, что есть в расшифровке и названии, ничего не выдумываешь. Если пол героя неизвестен, пишешь «герой» или «человек». Предложения простые и законченные, слова согласованы. Отвечай только текстом описания.", &user)
@@ -387,14 +467,35 @@ pub fn tags_prompt(title: &str, transcript: &str) -> String {
 }
 
 fn creative(seed: u32) -> Sampling {
-    Sampling { temperature: 0.55, seed: Some(seed), repeat_penalty: Some(1.12) }
+    Sampling {
+        temperature: 0.55,
+        seed: Some(seed),
+        repeat_penalty: Some(1.12),
+    }
 }
 
 /// Пишет описание для одного ролика. `seed` разный у разных роликов и попыток: так тексты не совпадают.
 /// `on` получает короткие сообщения о ходе работы.
-pub async fn describe(client: &mut LlmClient, title: &str, transcript: &str, seed: u32, on: &mut (dyn FnMut(&str) + Send)) -> anyhow::Result<Description> {
+pub async fn describe(
+    client: &mut LlmClient,
+    title: &str,
+    transcript: &str,
+    seed: u32,
+    on: &mut (dyn FnMut(&str) + Send),
+) -> anyhow::Result<Description> {
     on("Подбираю хэштеги");
-    let tags_raw = client.complete_with(&tags_prompt(title, transcript), TAGS_GRAMMAR, 120, Sampling { temperature: 0.5, seed: Some(seed), repeat_penalty: None }).await?;
+    let tags_raw = client
+        .complete_with(
+            &tags_prompt(title, transcript),
+            TAGS_GRAMMAR,
+            120,
+            Sampling {
+                temperature: 0.5,
+                seed: Some(seed),
+                repeat_penalty: None,
+            },
+        )
+        .await?;
     let tags = parse_tags(&tags_raw);
     if tags.len() < 3 {
         bail!("модель не придумала хэштеги: {}", clip(&tags_raw, 120));
@@ -406,14 +507,35 @@ pub async fn describe(client: &mut LlmClient, title: &str, transcript: &str, see
     let speech = speech_sentences(transcript);
     for round in 0..SECTIONS.len() + MAX_EXTRA {
         let (instruction, label) = match SECTIONS.get(round) {
-            Some(s) => (*s, format!("Пишу описание, часть {} из {}", round + 1, SECTIONS.len())),
-            None => (EXTRA, format!("Дописываю подробности ({})", round + 1 - SECTIONS.len())),
+            Some(s) => (
+                *s,
+                format!("Пишу описание, часть {} из {}", round + 1, SECTIONS.len()),
+            ),
+            None => (
+                EXTRA,
+                format!("Дописываю подробности ({})", round + 1 - SECTIONS.len()),
+            ),
         };
         on(&label);
-        let raw = client.complete_with(&section_prompt(title, transcript, instruction, &written), TEXT_GRAMMAR, SECTION_TOKENS, creative(seed.wrapping_add(round as u32 * 7 + 1))).await?;
+        let raw = client
+            .complete_with(
+                &section_prompt(title, transcript, instruction, &written),
+                TEXT_GRAMMAR,
+                SECTION_TOKENS,
+                creative(seed.wrapping_add(round as u32 * 7 + 1)),
+            )
+            .await?;
         let sentences = split_sentences(&clean(&raw));
         // повтор уже написанного пропускаем целиком
-        let fresh: Vec<String> = sentences.into_iter().filter(|s| !sections.iter().flatten().any(|o| o.to_lowercase() == s.to_lowercase())).collect();
+        let fresh: Vec<String> = sentences
+            .into_iter()
+            .filter(|s| {
+                !sections
+                    .iter()
+                    .flatten()
+                    .any(|o| o.to_lowercase() == s.to_lowercase())
+            })
+            .collect();
         if !fresh.is_empty() {
             written.push(' ');
             written.push_str(&fresh.join(" "));
@@ -438,8 +560,12 @@ pub async fn describe(client: &mut LlmClient, title: &str, transcript: &str, see
         }
     }
     match last_err {
-        FitError::TooShort { have } => Err(anyhow!("модель написала слишком мало текста ({have} символов), нужно {MIN_LEN}–{MAX_LEN}")),
-        FitError::NoFit => Err(anyhow!("не удалось уложить описание в {MIN_LEN}–{MAX_LEN} символов")),
+        FitError::TooShort { have } => Err(anyhow!(
+            "модель написала слишком мало текста ({have} символов), нужно {MIN_LEN}–{MAX_LEN}"
+        )),
+        FitError::NoFit => Err(anyhow!(
+            "не удалось уложить описание в {MIN_LEN}–{MAX_LEN} символов"
+        )),
     }
 }
 
@@ -451,7 +577,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self, lo: usize, hi: usize) -> usize {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             lo + ((self.0 >> 33) as usize) % (hi - lo + 1)
         }
     }
@@ -484,12 +613,17 @@ mod tests {
 
     fn tag_set(seed: u64) -> Vec<String> {
         let mut r = Lcg(seed);
-        (0..8).map(|i| format!("#тег{}{}", i, "а".repeat(r.next(2, 14)))).collect()
+        (0..8)
+            .map(|i| format!("#тег{}{}", i, "а".repeat(r.next(2, 14))))
+            .collect()
     }
 
     #[test]
     fn clean_drops_everything_outside_the_allowed_alphabet() {
-        assert_eq!(clean("Привет,\n\n мир!  #хэш 😀 «да» \"x\" ’y’"), "Привет, мир! хэш «да» x y");
+        assert_eq!(
+            clean("Привет,\n\n мир!  #хэш 😀 «да» \"x\" ’y’"),
+            "Привет, мир! хэш «да» x y"
+        );
         let c = clean("а😀б\u{200d}в");
         assert_eq!(c, "абв");
         assert!(clean("ёЁ—–…%()").chars().all(allowed));
@@ -498,31 +632,67 @@ mod tests {
     #[test]
     fn sentences_are_split_normalised_and_cut_off_tails_dropped() {
         let s = split_sentences("Первая фраза тут!!! Вторая фраза здесь... Третья фраза в 3.5 раза длиннее? Обрыв без знака");
-        assert_eq!(s, vec!["Первая фраза тут!", "Вторая фраза здесь…", "Третья фраза в 3.5 раза длиннее?"]);
-        assert!(split_sentences("Коротко. Ещё.").is_empty(), "слишком короткие не берём");
-        assert_eq!(split_sentences("Одна и та же фраза. Одна и та же фраза.").len(), 1, "повторы убираем");
+        assert_eq!(
+            s,
+            vec![
+                "Первая фраза тут!",
+                "Вторая фраза здесь…",
+                "Третья фраза в 3.5 раза длиннее?"
+            ]
+        );
+        assert!(
+            split_sentences("Коротко. Ещё.").is_empty(),
+            "слишком короткие не берём"
+        );
+        assert_eq!(
+            split_sentences("Одна и та же фраза. Одна и та же фраза.").len(),
+            1,
+            "повторы убираем"
+        );
     }
 
     #[test]
     fn tags_come_out_unique_hash_prefixed_and_one_alphabet_only() {
-        let t = parse_tags(r##"["#Юмор","юмор","смех шоу","пр","сериал_30","a b","тiktok","tiktok","кот_на_плите","котнаплитечайник"]"##);
+        let t = parse_tags(
+            r##"["#Юмор","юмор","смех шоу","пр","сериал_30","a b","тiktok","tiktok","кот_на_плите","котнаплитечайник"]"##,
+        );
         assert_eq!(t, vec!["#Юмор", "#смехшоу", "#сериал30", "#tiktok", "#котнаплите"], "подчёркивания и пробелы убраны, смесь алфавитов, повторы и варианты с хвостом отброшены");
         assert!(parse_tags("не json").is_empty());
     }
 
     #[test]
     fn speech_goes_in_as_clean_sentences_up_to_the_cap() {
-        let s = speech_sentences("Привет всем, это наш новый выпуск! А вот «цитата» — с эмодзи 😀 и #хэштегом. Да.");
-        assert_eq!(s, vec!["Привет всем, это наш новый выпуск!", "А вот «цитата» — с эмодзи и хэштегом."]);
+        let s = speech_sentences(
+            "Привет всем, это наш новый выпуск! А вот «цитата» — с эмодзи 😀 и #хэштегом. Да.",
+        );
+        assert_eq!(
+            s,
+            vec![
+                "Привет всем, это наш новый выпуск!",
+                "А вот «цитата» — с эмодзи и хэштегом."
+            ]
+        );
         let long = "Это ещё одна довольно длинная фраза из речи героя. ".repeat(80);
         let cut = speech_sentences(&long);
-        assert!(!cut.is_empty() && cut.iter().map(|x| len_utf16(x) + 1).sum::<usize>() <= SPEECH_CAP);
+        assert!(
+            !cut.is_empty() && cut.iter().map(|x| len_utf16(x) + 1).sum::<usize>() <= SPEECH_CAP
+        );
         assert!(speech_sentences("").is_empty());
     }
 
     #[test]
     fn combinations_are_complete_ordered_and_capped() {
-        assert_eq!(combinations(4, 2, 100), vec![vec![0, 1], vec![0, 2], vec![0, 3], vec![1, 2], vec![1, 3], vec![2, 3]]);
+        assert_eq!(
+            combinations(4, 2, 100),
+            vec![
+                vec![0, 1],
+                vec![0, 2],
+                vec![0, 3],
+                vec![1, 2],
+                vec![1, 3],
+                vec![2, 3]
+            ]
+        );
         assert_eq!(combinations(8, 5, 100).len(), 56);
         assert_eq!(combinations(8, 5, 10).len(), 10);
         assert!(combinations(2, 3, 10).is_empty());
@@ -533,20 +703,43 @@ mod tests {
         let mut inflated = 0;
         for seed in 0..300u64 {
             let sections = pool(seed, 4300 + (seed as usize % 7) * 400);
-            let d = fit_description(&sections, &tag_set(seed)).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+            let d = fit_description(&sections, &tag_set(seed))
+                .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
             let full = make_caption(&d.caption, &d.hashtags, usize::MAX);
             assert_eq!(len_utf16(&full), d.len, "seed {seed}");
-            assert!((MIN_LEN..=MAX_LEN).contains(&d.len), "seed {seed}: {}", d.len);
-            assert_eq!(full.chars().count(), d.len, "BMP: длина в символах и в UTF-16 совпадает");
-            assert!(d.hashtags.len() <= MAX_TAGS && !d.hashtags.is_empty(), "seed {seed}");
+            assert!(
+                (MIN_LEN..=MAX_LEN).contains(&d.len),
+                "seed {seed}: {}",
+                d.len
+            );
+            assert_eq!(
+                full.chars().count(),
+                d.len,
+                "BMP: длина в символах и в UTF-16 совпадает"
+            );
+            assert!(
+                d.hashtags.len() <= MAX_TAGS && !d.hashtags.is_empty(),
+                "seed {seed}"
+            );
             assert!(!d.caption.contains('#'), "хэштеги только в конце");
-            assert!(d.caption.chars().all(|c| allowed(c) || c == '\n' || c == '…' || c == '.'), "seed {seed}");
-            assert!(d.caption.starts_with(&sections[0][0]), "первое предложение остаётся");
+            assert!(
+                d.caption
+                    .chars()
+                    .all(|c| allowed(c) || c == '\n' || c == '…' || c == '.'),
+                "seed {seed}"
+            );
+            assert!(
+                d.caption.starts_with(&sections[0][0]),
+                "первое предложение остаётся"
+            );
             if d.caption.contains("...") || d.caption.contains("!!") || d.caption.contains("??") {
                 inflated += 1;
             }
         }
-        assert!(inflated <= 15, "подгонка растяжкой — запасной путь, а не обычный, но понадобилась в {inflated} из 300");
+        assert!(
+            inflated <= 15,
+            "подгонка растяжкой — запасной путь, а не обычный, но понадобилась в {inflated} из 300"
+        );
     }
 
     #[test]
@@ -554,7 +747,10 @@ mod tests {
         let core = |s: &str| s.trim_end_matches(['.', '!', '?', '…']).to_string();
         let sections = pool(7, 6000);
         let d = fit_description(&sections, &tag_set(7)).unwrap();
-        assert!(d.caption.contains(&core(sections[3].last().unwrap())), "итоговое предложение остаётся");
+        assert!(
+            d.caption.contains(&core(sections[3].last().unwrap())),
+            "итоговое предложение остаётся"
+        );
         // оставшиеся предложения идут в исходном порядке
         let (mut at, mut found) = (0, 0);
         for s in sections.iter().flatten() {
@@ -564,7 +760,10 @@ mod tests {
             }
         }
         assert!(found >= 20, "нашлось только {found} предложений по порядку");
-        assert!(found < sections.iter().map(Vec::len).sum::<usize>(), "пул больше окна: часть предложений убрана");
+        assert!(
+            found < sections.iter().map(Vec::len).sum::<usize>(),
+            "пул больше окна: часть предложений убрана"
+        );
     }
 
     #[test]
@@ -574,7 +773,10 @@ mod tests {
             Err(FitError::TooShort { have }) => assert!(have < MIN_LEN, "{have}"),
             other => panic!("{other:?}"),
         }
-        assert!(matches!(fit_description(&[vec!["Одна единственная фраза тут.".into()]], &tag_set(1)), Err(FitError::TooShort { .. })));
+        assert!(matches!(
+            fit_description(&[vec!["Одна единственная фраза тут.".into()]], &tag_set(1)),
+            Err(FitError::TooShort { .. })
+        ));
     }
 
     #[test]
@@ -582,14 +784,22 @@ mod tests {
         let tags: Vec<String> = (0..8).map(|i| format!("тег{i}аб")).collect();
         let d = fit_description(&pool(3, 5000), &tags).unwrap();
         assert!(d.hashtags.len() <= 5);
-        assert!(d.hashtags.iter().all(|t| t.starts_with('#') && !t[1..].contains('#')));
+        assert!(d
+            .hashtags
+            .iter()
+            .all(|t| t.starts_with('#') && !t[1..].contains('#')));
     }
 
     #[test]
     fn similarity_tells_copies_from_different_texts() {
         let a = "это длинное описание про то как герой пришёл домой и увидел сюрприз на столе";
         assert!(similarity(a, a) > 0.99);
-        assert!(similarity(a, "совсем другой текст про погоду в горах и про то как идёт дождь весь день") < 0.1);
+        assert!(
+            similarity(
+                a,
+                "совсем другой текст про погоду в горах и про то как идёт дождь весь день"
+            ) < 0.1
+        );
         assert_eq!(similarity("", a), 0.0);
         let near = "это длинное описание про то как герой пришёл домой и увидел подарок на столе";
         assert!(similarity(a, near) > 0.5);
@@ -601,10 +811,17 @@ mod tests {
         let p = section_prompt("Он не ожидал", &long, SECTIONS[0], "");
         assert!(p.starts_with("<|im_start|>system") && p.ends_with("<think>\n\n</think>\n\n"));
         assert!(p.contains("«Он не ожидал»"));
-        assert!(p.chars().count() < MAX_TRANSCRIPT_CHARS + 1200, "расшифровка обрезана до лимита");
+        assert!(
+            p.chars().count() < MAX_TRANSCRIPT_CHARS + 1200,
+            "расшифровка обрезана до лимита"
+        );
         assert!(!p.contains("Уже написано"));
         let p2 = section_prompt("t", "", SECTIONS[1], "Написанный ранее кусок.");
-        assert!(p2.contains("Расшифровки речи нет") && p2.contains("Уже написано") && p2.contains("Написанный ранее кусок."));
+        assert!(
+            p2.contains("Расшифровки речи нет")
+                && p2.contains("Уже написано")
+                && p2.contains("Написанный ранее кусок.")
+        );
         assert!(tags_prompt("т", "текст").contains("JSON-массив"));
     }
 
@@ -612,15 +829,29 @@ mod tests {
     fn the_text_grammar_alphabet_matches_what_clean_allows() {
         // сам разбор грамматики делает llama.cpp в воркере (проверяется тестом с настоящей моделью);
         // здесь убеждаемся, что алфавит грамматики и фильтр `clean` не разошлись
-        let class = TEXT_GRAMMAR.split('[').nth(1).unwrap().split(']').next().unwrap();
+        let class = TEXT_GRAMMAR
+            .split('[')
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap();
         for c in class.chars() {
-            assert!(allowed(c), "символ {c:?} есть в грамматике, но clean его не пропустит");
+            assert!(
+                allowed(c),
+                "символ {c:?} есть в грамматике, но clean его не пропустит"
+            );
         }
         for c in "яЯёЁzZ09 ,.!?:;()«»—–…%-".chars() {
             assert!(allowed(c));
         }
         assert!(!TEXT_GRAMMAR.contains('#') && !allowed('#') && !allowed('\n') && !allowed('😀'));
         assert!(TAGS_GRAMMAR.starts_with("root ::= \"[\""));
-        assert!(TAGS_GRAMMAR.contains("[а-яё]{3,20}") && !TAGS_GRAMMAR.contains("a-z") && !TAGS_GRAMMAR.contains('_'), "теги: одно русское слово, без латиницы и подчёркиваний");
+        assert!(
+            TAGS_GRAMMAR.contains("[а-яё]{3,20}")
+                && !TAGS_GRAMMAR.contains("a-z")
+                && !TAGS_GRAMMAR.contains('_'),
+            "теги: одно русское слово, без латиницы и подчёркиваний"
+        );
     }
 }

@@ -1,16 +1,28 @@
 use super::{Candidate, Sentence, Signals, HOP};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Weights {
     pub loudness: f32,
     pub motion: f32,
     pub events: f32,
     pub speech: f32,
+    pub chat: f32,
+    pub viewer_clips: f32,
+    pub camera: f32,
 }
 
 impl Default for Weights {
     fn default() -> Self {
-        Self { loudness: 0.35, motion: 0.15, events: 0.35, speech: 0.15 }
+        Self {
+            loudness: 0.35,
+            motion: 0.15,
+            events: 0.35,
+            speech: 0.15,
+            chat: 0.15,
+            viewer_clips: 0.2,
+            camera: 0.15,
+        }
     }
 }
 
@@ -28,22 +40,40 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { min_len: 20.0, max_len: 60.0, top_k: 30, max_overlap: 0.3, pad_start: 0.15, pad_end: 0.35 }
+        Self {
+            min_len: 20.0,
+            max_len: 60.0,
+            top_k: 30,
+            max_overlap: 0.3,
+            pad_start: 0.15,
+            pad_end: 0.35,
+        }
     }
 }
 
 /// Кривая интереса 0..1 по сетке `HOP`. Недостающие сигналы не штрафуют: веса пересчитываются.
 pub fn interest_curve(sig: &Signals, w: &Weights) -> Vec<f32> {
-    let n = [Some(sig.loudness.len()), Some(sig.motion.len()), sig.events.as_ref().map(Vec::len), sig.speech.as_ref().map(Vec::len)]
-        .into_iter()
-        .flatten()
-        .max()
-        .unwrap_or(0);
+    let n = [
+        Some(sig.loudness.len()),
+        Some(sig.motion.len()),
+        sig.events.as_ref().map(Vec::len),
+        sig.speech.as_ref().map(Vec::len),
+        sig.chat.as_ref().map(Vec::len),
+        sig.viewer_clips.as_ref().map(Vec::len),
+        sig.camera.as_ref().map(Vec::len),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0);
     let parts: Vec<(f32, &[f32])> = [
         (w.loudness, Some(sig.loudness.as_slice())),
         (w.motion, Some(sig.motion.as_slice())),
         (w.events, sig.events.as_deref()),
         (w.speech, sig.speech.as_deref()),
+        (w.chat, sig.chat.as_deref()),
+        (w.viewer_clips, sig.viewer_clips.as_deref()),
+        (w.camera, sig.camera.as_deref()),
     ]
     .into_iter()
     .filter_map(|(wt, v)| v.filter(|v| !v.is_empty() && wt > 0.0).map(|v| (wt, v)))
@@ -53,7 +83,13 @@ pub fn interest_curve(sig: &Signals, w: &Weights) -> Vec<f32> {
         return vec![0.0; n];
     }
     let raw: Vec<f32> = (0..n)
-        .map(|i| parts.iter().map(|(wt, v)| wt * v.get(i).copied().unwrap_or(0.0).clamp(0.0, 4.0) / 4.0).sum::<f32>() / total)
+        .map(|i| {
+            parts
+                .iter()
+                .map(|(wt, v)| wt * v.get(i).copied().unwrap_or(0.0).clamp(0.0, 4.0) / 4.0)
+                .sum::<f32>()
+                / total
+        })
         .collect();
     smooth(&raw, 1)
 }
@@ -78,11 +114,15 @@ fn slice(curve: &[f32], a: f64, b: f64) -> &[f32] {
 pub fn pick_climax(curve: &[f32], start: f64, end: f64) -> f64 {
     let len = end - start;
     let (lo, hi) = (start + 0.35 * len, start + 0.85 * len);
-    let sm = smooth(curve, 1);
+    let local = |i: usize| {
+        let a = i.saturating_sub(1);
+        let b = (i + 2).min(curve.len());
+        curve[a..b].iter().sum::<f32>() / (b - a).max(1) as f32
+    };
     let first = (lo / HOP).floor().max(0.0) as usize;
     let best = (first..(hi / HOP).ceil() as usize)
-        .filter(|&i| i < sm.len())
-        .max_by(|&a, &b| sm[a].total_cmp(&sm[b]));
+        .filter(|&i| i < curve.len())
+        .max_by(|&a, &b| local(a).total_cmp(&local(b)));
     match best {
         Some(i) => ((i as f64 + 0.5) * HOP).clamp(lo, hi),
         None => start + 0.6 * len,
@@ -114,7 +154,12 @@ pub fn candidates(sentences: &[Sentence], curve: &[f32], p: &Params) -> Vec<Cand
             if len >= p.min_len {
                 let start = (sents[i].start - p.pad_start).max(0.0);
                 let end = sents[j].end + p.pad_end;
-                out.push(Candidate { start, end, score: rate(curve, start, end), climax: pick_climax(curve, start, end) });
+                out.push(Candidate {
+                    start,
+                    end,
+                    score: rate(curve, start, end),
+                    climax: pick_climax(curve, start, end),
+                });
             }
         }
     }
@@ -132,7 +177,12 @@ fn snap_to(t: f64, quiet: &[f64], snap: f64) -> f64 {
 }
 
 /// Кандидаты для видео без речи (геймплей, музыка): скользящие окна, границы — в паузах.
-pub fn window_candidates(duration: f64, curve: &[f32], quiet: &[f64], p: &Params) -> Vec<Candidate> {
+pub fn window_candidates(
+    duration: f64,
+    curve: &[f32],
+    quiet: &[f64],
+    p: &Params,
+) -> Vec<Candidate> {
     let target = (p.min_len + p.max_len) / 2.0;
     let mut out = Vec::new();
     let mut t = 0.0;
@@ -140,11 +190,57 @@ pub fn window_candidates(duration: f64, curve: &[f32], quiet: &[f64], p: &Params
         let start = snap_to(t, quiet, 2.5).max(0.0);
         let end = snap_to((t + target).min(duration), quiet, 2.5).min(duration);
         if end - start >= p.min_len && end - start <= p.max_len {
-            out.push(Candidate { start, end, score: rate(curve, start, end), climax: pick_climax(curve, start, end) });
+            out.push(Candidate {
+                start,
+                end,
+                score: rate(curve, start, end),
+                climax: pick_climax(curve, start, end),
+            });
         }
         t += 5.0;
     }
     nms(out, p.max_overlap, p.top_k)
+}
+
+/// Фразы и fallback-окна остаются внутри распознанных областей.
+pub fn in_windows(
+    sentences: &[Sentence],
+    curve: &[f32],
+    quiet: &[f64],
+    p: &Params,
+    windows: &[super::scout::Window],
+) -> Vec<Candidate> {
+    let mut all = Vec::new();
+    for w in windows {
+        let s: Vec<_> = sentences
+            .iter()
+            .filter(|s| w.contains(s.start, s.end))
+            .cloned()
+            .collect();
+        let mut c = candidates(&s, curve, p);
+        for x in &mut c {
+            x.start = x.start.max(w.start);
+            x.end = x.end.min(w.end);
+        }
+        c.retain(|c| c.len() >= p.min_len);
+        if c.is_empty() {
+            let a = ((w.start / HOP).floor() as usize).min(curve.len());
+            let b = ((w.end / HOP).ceil() as usize).min(curve.len());
+            let q: Vec<_> = quiet
+                .iter()
+                .filter(|&&t| t >= w.start && t <= w.end)
+                .map(|t| t - w.start)
+                .collect();
+            c = window_candidates(w.len(), &curve[a..b.max(a)], &q, p);
+            for x in &mut c {
+                x.start += w.start;
+                x.end += w.start;
+                x.climax += w.start;
+            }
+        }
+        all.extend(c);
+    }
+    nms(super::scout::covered(all, windows), p.max_overlap, p.top_k)
 }
 
 /// Оставляет лучшие кандидаты, которые почти не пересекаются.
@@ -166,9 +262,74 @@ pub fn nms(mut c: Vec<Candidate>, max_overlap: f64, top_k: usize) -> Vec<Candida
     kept
 }
 
+/// Не более двух лучших моментов из одной пятиминутной области длинной записи.
+/// Сначала сортируем весь пул, затем применяем квоту: другие области не теряются из-за top-K.
+pub fn diverse(mut candidates: Vec<Candidate>, duration: f64, top_k: usize) -> Vec<Candidate> {
+    candidates.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.start.total_cmp(&b.start))
+    });
+    let mut counts = std::collections::HashMap::<i64, usize>::new();
+    candidates
+        .into_iter()
+        .filter(|c| {
+            if duration <= 600.0 {
+                return true;
+            }
+            let bucket = ((c.start + c.end) / 2.0 / 300.0).floor() as i64;
+            let count = counts.entry(bucket).or_default();
+            if *count >= 2 {
+                return false;
+            }
+            *count += 1;
+            true
+        })
+        .take(top_k)
+        .collect()
+}
+
+/// Убираем до четырёх секунд начальной тишины, сохраняя минимальную длину и запас перед речью.
+pub fn trim_silence(c: &mut Candidate, db: &[f32], min_len: f64) {
+    let limit = (c.start + 4.0).min(c.end - min_len);
+    if limit <= c.start {
+        return;
+    }
+    let mut t = c.start;
+    while t < limit {
+        let i = (t / HOP).floor() as usize;
+        if db.get(i).is_none_or(|v| *v >= -45.0) {
+            break;
+        }
+        t = (t + HOP).min(limit);
+    }
+    if t > c.start {
+        c.start = (t - 0.15).max(c.start);
+    }
+}
+
 /// Режим «по N секунд»: подряд идущие части, у которых границы прилипают к ближайшей паузе
 /// или концу фразы. Короткого хвоста не остаётся.
-pub fn fixed_grid(duration: f64, target: f64, min_tail: f64, boundaries: &[f64], snap: f64) -> Vec<(f64, f64)> {
+pub fn fixed_grid(
+    duration: f64,
+    target: f64,
+    min_tail: f64,
+    boundaries: &[f64],
+    snap: f64,
+) -> Vec<(f64, f64)> {
+    if !duration.is_finite() || duration <= 0.0 || !target.is_finite() || target <= 0.0 {
+        return Vec::new();
+    }
+    let min_tail = if min_tail.is_finite() {
+        min_tail.max(0.0).min(target)
+    } else {
+        0.0
+    };
+    let snap = if snap.is_finite() {
+        snap.max(0.0).min(target * 0.25)
+    } else {
+        0.0
+    };
     let mut parts = Vec::new();
     let mut start = 0.0;
     while duration - start > target + min_tail {
@@ -176,7 +337,12 @@ pub fn fixed_grid(duration: f64, target: f64, min_tail: f64, boundaries: &[f64],
         let end = boundaries
             .iter()
             .copied()
-            .filter(|b| (b - ideal).abs() <= snap && *b > start + target * 0.5)
+            .filter(|b| {
+                b.is_finite()
+                    && *b < duration
+                    && (b - ideal).abs() <= snap
+                    && *b > start + target * 0.5
+            })
             .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()))
             .unwrap_or(ideal);
         parts.push((start, end));
@@ -195,7 +361,14 @@ struct Cut {
 /// Режим «вплотную»: всё видео подряд, без пропусков, перекрытий и запаса по краям. Граница ставится
 /// в паузе между фразами, на смене сцены или в тихом месте; длина части лежит в `min_len..=max_len`.
 /// Видео короче `min_len` остаётся одной частью, а остаток меньше двух минимальных частей делится пополам.
-pub fn tight_split(duration: f64, sentences: &[Sentence], cuts: &[f64], quiet: &[f64], curve: &[f32], p: &Params) -> Vec<Candidate> {
+pub fn tight_split(
+    duration: f64,
+    sentences: &[Sentence],
+    cuts: &[f64],
+    quiet: &[f64],
+    curve: &[f32],
+    p: &Params,
+) -> Vec<Candidate> {
     let mut sents: Vec<&Sentence> = sentences.iter().collect();
     sents.sort_by(|a, b| a.start.total_cmp(&b.start));
     let inside = |t: f64| {
@@ -207,27 +380,45 @@ pub fn tight_split(duration: f64, sentences: &[Sentence], cuts: &[f64], quiet: &
         .windows(2)
         .map(|w| {
             let gap = (w[1].start - w[0].end).max(0.0);
-            Cut { t: w[0].end + gap / 2.0, quality: 1.0 + gap.min(1.5) / 3.0 }
+            Cut {
+                t: w[0].end + gap / 2.0,
+                quality: 1.0 + gap.min(1.5) / 3.0,
+            }
         })
         .collect();
-    points.extend(cuts.iter().map(|&t| Cut { t, quality: if inside(t) { 0.15 } else { 0.55 } }));
+    points.extend(cuts.iter().map(|&t| Cut {
+        t,
+        quality: if inside(t) { 0.15 } else { 0.55 },
+    }));
     // тишина внутри фразы не повод её резать: берём только тихие места вне речи
-    points.extend(quiet.iter().filter(|&&t| !inside(t)).map(|&t| Cut { t, quality: if sents.is_empty() { 0.4 } else { 0.3 } }));
+    points.extend(quiet.iter().filter(|&&t| !inside(t)).map(|&t| Cut {
+        t,
+        quality: if sents.is_empty() { 0.4 } else { 0.3 },
+    }));
     points.sort_by(|a, b| a.t.total_cmp(&b.t));
 
     let target = (p.min_len + p.max_len) / 2.0;
     let span = (p.max_len - p.min_len).max(1.0);
     // лучшая граница в [lo, hi]: качество минус штраф за удаление от желаемой точки `want`
     let best_in = |lo: f64, hi: f64, want: f64| {
-        let (a, b) = (points.partition_point(|c| c.t < lo), points.partition_point(|c| c.t <= hi));
+        let (a, b) = (
+            points.partition_point(|c| c.t < lo),
+            points.partition_point(|c| c.t <= hi),
+        );
         let fit = |c: &Cut| c.quality - 0.8 * (c.t - want).abs() / span;
-        points[a..b].iter().max_by(|x, y| fit(x).total_cmp(&fit(y))).map_or(want.clamp(lo, hi), |c| c.t)
+        points[a..b]
+            .iter()
+            .max_by(|x, y| fit(x).total_cmp(&fit(y)))
+            .map_or(want.clamp(lo, hi), |c| c.t)
     };
 
     let mut bounds = vec![0.0];
     let mut start = 0.0;
     while duration - start > p.max_len {
-        let (lo, hi) = (start + p.min_len, (start + p.max_len).min(duration - p.min_len));
+        let (lo, hi) = (
+            start + p.min_len,
+            (start + p.max_len).min(duration - p.min_len),
+        );
         let end = if hi >= lo {
             best_in(lo, hi, start + target)
         } else {
@@ -241,7 +432,12 @@ pub fn tight_split(duration: f64, sentences: &[Sentence], cuts: &[f64], quiet: &
 
     bounds
         .windows(2)
-        .map(|w| Candidate { start: w[0], end: w[1], score: rate(curve, w[0], w[1]), climax: pick_climax(curve, w[0], w[1]) })
+        .map(|w| Candidate {
+            start: w[0],
+            end: w[1],
+            score: rate(curve, w[0], w[1]),
+            climax: pick_climax(curve, w[0], w[1]),
+        })
         .collect()
 }
 
@@ -250,32 +446,127 @@ mod tests {
     use super::*;
 
     fn sentences(n: usize, each: f64) -> Vec<Sentence> {
-        (0..n).map(|i| Sentence { start: i as f64 * each, end: (i + 1) as f64 * each - 0.2, text: format!("фраза {i}") }).collect()
+        (0..n)
+            .map(|i| Sentence {
+                start: i as f64 * each,
+                end: (i + 1) as f64 * each - 0.2,
+                text: format!("фраза {i}"),
+            })
+            .collect()
     }
 
     /// Кривая, у которой пик в секундах `at`, остальное фон.
     fn curve_with_peak(secs: f64, at: f64) -> Vec<f32> {
-        (0..(secs / HOP) as usize).map(|i| if ((i as f64 + 0.5) * HOP - at).abs() < 2.0 { 1.0 } else { 0.05 }).collect()
+        (0..(secs / HOP) as usize)
+            .map(|i| {
+                if ((i as f64 + 0.5) * HOP - at).abs() < 2.0 {
+                    1.0
+                } else {
+                    0.05
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diversity_reserves_other_periods_and_silence_trim_is_bounded() {
+        let candidates = (0..10)
+            .map(|i| Candidate {
+                start: i as f64 * 40.0,
+                end: i as f64 * 40.0 + 30.0,
+                score: 1.0 - i as f64 / 20.0,
+                climax: i as f64 * 40.0 + 20.0,
+            })
+            .collect();
+        let out = diverse(candidates, 3600.0, 10);
+        assert!(out.len() < 10);
+        assert!(out.iter().any(|c| c.start >= 300.0));
+        let mut c = Candidate {
+            start: 0.0,
+            end: 30.0,
+            score: 1.0,
+            climax: 20.0,
+        };
+        let mut db = vec![-20.0; 60];
+        db[..6].fill(-90.0);
+        trim_silence(&mut c, &db, 20.0);
+        assert!((c.start - 2.85).abs() < 0.01);
+        assert_eq!(c.end, 30.0);
+    }
+
+    #[test]
+    fn fixed_grid_rejects_invalid_duration_and_target_and_ignores_bad_boundaries() {
+        for (d, t) in [
+            (0.0, 30.0),
+            (60.0, 0.0),
+            (f64::NAN, 30.0),
+            (60.0, f64::INFINITY),
+        ] {
+            assert!(fixed_grid(d, t, 5.0, &[], 2.5).is_empty());
+        }
+        assert_eq!(
+            fixed_grid(70.0, 30.0, 5.0, &[f64::NAN, f64::INFINITY, 999.0], 2.5),
+            vec![(0.0, 30.0), (30.0, 60.0), (60.0, 70.0)]
+        );
     }
 
     #[test]
     fn curve_is_normalised_and_peaks_where_the_signal_does() {
         let mut z = vec![0.0f32; 100];
         z[40] = 6.0;
-        let sig = Signals { loudness: z, motion: vec![0.0; 100], ..Default::default() };
+        let sig = Signals {
+            loudness: z,
+            motion: vec![0.0; 100],
+            ..Default::default()
+        };
         let c = interest_curve(&sig, &Weights::default());
         assert!(c.iter().all(|v| (0.0..=1.0).contains(v)));
-        let peak = c.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        let peak = c
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
         assert!((39..=41).contains(&peak), "{peak}");
     }
 
     #[test]
     fn missing_signals_do_not_drag_the_score_down() {
         let loud = vec![4.0f32; 10];
-        let only = Signals { loudness: loud.clone(), motion: vec![], ..Default::default() };
-        let all = Signals { loudness: loud, motion: vec![4.0; 10], events: Some(vec![4.0; 10]), speech: Some(vec![4.0; 10]), ..Default::default() };
-        let (a, b) = (interest_curve(&only, &Weights::default()), interest_curve(&all, &Weights::default()));
+        let only = Signals {
+            loudness: loud.clone(),
+            motion: vec![],
+            ..Default::default()
+        };
+        let all = Signals {
+            loudness: loud,
+            motion: vec![4.0; 10],
+            events: Some(vec![4.0; 10]),
+            speech: Some(vec![4.0; 10]),
+            ..Default::default()
+        };
+        let (a, b) = (
+            interest_curve(&only, &Weights::default()),
+            interest_curve(&all, &Weights::default()),
+        );
         assert!((a[5] - b[5]).abs() < 1e-5, "{} vs {}", a[5], b[5]);
+    }
+    #[test]
+    fn camera_activity_uses_its_own_weight_and_legacy_weights_keep_defaults() {
+        let mut camera = vec![0.0; 20];
+        camera[10] = 4.0;
+        let signals = Signals {
+            camera: Some(camera),
+            ..Default::default()
+        };
+        let weights: Weights = serde_json::from_str(r#"{"loudness":0.35}"#).unwrap();
+        assert!(weights.camera > 0.0);
+        assert!(interest_curve(&signals, &weights)[10] > 0.3);
+        let zero = Weights {
+            camera: 0.0,
+            ..weights
+        };
+        assert!(interest_curve(&signals, &zero).iter().all(|v| *v == 0.0));
     }
 
     #[test]
@@ -293,7 +584,9 @@ mod tests {
         let s = sentences(60, 5.0);
         let p = Params::default();
         for k in candidates(&s, &curve_with_peak(300.0, 150.0), &p) {
-            let on_start = s.iter().any(|x| (x.start - p.pad_start - k.start).abs() < 1e-9 || k.start == 0.0);
+            let on_start = s
+                .iter()
+                .any(|x| (x.start - p.pad_start - k.start).abs() < 1e-9 || k.start == 0.0);
             let on_end = s.iter().any(|x| (x.end + p.pad_end - k.end).abs() < 1e-9);
             assert!(on_start && on_end, "{k:?}");
         }
@@ -302,7 +595,10 @@ mod tests {
     #[test]
     fn selected_candidates_barely_overlap_and_top_k_is_respected() {
         let s = sentences(120, 5.0);
-        let p = Params { top_k: 5, ..Default::default() };
+        let p = Params {
+            top_k: 5,
+            ..Default::default()
+        };
         let c = candidates(&s, &curve_with_peak(600.0, 300.0), &p);
         assert_eq!(c.len(), 5);
         for (i, a) in c.iter().enumerate() {
@@ -344,7 +640,9 @@ mod tests {
         let c = window_candidates(300.0, &curve, &quiet, &Params::default());
         assert!(!c.is_empty());
         assert!(c[0].start <= 150.0 && 150.0 <= c[0].end, "{:?}", c[0]);
-        assert!(c.iter().all(|k| k.len() >= 20.0 && k.len() <= 60.0 && k.end <= 300.0));
+        assert!(c
+            .iter()
+            .all(|k| k.len() >= 20.0 && k.len() <= 60.0 && k.end <= 300.0));
         // границы прилипли к паузам
         assert!(quiet.iter().any(|q| (q - c[0].start).abs() < 1e-9));
     }
@@ -361,9 +659,22 @@ mod tests {
         assert!(!parts.is_empty());
         assert_eq!(parts.first().unwrap().start, 0.0);
         assert_eq!(parts.last().unwrap().end, duration);
-        assert!(parts.windows(2).all(|w| w[0].end == w[1].start), "зазор или перекрытие: {parts:?}");
-        assert!(parts.iter().all(|k| k.len() > 0.0 && k.len() <= p.max_len + 1e-9), "{parts:?}");
-        assert!(parts.iter().all(|k| k.climax >= k.start && k.climax <= k.end), "{parts:?}");
+        assert!(
+            parts.windows(2).all(|w| w[0].end == w[1].start),
+            "зазор или перекрытие: {parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|k| k.len() > 0.0 && k.len() <= p.max_len + 1e-9),
+            "{parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|k| k.climax >= k.start && k.climax <= k.end),
+            "{parts:?}"
+        );
     }
 
     #[test]
@@ -375,7 +686,10 @@ mod tests {
         assert!(parts.iter().all(|k| k.len() >= p.min_len), "{parts:?}");
         for k in &parts[..parts.len() - 1] {
             // граница — середина паузы между фразами, ни одна фраза не разрезана
-            assert!(s.iter().any(|x| (x.end + 0.1 - k.end).abs() < 1e-9), "{k:?}");
+            assert!(
+                s.iter().any(|x| (x.end + 0.1 - k.end).abs() < 1e-9),
+                "{k:?}"
+            );
         }
     }
 
@@ -383,9 +697,21 @@ mod tests {
     fn tight_split_prefers_a_long_pause_near_the_target() {
         // 40 с — обычная пауза 0.2 с, 45 с — пауза 1.5 с: длинная лучше, хотя и дальше от цели
         let s = vec![
-            Sentence { start: 0.0, end: 39.9, text: "а".into() },
-            Sentence { start: 40.1, end: 44.0, text: "б".into() },
-            Sentence { start: 45.5, end: 100.0, text: "в".into() },
+            Sentence {
+                start: 0.0,
+                end: 39.9,
+                text: "а".into(),
+            },
+            Sentence {
+                start: 40.1,
+                end: 44.0,
+                text: "б".into(),
+            },
+            Sentence {
+                start: 45.5,
+                end: 100.0,
+                text: "в".into(),
+            },
         ];
         let parts = tight_split(100.0, &s, &[], &[], &[], &Params::default());
         assert!((parts[0].end - 44.75).abs() < 1e-9, "{parts:?}");
@@ -394,8 +720,16 @@ mod tests {
     #[test]
     fn tight_split_avoids_scene_cuts_inside_a_phrase() {
         let s = vec![
-            Sentence { start: 0.0, end: 38.0, text: "а".into() },
-            Sentence { start: 40.0, end: 100.0, text: "б".into() },
+            Sentence {
+                start: 0.0,
+                end: 38.0,
+                text: "а".into(),
+            },
+            Sentence {
+                start: 40.0,
+                end: 100.0,
+                text: "б".into(),
+            },
         ];
         // смена сцены у самой цели (40,5 с), но на ней идёт фраза «б»; пауза 38–40 с лучше
         let parts = tight_split(100.0, &s, &[40.5], &[], &[], &Params::default());
@@ -410,7 +744,12 @@ mod tests {
         let quiet: Vec<f64> = (0..400).map(|i| i as f64 * 0.5 + 0.25).collect();
         let parts = tight_split(200.0, &[], &[], &quiet, &[], &p);
         assert_tight(&parts, 200.0, &p);
-        assert!(parts[..parts.len() - 1].iter().all(|k| quiet.contains(&k.end)), "{parts:?}");
+        assert!(
+            parts[..parts.len() - 1]
+                .iter()
+                .all(|k| quiet.contains(&k.end)),
+            "{parts:?}"
+        );
     }
 
     #[test]
@@ -429,7 +768,11 @@ mod tests {
         assert_eq!((short.len(), short[0].start, short[0].end), (1, 0.0, 15.0));
 
         // остаток 30 с при max_len 25 и min_len 20: двух частей по 20 не получится, делим пополам
-        let p = Params { min_len: 20.0, max_len: 25.0, ..Default::default() };
+        let p = Params {
+            min_len: 20.0,
+            max_len: 25.0,
+            ..Default::default()
+        };
         let halves = tight_split(30.0, &[], &[], &[], &[], &p);
         assert_tight(&halves, 30.0, &p);
         assert_eq!(halves.len(), 2);
@@ -441,11 +784,24 @@ mod tests {
         let p = Params::default();
         for tenths in (1..6000).step_by(7) {
             let d = tenths as f64 / 10.0;
-            let quiet: Vec<f64> = (0..(d / 0.5) as usize).filter(|i| i % 9 == 0).map(|i| i as f64 * 0.5 + 0.25).collect();
-            let parts = tight_split(d, &sentences((d / 5.0) as usize, 5.0), &[d / 3.0], &quiet, &[], &p);
+            let quiet: Vec<f64> = (0..(d / 0.5) as usize)
+                .filter(|i| i % 9 == 0)
+                .map(|i| i as f64 * 0.5 + 0.25)
+                .collect();
+            let parts = tight_split(
+                d,
+                &sentences((d / 5.0) as usize, 5.0),
+                &[d / 3.0],
+                &quiet,
+                &[],
+                &p,
+            );
             assert_tight(&parts, d, &p);
             // короткий хвост не остаётся: кроме видео короче min_len, все части не короче min_len
-            assert!(d < p.min_len || parts.iter().all(|k| k.len() >= p.min_len - 1e-9), "{d}: {parts:?}");
+            assert!(
+                d < p.min_len || parts.iter().all(|k| k.len() >= p.min_len - 1e-9),
+                "{d}: {parts:?}"
+            );
         }
     }
 }

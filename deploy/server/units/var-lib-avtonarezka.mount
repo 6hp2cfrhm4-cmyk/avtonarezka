@@ -1,0 +1,13 @@
+# Данные проекта лежат в образе ext4 фиксированного размера (потолок диска, правило G4).
+# Имя юнита обязано повторять путь монтирования, поэтому оно не avtonarezka-data.mount.
+[Unit]
+Description=Автонарезка: данные (образ диска с потолком размера)
+
+[Mount]
+What=/var/lib/avtonarezka.img
+Where=/var/lib/avtonarezka
+Type=ext4
+Options=loop,noatime,nodev,nosuid,noexec,nofail
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-//! Модели для анализа качаются сами: при запуске программы, если каких-то файлов на диске нет.
+//! Модели для анализа скачиваются только по явному запросу пользователя.
 //! Размер и SHA256 каждого файла заданы здесь. Загрузка идёт в `.part`-файл и докачивается, если прервалась.
 //! Файл получает своё имя, только когда его контрольная сумма совпала.
 
@@ -8,10 +8,10 @@ use std::{
     time::Duration,
 };
 
+use crate::host::{AppHandle, Emitter, Manager};
 use anyhow::{bail, Context};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
 use crate::state::AppState;
@@ -27,7 +27,8 @@ struct Model {
 static MODELS: [Model; 4] = [
     Model {
         rel: "whisper-large-v3-turbo-q5_0/ggml-large-v3-turbo-q5_0.bin",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+        url:
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
         size: 574_041_195,
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
     },
@@ -51,9 +52,58 @@ static MODELS: [Model; 4] = [
     },
 ];
 
+/// Необязательная модель реакции. Не входит в общий стартовый набор.
+/// OpenCV Zoo, MIT; SHA совпадает с oid официального Git LFS на закреплённом коммите.
+pub const FACE_REL: &str = "face-detection-yunet/face_detection_yunet_2023mar.onnx";
+static FACE_MODEL: Model = Model {
+    rel: FACE_REL,
+    url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/f12e12798e8314f7c074a6656816c048dcc95b7a/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+    size: 232_589,
+    sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+};
+pub fn face_ready(dir: &Path) -> bool {
+    std::fs::metadata(dir.join(FACE_REL)).is_ok_and(|m| m.len() == FACE_MODEL.size)
+}
+/// Только явная кнопка после согласия пользователя; остальные модели не скачиваются.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn face_model_download(app: AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    if face_ready(&state.models_dir()) || state.models_downloading.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    crate::host::spawn(async move {
+        let state = app.state::<AppState>();
+        let result = async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(30))
+                .build()?;
+            download(&app, &client, &state.models_dir(), &FACE_MODEL).await
+        }
+        .await;
+        state.models_downloading.store(false, Ordering::SeqCst);
+        match result {
+            Ok(()) => {
+                let _ = app.emit("models-done", ());
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "models-error",
+                    Failed {
+                        message: format!("YuNet: {e:#}"),
+                    },
+                );
+            }
+        }
+    });
+    true
+}
+
 /// Модели, которых нет на диске или которые лежат не целиком (по размеру).
 fn missing(dir: &Path) -> Vec<&'static Model> {
-    MODELS.iter().filter(|m| std::fs::metadata(dir.join(m.rel)).map_or(true, |md| md.len() != m.size)).collect()
+    MODELS
+        .iter()
+        .filter(|m| std::fs::metadata(dir.join(m.rel)).map_or(true, |md| md.len() != m.size))
+        .collect()
 }
 
 /// Все модели на месте.
@@ -82,15 +132,22 @@ pub fn start(app: &AppHandle) -> bool {
         return false;
     }
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::host::spawn(async move {
         let result = run(&app).await;
-        app.state::<AppState>().models_downloading.store(false, Ordering::SeqCst);
+        app.state::<AppState>()
+            .models_downloading
+            .store(false, Ordering::SeqCst);
         match result {
             Ok(()) => {
                 let _ = app.emit("models-done", ());
             }
             Err(e) => {
-                let _ = app.emit("models-error", Failed { message: format!("{e:#}") });
+                let _ = app.emit(
+                    "models-error",
+                    Failed {
+                        message: format!("{e:#}"),
+                    },
+                );
             }
         }
     });
@@ -99,14 +156,23 @@ pub fn start(app: &AppHandle) -> bool {
 
 async fn run(app: &AppHandle) -> anyhow::Result<()> {
     let dir = app.state::<AppState>().models_dir();
-    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build()?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()?;
     for m in missing(&dir) {
-        download(app, &client, &dir, m).await.with_context(|| format!("не скачалась модель {}", m.rel))?;
+        download(app, &client, &dir, m)
+            .await
+            .with_context(|| format!("не скачалась модель {}", m.rel))?;
     }
     Ok(())
 }
 
-async fn download(app: &AppHandle, client: &reqwest::Client, dir: &Path, m: &Model) -> anyhow::Result<()> {
+async fn download(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    dir: &Path,
+    m: &Model,
+) -> anyhow::Result<()> {
     let target = dir.join(m.rel);
     let part = PathBuf::from(format!("{}.part", target.display()));
     if let Some(parent) = target.parent() {
@@ -129,7 +195,10 @@ async fn download(app: &AppHandle, client: &reqwest::Client, dir: &Path, m: &Mod
             have = 0;
         }
         let mut file = if resumed {
-            tokio::fs::OpenOptions::new().append(true).open(&part).await?
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&part)
+                .await?
         } else {
             tokio::fs::File::create(&part).await?
         };
@@ -146,7 +215,14 @@ async fn download(app: &AppHandle, client: &reqwest::Client, dir: &Path, m: &Mod
             // событие не чаще чем раз в 4 МБ, иначе интерфейс захлебнётся
             if received - reported >= 4 << 20 || received == m.size {
                 reported = received;
-                let _ = app.emit("models-progress", Progress { name: m.rel, received, total: m.size });
+                let _ = app.emit(
+                    "models-progress",
+                    Progress {
+                        name: m.rel,
+                        received,
+                        total: m.size,
+                    },
+                );
             }
         }
         file.flush().await?;
@@ -178,7 +254,7 @@ async fn download(app: &AppHandle, client: &reqwest::Client, dir: &Path, m: &Mod
 }
 
 /// Команда из интерфейса: докачать недостающее. `false` — ничего качать не надо или уже качается.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn models_download(app: AppHandle) -> bool {
     start(&app)
 }
@@ -190,7 +266,11 @@ mod tests {
     #[test]
     fn a_missing_or_short_file_counts_as_not_downloaded() {
         let dir = std::env::temp_dir().join(format!("avto-models-{}", std::process::id()));
-        assert_eq!(missing(&dir).len(), MODELS.len(), "пустая папка — всё качать");
+        assert_eq!(
+            missing(&dir).len(),
+            MODELS.len(),
+            "пустая папка — всё качать"
+        );
         let yamnet = dir.join("yamnet-onnx");
         std::fs::create_dir_all(&yamnet).unwrap();
         std::fs::write(yamnet.join("yamnet_class_map.csv"), [0u8; 10]).unwrap();

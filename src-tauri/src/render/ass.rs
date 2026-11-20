@@ -7,28 +7,52 @@ const PLAY_H: u32 = 1920;
 
 /// `RRGGBB` → `&H00BBGGRR` (в ASS порядок каналов обратный).
 fn color(rgb: &str) -> String {
-    let c: String = rgb.trim_start_matches('#').chars().filter(char::is_ascii_hexdigit).collect();
-    let c = if c.len() == 6 { c } else { "ffffff".to_string() };
+    let c: String = rgb
+        .trim_start_matches('#')
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .collect();
+    let c = if c.len() == 6 {
+        c
+    } else {
+        "ffffff".to_string()
+    };
     format!("&H00{}{}{}", &c[4..6], &c[2..4], &c[0..2]).to_uppercase()
 }
 
 fn ts(t: f64) -> String {
     let cs = (t.max(0.0) * 100.0).round() as u64;
-    format!("{}:{:02}:{:02}.{:02}", cs / 360_000, cs / 6000 % 60, cs / 100 % 60, cs % 100)
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        cs / 360_000,
+        cs / 6000 % 60,
+        cs / 100 % 60,
+        cs % 100
+    )
 }
 
 fn clean(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '{' | '}' | '\\' | '\n' | '\r')).collect()
+    s.chars()
+        .filter(|c| !matches!(c, '{' | '}' | '\\' | '\n' | '\r'))
+        .collect()
 }
 
 /// Переносит интервал из времени исходника во время ролика. Пока играет баннер, субтитров нет:
 /// интервал, который накрывает заморозку, делится на две части.
-pub fn map_interval(s: f64, e: f64, clip_start: f64, clip_len: f64, freeze: Option<(f64, f64)>) -> Vec<(f64, f64)> {
+pub fn map_interval(
+    s: f64,
+    e: f64,
+    clip_start: f64,
+    clip_len: f64,
+    freeze: Option<(f64, f64)>,
+) -> Vec<(f64, f64)> {
     let (s, e) = ((s - clip_start).max(0.0), (e - clip_start).min(clip_len));
     if e - s < 0.02 {
         return vec![];
     }
-    let Some((tb, d)) = freeze else { return vec![(s, e)] };
+    let Some((tb, d)) = freeze else {
+        return vec![(s, e)];
+    };
     let mut out = Vec::new();
     if s < tb {
         out.push((s, e.min(tb)));
@@ -51,9 +75,13 @@ fn group<'a>(words: &'a [Word], per_line: usize) -> Vec<Line<'a>> {
     for i in 0..words.len() {
         let n = i + 1 - from;
         let end_of_sentence = words[i].text.ends_with(['.', '!', '?', '…']);
-        let long_pause = words.get(i + 1).is_some_and(|w| w.start - words[i].end > 0.9);
+        let long_pause = words
+            .get(i + 1)
+            .is_some_and(|w| w.start - words[i].end > 0.9);
         if n >= per_line || end_of_sentence || long_pause || i + 1 == words.len() {
-            lines.push(Line { words: &words[from..=i] });
+            lines.push(Line {
+                words: &words[from..=i],
+            });
             from = i + 1;
         }
     }
@@ -81,7 +109,12 @@ pub fn build(job: &RenderJob) -> String {
     let freeze = job.freeze();
     let out_len = job.out_len();
     let (_, h) = job.profile.size();
-    let split_y = (PLAY_H as f64 * st.split).round().min(h as f64 * 10.0);
+    let anchor = match st.layout {
+        super::types::Layout::ReactionPip if !st.reaction.background => 0.72,
+        super::types::Layout::ReactionPip => (st.split.clamp(0.3, 0.75) + 0.16).min(0.88),
+        _ => st.split.clamp(0.3, 0.75),
+    };
+    let split_y = (PLAY_H as f64 * anchor).round().min(h as f64 * 10.0);
 
     let sub = &st.subtitles;
     let part = &st.part_label;
@@ -92,11 +125,21 @@ pub fn build(job: &RenderJob) -> String {
     s.push_str("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
     s.push_str(&format!(
         "Style: Sub,{},{},{},{},{},&H00000000,0,0,0,0,100,100,0,0,1,{},0,5,60,60,60,1\n",
-        clean(&sub.font), sub.size, color(&sub.color), color(&sub.color), color(&sub.outline_color), sub.outline
+        clean(&sub.font),
+        sub.size,
+        color(&sub.color),
+        color(&sub.color),
+        color(&sub.outline_color),
+        sub.outline
     ));
     s.push_str(&format!(
         "Style: Part,{},{},{},{},{},&H00000000,0,0,0,0,100,100,0,0,1,{},0,5,60,60,60,1\n\n",
-        clean(&part.font), part.size, color(&part.color), color(&part.color), color(&part.outline_color), part.outline
+        clean(&part.font),
+        part.size,
+        color(&part.color),
+        color(&part.color),
+        color(&part.outline_color),
+        part.outline
     ));
     s.push_str("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
 
@@ -106,7 +149,38 @@ pub fn build(job: &RenderJob) -> String {
             let y = (PLAY_H as f64 * part.y_pct).round();
             s.push_str(&format!(
                 "Dialogue: 1,{},{},Part,,0,0,0,,{{\\an5\\pos({},{})}}{}\n",
-                ts(0.0), ts(out_len), PLAY_W / 2, y, text
+                ts(0.0),
+                ts(out_len),
+                PLAY_W / 2,
+                y,
+                text
+            ));
+        }
+    }
+
+    if st.hook_enabled {
+        if let Some(hook) = job.hook.as_ref().filter(|s| !s.trim().is_empty()) {
+            let text = clean(&hook.chars().take(60).collect::<String>());
+            let mut lines = vec![String::new()];
+            for word in text.split_whitespace() {
+                if lines.last().unwrap().chars().count() + word.chars().count() > 28
+                    && lines.len() < 3
+                {
+                    lines.push(String::new());
+                }
+                let line = lines.last_mut().unwrap();
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            // Отдельная строка выше субтитров; размер и шрифт берём из существующего оформления.
+            s.push_str(&format!(
+                "Dialogue: 2,{},{},Part,,0,0,0,,{{\\an5\\pos({},480)\\fs64}}{}\n",
+                ts(0.0),
+                ts(3.0f64.min(out_len)),
+                PLAY_W / 2,
+                lines.join("\\N")
             ));
         }
     }
@@ -131,7 +205,9 @@ pub fn build(job: &RenderJob) -> String {
             for (k, active) in ws.iter().enumerate() {
                 // Событие слова длится до начала следующего, чтобы строка не мигала в паузах.
                 let from = active.start;
-                let to = ws.get(k + 1).map_or(active.end + 0.25, |n| n.start.max(active.end));
+                let to = ws
+                    .get(k + 1)
+                    .map_or(active.end + 0.25, |n| n.start.max(active.end));
                 let text = ws
                     .iter()
                     .enumerate()
@@ -153,7 +229,11 @@ pub fn build(job: &RenderJob) -> String {
             for (a, b) in map_interval(from, to, clip_start, clip_len, freeze) {
                 s.push_str(&format!(
                     "Dialogue: 0,{},{},Sub,,0,0,0,,{{\\an5\\pos({},{})}}{}\n",
-                    ts(a), ts(b), PLAY_W / 2, y, text
+                    ts(a),
+                    ts(b),
+                    PLAY_W / 2,
+                    y,
+                    text
                 ));
             }
         }
@@ -166,6 +246,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hook_is_opt_in_escaped_and_only_first_three_seconds() {
+        let mut job = label_job(None);
+        job.hook = Some("Короткий {хук} без \\опасных команд".into());
+        assert!(!build(&job).contains("Короткий"));
+        job.style.hook_enabled = true;
+        let ass = build(&job);
+        assert!(ass.contains("0:00:00.00,0:00:03.00,Part"));
+        assert!(ass.contains("Короткий хук"));
+        assert!(!ass.contains("{хук}"));
+    }
+
+    #[test]
     fn color_is_bgr() {
         assert_eq!(color("b6ff3c"), "&H003CFFB6");
         assert_eq!(color("#FF0000"), "&H000000FF");
@@ -174,8 +266,13 @@ mod tests {
 
     fn label_job(part: Option<u32>) -> RenderJob {
         use crate::render::{Encoder, MediaRef, Profile, RenderJob, Style};
-        let media = |name: &str| MediaRef { path: std::path::PathBuf::from(name), duration: 60.0, has_audio: true };
+        let media = |name: &str| MediaRef {
+            path: std::path::PathBuf::from(name),
+            duration: 60.0,
+            has_audio: true,
+        };
         RenderJob {
+            cam_rect: None,
             decode: Default::default(),
             source: media("/v/src.mp4"),
             source_aspect: 16.0 / 9.0,
@@ -189,6 +286,7 @@ mod tests {
             music_offset: 0.0,
             words: vec![],
             part,
+            hook: None,
             style: Style::default(),
             profile: Profile::Final,
             encoder: Encoder::X264,
@@ -201,6 +299,22 @@ mod tests {
     fn the_part_label_needs_a_part_number() {
         assert!(build(&label_job(Some(2))).contains("Часть 2"));
         assert!(!build(&label_job(None)).contains("Часть"));
+    }
+
+    #[test]
+    fn split_uses_the_same_bounds_as_the_video_filter() {
+        for (invalid, valid) in [(-4.0, 0.3), (9.0, 0.75)] {
+            let mut j = label_job(Some(1));
+            j.words = vec![Word {
+                text: "Тест".into(),
+                start: 1.0,
+                end: 2.0,
+            }];
+            j.style.split = invalid;
+            let a = build(&j);
+            j.style.split = valid;
+            assert_eq!(a, build(&j));
+        }
     }
 
     #[test]
@@ -243,7 +357,10 @@ mod tests {
             (3.2, 4.0, "d".to_string()), // хвост «c» заходит на «d»
         ];
         let out = non_overlapping(ev);
-        assert_eq!(out.iter().map(|e| e.2.as_str()).collect::<Vec<_>>(), ["a", "b", "c", "d"]);
+        assert_eq!(
+            out.iter().map(|e| e.2.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
         assert!(out.windows(2).all(|w| w[0].1 <= w[1].0 + 1e-9));
         assert_eq!(out[0].1, 2.0);
         assert_eq!(out[2].1, 3.2);

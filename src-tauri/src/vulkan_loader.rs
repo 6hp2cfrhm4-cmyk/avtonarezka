@@ -23,17 +23,29 @@ pub enum Source {
 #[cfg(windows)]
 pub fn prepare() -> Source {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::System::LibraryLoader::{LoadLibraryExW, LoadLibraryW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    use windows_sys::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LoadLibraryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
 
     let wide = |s: &std::ffi::OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
 
     // Модуль остаётся загруженным: когда отложенная загрузка потом попросит «vulkan-1.dll», Windows найдёт его по имени
     // среди уже загруженных и не будет искать заново.
     let system = wide("vulkan-1.dll".as_ref());
-    if !unsafe { LoadLibraryExW(system.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) }.is_null() {
+    if !unsafe {
+        LoadLibraryExW(
+            system.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    }
+    .is_null()
+    {
         return Source::System;
     }
-    let bundled = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join("vk").join("vulkan-1.dll")));
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("vk").join("vulkan-1.dll")));
     if let Some(path) = bundled {
         if path.is_file() && !unsafe { LoadLibraryW(wide(path.as_os_str()).as_ptr()) }.is_null() {
             return Source::Bundled;

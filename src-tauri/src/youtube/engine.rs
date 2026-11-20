@@ -24,7 +24,8 @@ use super::{
 };
 
 #[cfg(not(windows))]
-pub const NOT_FOUND: &str = "yt-dlp не найден. Установи yt-dlp и Deno (Arch: sudo pacman -S yt-dlp deno).";
+pub const NOT_FOUND: &str =
+    "yt-dlp не найден. Установи yt-dlp и Deno (Arch: sudo pacman -S yt-dlp deno).";
 #[cfg(windows)]
 pub const NOT_FOUND: &str = "yt-dlp не найден. Он должен лежать в папке tools рядом с программой: переустанови Автонарезку.";
 
@@ -36,7 +37,8 @@ const OUTPUT_TEMPLATE: &str = "%(title).150B [%(id)s] [%(height)sp].%(ext)s";
 const OUTPUT_TEMPLATE: &str = "%(title).90B [%(id)s] [%(height)sp].%(ext)s";
 /// Что печатает yt-dlp на каждый кусок скачанного; разбор — в `progress::parse_line`.
 const DOWNLOAD_TEMPLATE: &str = "download:AVTO|D|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(info.format_id)s|%(info.vcodec)s|%(info.acodec)s|%(info.height)s|%(info.fps)s|%(info.abr)s";
-const POSTPROCESS_TEMPLATE: &str = "postprocess:AVTO|P|%(progress.status)s|%(progress.postprocessor)s";
+const POSTPROCESS_TEMPLATE: &str =
+    "postprocess:AVTO|P|%(progress.status)s|%(progress.postprocessor)s";
 const FILE_PRINT: &str = "after_move:AVTO|F|%(filepath)s";
 const RETRIES: &str = "5";
 const ANALYZE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -75,12 +77,21 @@ pub fn find_ffmpeg_dir() -> Option<PathBuf> {
 
 /// Какой JS-рантайм есть для задач YouTube: сначала Deno, запасной — Node (как в утилите).
 pub fn find_js_runtime() -> Option<&'static str> {
-    ["deno", "node"].into_iter().find(|n| crate::platform::find_tool(n).is_some())
+    ["deno", "node"]
+        .into_iter()
+        .find(|n| crate::platform::find_tool(n).is_some())
 }
 
 pub async fn tool_version(path: &Path) -> Option<String> {
-    let run = ytdlp_command(path).arg("--version").stdin(Stdio::null()).kill_on_drop(true).output();
-    let out = tokio::time::timeout(Duration::from_secs(10), run).await.ok()?.ok()?;
+    let run = ytdlp_command(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .ok()?
+        .ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !v.is_empty()).then_some(v)
 }
@@ -171,40 +182,76 @@ fn to_fmt(f: &RawFormat) -> Fmt {
         fps: f.fps.filter(|v| *v > 0.0),
         vcodec: f.vcodec.clone(),
         acodec: f.acodec.clone(),
-        size: f.filesize.or(f.filesize_approx).filter(|s| *s > 0.0).map(|s| s as u64),
-        hdr: f.dynamic_range.as_deref().is_some_and(|d| !d.eq_ignore_ascii_case("sdr")),
+        size: f
+            .filesize
+            .or(f.filesize_approx)
+            .filter(|s| *s > 0.0)
+            .map(|s| s as u64),
+        hdr: f
+            .dynamic_range
+            .as_deref()
+            .is_some_and(|d| !d.eq_ignore_ascii_case("sdr")),
     }
 }
 
 /// Разбирает ответ `yt-dlp -J`. Чистая функция: проверяется тестами без сети.
 pub fn parse_info(json: &[u8], fallback_id: &str) -> Result<VideoInfo, String> {
-    let raw: RawInfo = serde_json::from_slice(json).map_err(|e| format!("yt-dlp вернул непонятный ответ: {e}"))?;
+    let raw: RawInfo =
+        serde_json::from_slice(json).map_err(|e| format!("yt-dlp вернул непонятный ответ: {e}"))?;
     if matches!(raw.kind.as_deref(), Some("playlist" | "multi_video")) {
         return Err(UrlError::Playlist.to_string());
     }
-    let formats: Vec<Fmt> = raw.formats.iter().filter(|f| f.format_id.is_some()).map(to_fmt).collect();
+    let formats: Vec<Fmt> = raw
+        .formats
+        .iter()
+        .filter(|f| f.format_id.is_some())
+        .map(to_fmt)
+        .collect();
     let max_height = select::max_height(&formats);
     // при равенстве берём первый из списка, как `max` в утилите
     let best = formats
         .iter()
         .rev()
         .filter(|f| f.has_video() && f.height.is_some())
-        .max_by(|a, b| a.height.cmp(&b.height).then(a.fps.partial_cmp(&b.fps).unwrap_or(std::cmp::Ordering::Equal)));
+        .max_by(|a, b| {
+            a.height.cmp(&b.height).then(
+                a.fps
+                    .partial_cmp(&b.fps)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
 
-    let id = raw.id.filter(|i| !i.is_empty()).unwrap_or_else(|| fallback_id.to_string());
+    let id = raw
+        .id
+        .filter(|i| !i.is_empty())
+        .unwrap_or_else(|| fallback_id.to_string());
     let presets = PRESETS
         .iter()
         .map(|&(key, label)| {
             let available = select::preset_available(key, max_height);
-            PresetInfo { key, label, available, approx_bytes: available.then(|| select::estimate_bytes(key, &formats)).flatten() }
+            PresetInfo {
+                key,
+                label,
+                available,
+                approx_bytes: available
+                    .then(|| select::estimate_bytes(key, &formats))
+                    .flatten(),
+            }
         })
         .collect();
 
     Ok(VideoInfo {
         url: format!("https://www.youtube.com/watch?v={id}"),
         id,
-        title: raw.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Без названия".into()),
-        channel: raw.channel.or(raw.uploader).filter(|c| !c.trim().is_empty()).unwrap_or_else(|| "—".into()),
+        title: raw
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "Без названия".into()),
+        channel: raw
+            .channel
+            .or(raw.uploader)
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "—".into()),
         duration: raw.duration.filter(|d| *d > 0.0).map(|d| d as u64),
         thumbnail_url: raw.thumbnail,
         thumb: None,
@@ -219,7 +266,13 @@ pub fn parse_info(json: &[u8], fallback_id: &str) -> Result<VideoInfo, String> {
 /// Читает сведения о ролике, ничего не скачивая. `url` уже приведён к каноничному виду.
 pub async fn analyze(ytdlp: &Path, url: &str, video_id: &str) -> Result<VideoInfo, String> {
     let child = ytdlp_command(ytdlp)
-        .args(["-J", "--no-playlist", "--skip-download", "--no-warnings", "--no-colors"])
+        .args([
+            "-J",
+            "--no-playlist",
+            "--skip-download",
+            "--no-warnings",
+            "--no-colors",
+        ])
         .args(["--js-runtimes", "deno", "--js-runtimes", "node"])
         .arg(url)
         .stdin(Stdio::null())
@@ -230,10 +283,15 @@ pub async fn analyze(ytdlp: &Path, url: &str, video_id: &str) -> Result<VideoInf
         .map_err(spawn_error)?;
     let out = tokio::time::timeout(ANALYZE_TIMEOUT, child.wait_with_output())
         .await
-        .map_err(|_| "yt-dlp слишком долго не отвечает. Проверь интернет и попробуй ещё раз.".to_string())?
+        .map_err(|_| {
+            "yt-dlp слишком долго не отвечает. Проверь интернет и попробуй ещё раз.".to_string()
+        })?
         .map_err(|e| format!("yt-dlp: {e}"))?;
     if !out.status.success() {
-        return Err(error_text(String::from_utf8_lossy(&out.stderr).lines(), out.status.code()));
+        return Err(error_text(
+            String::from_utf8_lossy(&out.stderr).lines(),
+            out.status.code(),
+        ));
     }
     parse_info(&out.stdout, video_id)
 }
@@ -275,12 +333,26 @@ pub enum DownloadError {
 pub fn download_args(req: &DownloadRequest) -> Result<Vec<String>, String> {
     let format = select::build_format(&req.preset)?;
     let mut a: Vec<String> = [
-        "--no-playlist", "--quiet", "--progress", "--newline", "--no-colors", "--no-warnings",
-        "--windows-filenames", "--no-overwrites", "--continue",
-        "--retries", RETRIES, "--fragment-retries", RETRIES,
-        "--js-runtimes", "deno", "--js-runtimes", "node",
+        "--no-playlist",
+        "--quiet",
+        "--progress",
+        "--newline",
+        "--no-colors",
+        "--no-warnings",
+        "--windows-filenames",
+        "--no-overwrites",
+        "--continue",
+        "--retries",
+        RETRIES,
+        "--fragment-retries",
+        RETRIES,
+        "--js-runtimes",
+        "deno",
+        "--js-runtimes",
+        "node",
         // mp4, а если потоки в него не ложатся, yt-dlp сам берёт mkv
-        "--merge-output-format", "mp4/mkv",
+        "--merge-output-format",
+        "mp4/mkv",
     ]
     .iter()
     .map(ToString::to_string)
@@ -291,8 +363,14 @@ pub fn download_args(req: &DownloadRequest) -> Result<Vec<String>, String> {
     a.extend(["-f".to_string(), format]);
     a.extend(["-P".to_string(), req.out_dir.display().to_string()]);
     a.extend(["-o".to_string(), OUTPUT_TEMPLATE.to_string()]);
-    a.extend(["--progress-template".to_string(), DOWNLOAD_TEMPLATE.to_string()]);
-    a.extend(["--progress-template".to_string(), POSTPROCESS_TEMPLATE.to_string()]);
+    a.extend([
+        "--progress-template".to_string(),
+        DOWNLOAD_TEMPLATE.to_string(),
+    ]);
+    a.extend([
+        "--progress-template".to_string(),
+        POSTPROCESS_TEMPLATE.to_string(),
+    ]);
     a.extend(["--print".to_string(), FILE_PRINT.to_string()]);
     a.push(req.url.clone());
     Ok(a)
@@ -318,7 +396,10 @@ fn find_by_id(dir: &Path, video_id: &str) -> Option<PathBuf> {
         .flatten()
         .filter(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            name.contains(&needle) && !name.ends_with(".part") && !name.ends_with(".ytdl") && !is_stream_part(&name)
+            name.contains(&needle)
+                && !name.ends_with(".part")
+                && !name.ends_with(".ytdl")
+                && !is_stream_part(&name)
         })
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         .map(|e| e.path())
@@ -327,7 +408,11 @@ fn find_by_id(dir: &Path, video_id: &str) -> Option<PathBuf> {
 /// Промежуточные файлы склейки: `имя [id].f136.mp4`.
 fn is_stream_part(name: &str) -> bool {
     name.rsplit('.').nth(1).is_some_and(|stem_ext| {
-        stem_ext.len() > 1 && stem_ext.starts_with('f') && stem_ext[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        stem_ext.len() > 1
+            && stem_ext.starts_with('f')
+            && stem_ext[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
     })
 }
 
@@ -335,15 +420,30 @@ fn is_stream_part(name: &str) -> bool {
 pub async fn download(
     ytdlp: &Path,
     req: &DownloadRequest,
+    cancel: watch::Receiver<bool>,
+    on_update: impl FnMut(Update),
+) -> Result<PathBuf, DownloadError> {
+    let args = download_args(req).map_err(DownloadError::Failed)?;
+    download_with_args(ytdlp, req, args, cancel, on_update).await
+}
+
+/// Общий исполнитель для одиночных видео, прокси и секций фабрики.
+pub async fn download_with_args(
+    ytdlp: &Path,
+    req: &DownloadRequest,
+    args: Vec<String>,
     mut cancel: watch::Receiver<bool>,
     mut on_update: impl FnMut(Update),
 ) -> Result<PathBuf, DownloadError> {
     if *cancel.borrow() {
         return Err(DownloadError::Cancelled);
     }
-    let args = download_args(req).map_err(DownloadError::Failed)?;
-    std::fs::create_dir_all(&req.out_dir)
-        .map_err(|e| DownloadError::Failed(format!("не удалось создать папку {}: {e}", req.out_dir.display())))?;
+    std::fs::create_dir_all(&req.out_dir).map_err(|e| {
+        DownloadError::Failed(format!(
+            "не удалось создать папку {}: {e}",
+            req.out_dir.display()
+        ))
+    })?;
 
     let mut child = ytdlp_command(ytdlp)
         .args(&args)
@@ -413,16 +513,24 @@ pub async fn download(
         }
     }
 
-    let status = child.wait().await.map_err(|e| DownloadError::Failed(format!("yt-dlp: {e}")))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| DownloadError::Failed(format!("yt-dlp: {e}")))?;
     if cancelled {
         return Err(DownloadError::Cancelled);
     }
     if !status.success() {
-        return Err(DownloadError::Failed(error_text(tail.iter().map(String::as_str), status.code())));
+        return Err(DownloadError::Failed(error_text(
+            tail.iter().map(String::as_str),
+            status.code(),
+        )));
     }
     file.filter(|p| p.is_file())
         .or_else(|| find_by_id(&req.out_dir, &req.video_id))
-        .ok_or_else(|| DownloadError::Failed("yt-dlp закончил работу, но готового файла не видно.".into()))
+        .ok_or_else(|| {
+            DownloadError::Failed("yt-dlp закончил работу, но готового файла не видно.".into())
+        })
 }
 
 #[cfg(test)]
@@ -445,10 +553,16 @@ mod tests {
     #[test]
     fn parses_info_and_presets() {
         let info = parse_info(RICK.as_bytes(), "fallback").unwrap();
-        assert_eq!((info.id.as_str(), info.title.as_str(), info.channel.as_str()), ("dQw4w9WgXcQ", "Never Gonna Give You Up", "Rick Astley"));
+        assert_eq!(
+            (info.id.as_str(), info.title.as_str(), info.channel.as_str()),
+            ("dQw4w9WgXcQ", "Never Gonna Give You Up", "Rick Astley")
+        );
         assert_eq!(info.duration, Some(213));
         assert_eq!(info.max_height, 1080);
-        assert_eq!((info.best_codec.as_deref(), info.best_fps), (Some("H.264"), Some(25.0)));
+        assert_eq!(
+            (info.best_codec.as_deref(), info.best_fps),
+            (Some("H.264"), Some(25.0))
+        );
         assert!(!info.hdr);
         let by_key = |k: &str| info.presets.iter().find(|p| p.key == k).unwrap();
         assert!(by_key("720").available && by_key("1080").available && by_key("best").available);
@@ -461,9 +575,20 @@ mod tests {
     #[test]
     fn missing_id_falls_back_and_playlist_is_rejected() {
         let info = parse_info(br#"{"title":"x"}"#, "abcdefghijk").unwrap();
-        assert_eq!((info.id.as_str(), info.channel.as_str(), info.max_height), ("abcdefghijk", "—", 0));
-        assert!(info.presets.iter().find(|p| p.key == "best").unwrap().available);
-        assert!(parse_info(br#"{"_type":"playlist","entries":[]}"#, "x").unwrap_err().contains("Плейлисты"));
+        assert_eq!(
+            (info.id.as_str(), info.channel.as_str(), info.max_height),
+            ("abcdefghijk", "—", 0)
+        );
+        assert!(
+            info.presets
+                .iter()
+                .find(|p| p.key == "best")
+                .unwrap()
+                .available
+        );
+        assert!(parse_info(br#"{"_type":"playlist","entries":[]}"#, "x")
+            .unwrap_err()
+            .contains("Плейлисты"));
         assert!(parse_info(b"not json", "x").is_err());
     }
 
@@ -484,19 +609,44 @@ mod tests {
         assert_eq!(after("-o"), Some(OUTPUT_TEMPLATE));
         assert!(after("-f").unwrap().contains("[vcodec^=avc1]"));
         assert!(a.contains(&"--no-playlist".to_string()) && a.contains(&"--continue".to_string()));
-        assert_eq!(a.last().map(String::as_str), Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
-        for forbidden in ["--recode-video", "--extract-audio", "--postprocessor-args", "--embed-subs"] {
+        assert_eq!(
+            a.last().map(String::as_str),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+        for forbidden in [
+            "--recode-video",
+            "--extract-audio",
+            "--postprocessor-args",
+            "--embed-subs",
+        ] {
             assert!(!a.contains(&forbidden.to_string()), "{forbidden}");
         }
-        assert!(download_args(&DownloadRequest { preset: "bogus".into(), ..req }).is_err());
+        assert!(download_args(&DownloadRequest {
+            preset: "bogus".into(),
+            ..req
+        })
+        .is_err());
     }
 
     #[test]
     fn error_text_prefers_the_error_line() {
-        let lines = ["WARNING: x", "ERROR: [youtube] abc: This video is unavailable", ""];
-        assert_eq!(error_text(lines.into_iter(), Some(1)), "[youtube] abc: This video is unavailable");
-        assert_eq!(error_text(["просто строка"].into_iter(), Some(1)), "просто строка");
-        assert_eq!(error_text(std::iter::empty(), Some(2)), "yt-dlp завершился с ошибкой (код 2)");
+        let lines = [
+            "WARNING: x",
+            "ERROR: [youtube] abc: This video is unavailable",
+            "",
+        ];
+        assert_eq!(
+            error_text(lines.into_iter(), Some(1)),
+            "[youtube] abc: This video is unavailable"
+        );
+        assert_eq!(
+            error_text(["просто строка"].into_iter(), Some(1)),
+            "просто строка"
+        );
+        assert_eq!(
+            error_text(std::iter::empty(), Some(2)),
+            "yt-dlp завершился с ошибкой (код 2)"
+        );
     }
 
     #[test]

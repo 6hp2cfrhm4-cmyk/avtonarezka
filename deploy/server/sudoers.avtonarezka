@@ -1,0 +1,3 @@
+# Узкое правило для ограниченного ключа проекта (G6). Ничего другого пользователю входа не даёт.
+@LOGIN_USER@ ALL=(avtonarezka) NOPASSWD: /opt/avtonarezka/bin/avtoctl serve
+@LOGIN_USER@ ALL=(root) NOPASSWD: /usr/bin/systemctl is-active avtonarezka-daemon.service, /usr/bin/systemctl restart avtonarezka-daemon.service

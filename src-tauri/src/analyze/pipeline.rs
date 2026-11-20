@@ -12,6 +12,7 @@ use super::{
     events::EventModel,
     llm::{self, LlmClient},
     score::{self, Params, Weights},
+    scout,
     speech::{self, Control},
     video, Candidate, Sentence, Signals, HOP,
 };
@@ -33,12 +34,21 @@ pub struct Options {
     pub weights: Weights,
     /// Видео уже размечено: режем его целиком подряд (`score::tight_split`) вместо выбора лучших мест.
     pub tight: bool,
+    /// Нарезать всю запись по N секунд с привязкой к паузам, без отбора top-K.
+    pub fixed_seconds: Option<f64>,
+    pub scout_enabled: bool,
+    pub scout_coverage: f64,
+    pub chat: Option<Vec<f32>>,
+    pub viewer_clips: Option<Vec<f32>>,
+    pub camera: Option<super::face::Rect>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            threads: std::thread::available_parallelism().map_or(4, |n| n.get()).min(12),
+            threads: std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .min(12),
             language: "ru".into(),
             use_events: true,
             use_speech: true,
@@ -49,6 +59,12 @@ impl Default for Options {
             params: Params::default(),
             weights: Weights::default(),
             tight: false,
+            fixed_seconds: None,
+            scout_enabled: true,
+            scout_coverage: 0.25,
+            chat: None,
+            viewer_clips: None,
+            camera: None,
         }
     }
 }
@@ -90,7 +106,9 @@ pub type Report = Arc<dyn Fn(Progress) + Send + Sync>;
 
 /// Тяжёлая работа ML — на отдельном потоке ОС: она долгая и не должна занимать общий пул `spawn_blocking`,
 /// которым пользуется остальной код (ввод-вывод, запросы к БД).
-fn on_new_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::sync::oneshot::Receiver<T> {
+fn on_new_thread<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<T> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("ml-stage".into())
@@ -112,12 +130,45 @@ fn pad(mut v: Vec<f32>, n: usize) -> Vec<f32> {
 }
 
 fn text_in(sentences: &[Sentence], start: f64, end: f64) -> String {
-    sentences.iter().filter(|s| s.end > start && s.start < end).map(|s| s.text.trim()).collect::<Vec<_>>().join(" ")
+    sentences
+        .iter()
+        .filter(|s| s.end > start && s.start < end)
+        .map(|s| s.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn first_words(text: &str, max: usize) -> String {
     let t: String = text.chars().take(max).collect();
-    if text.chars().count() > max { format!("{}…", t.trim_end()) } else { t }
+    if text.chars().count() > max {
+        format!("{}…", t.trim_end())
+    } else {
+        t
+    }
+}
+
+/// Почти одинаковые длинные расшифровки (повторы/заставки) не занимают выдачу несколько раз.
+fn similar_text(a: &str, b: &str) -> bool {
+    let tokens = |s: &str| {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let a = tokens(a);
+    let b = tokens(b);
+    if a.len() < 8 || b.len() < 8 {
+        return false;
+    }
+    let shingles = |v: Vec<String>| {
+        v.windows(3)
+            .map(|w| w.join(" "))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let a = shingles(a);
+    let b = shingles(b);
+    a.intersection(&b).count() as f64 / a.union(&b).count().max(1) as f64 >= 0.8
 }
 
 pub async fn run(
@@ -129,15 +180,35 @@ pub async fn run(
     cancel: watch::Receiver<bool>,
     report: Report,
 ) -> anyhow::Result<Analysis> {
-    let say = |stage: &'static str, fraction: f64, message: &str| report(Progress { stage, fraction, message: message.into() });
-    let check = || if *cancel.borrow() { bail!("анализ отменён") } else { Ok(()) };
+    let say = |stage: &'static str, fraction: f64, message: &str| {
+        report(Progress {
+            stage,
+            fraction,
+            message: message.into(),
+        })
+    };
+    let check = || {
+        if *cancel.borrow() {
+            bail!("анализ отменён")
+        } else {
+            Ok(())
+        }
+    };
     let n_hops = (duration / HOP).ceil() as usize;
     let mut notes = Vec::new();
 
     // --- звук ---
     say("audio", 0.0, "Читаю звук");
-    let pcm = if has_audio { audio::decode_pcm16k(path).await? } else { Vec::new() };
-    let loud_db = if pcm.is_empty() { vec![-90.0; n_hops] } else { audio::rms_db(&pcm) };
+    let pcm = if has_audio {
+        audio::decode_pcm16k(path).await?
+    } else {
+        Vec::new()
+    };
+    let loud_db = if pcm.is_empty() {
+        vec![-90.0; n_hops]
+    } else {
+        audio::rms_db(&pcm)
+    };
     let quiet = audio::quiet_points(&loud_db, -45.0);
     let loudness = pad(audio::robust_z(&loud_db), n_hops);
     if !has_audio {
@@ -147,7 +218,9 @@ pub async fn run(
 
     // --- картинка: идёт параллельно со всем остальным ---
     let vpath = path.to_path_buf();
-    let video_task = tokio::spawn(async move { video::analyze(&vpath, |_| {}).await });
+    let camera = opt.camera;
+    let video_task =
+        tokio::spawn(async move { video::analyze_camera(&vpath, camera, |_| {}).await });
 
     // --- звуковые события ---
     let pcm = Arc::new(pcm);
@@ -155,10 +228,22 @@ pub async fn run(
     if opt.use_events && !pcm.is_empty() {
         if models.yamnet.is_file() && models.yamnet_classes.is_file() {
             say("events", 0.06, "Ищу смех, крики и аплодисменты");
-            let (y, c, data, threads, rep) = (models.yamnet.clone(), models.yamnet_classes.clone(), pcm.clone(), opt.threads, report.clone());
+            let (y, c, data, threads, rep) = (
+                models.yamnet.clone(),
+                models.yamnet_classes.clone(),
+                pcm.clone(),
+                opt.threads,
+                report.clone(),
+            );
             let res = on_new_thread(move || {
                 let m = EventModel::load(&y, &c)?;
-                m.scan(&data, threads, |f| rep(Progress { stage: "events", fraction: 0.06 + 0.09 * f, message: "Ищу смех, крики и аплодисменты".into() }))
+                m.scan(&data, threads, |f| {
+                    rep(Progress {
+                        stage: "events",
+                        fraction: 0.06 + 0.09 * f,
+                        message: "Ищу смех, крики и аплодисменты".into(),
+                    })
+                })
             })
             .await?;
             match res {
@@ -171,15 +256,56 @@ pub async fn run(
     }
     check()?;
 
+    // --- скаут использует картинку до запуска тяжёлого распознавания ---
+    say("video", 0.15, "Считаю динамику кадра");
+    let vs = video_task.await??;
+    check()?;
+    let mut signals = Signals {
+        loudness,
+        motion: pad(audio::robust_z(&vs.motion), n_hops),
+        events,
+        speech: None,
+        cuts: vs.cuts,
+        chat: opt.chat.clone().map(|v| pad(v, n_hops)),
+        viewer_clips: opt.viewer_clips.clone().map(|v| pad(v, n_hops)),
+        camera: vs.camera_motion.map(|v| pad(audio::robust_z(&v), n_hops)),
+        ..Default::default()
+    };
+    let scout_curve = score::interest_curve(&signals, &opt.weights);
+    let mut scouting = scout::select(
+        duration,
+        &scout_curve,
+        opt.params.max_len,
+        opt.scout_coverage,
+        !opt.scout_enabled || opt.tight || opt.fixed_seconds.is_some(),
+    );
+    say(
+        "scout",
+        0.15,
+        &format!(
+            "Скаут: {} окон, {:.0} из {:.0} с для распознавания",
+            scouting.windows.len(),
+            scouting.selected_seconds,
+            duration
+        ),
+    );
     // --- речь ---
     let mut words: Vec<Word> = Vec::new();
     let mut sentences: Vec<Sentence> = Vec::new();
     if opt.use_speech && !pcm.is_empty() {
         if models.whisper.is_file() {
-            let data = Arc::try_unwrap(pcm.clone()).unwrap_or_else(|a| (*a).clone());
+            let data = pcm.clone();
+            let windows = scouting.windows.clone();
             let ctl = Control::default();
-            let (model, lang, threads, c2) = (models.whisper.clone(), opt.language.clone(), opt.threads.saturating_sub(2).max(2) as i32, ctl.clone());
-            let mut job = on_new_thread(move || speech::transcribe(&model, data, &lang, threads, c2));
+            let (model, lang, threads, c2) = (
+                models.whisper.clone(),
+                opt.language.clone(),
+                opt.threads.saturating_sub(2).max(2) as i32,
+                ctl.clone(),
+            );
+            let mut job = on_new_thread(move || {
+                speech::transcribe_windows(&model, data, &windows, &lang, threads, c2)
+            });
             let res = loop {
                 tokio::select! {
                     r = &mut job => break r?,
@@ -194,6 +320,7 @@ pub async fn run(
             };
             match res {
                 Ok(sp) => {
+                    scouting.speech_seconds = scouting.selected_seconds;
                     words = sp.words;
                     sentences = sp.sentences;
                 }
@@ -206,34 +333,61 @@ pub async fn run(
     }
     check()?;
 
-    // --- картинка: дождёмся ---
-    say("video", 0.76, "Считаю динамику кадра");
-    let vs = video_task.await??;
-    check()?;
-
     // --- кривая интереса и кандидаты ---
     say("score", 0.80, "Выбираю лучшие места");
-    let speech_curve = (!words.is_empty()).then(|| pad(audio::robust_z(&speech::speech_rate(&words, n_hops)), n_hops));
-    let signals = Signals {
-        loudness,
-        motion: pad(audio::robust_z(&vs.motion), n_hops),
-        events,
-        speech: speech_curve,
-        cuts: vs.cuts,
-    };
+    signals.speech = (!words.is_empty()).then(|| {
+        pad(
+            audio::robust_z(&speech::speech_rate(&words, n_hops)),
+            n_hops,
+        )
+    });
+    signals.scout = Some(scouting.clone());
     let curve = score::interest_curve(&signals, &opt.weights);
     let mut params = opt.params.clone();
-    params.top_k = if opt.use_llm { opt.llm_top.max(opt.params.top_k.min(40)) } else { opt.params.top_k };
-    let cands: Vec<Candidate> = if opt.tight {
+    let wanted = if opt.use_llm {
+        opt.llm_top.max(opt.params.top_k.min(40))
+    } else {
+        opt.params.top_k
+    };
+    params.top_k = wanted.saturating_mul(4).min(240);
+    let mut cands: Vec<Candidate> = if let Some(target) = opt.fixed_seconds {
+        let boundaries: Vec<f64> = sentences
+            .iter()
+            .map(|s| s.end)
+            .chain(quiet.iter().copied())
+            .collect();
+        score::fixed_grid(
+            duration,
+            target,
+            target * 0.25,
+            &boundaries,
+            (target * 0.1).min(2.5),
+        )
+        .into_iter()
+        .map(|(start, end)| Candidate {
+            start,
+            end,
+            score: 0.0,
+            climax: score::pick_climax(&curve, start, end),
+        })
+        .collect()
+    } else if opt.tight {
         if sentences.is_empty() {
             notes.push("Фраз нет: границы фрагментов ставятся по сменам сцены и тишине".into());
         }
         score::tight_split(duration, &sentences, &signals.cuts, &quiet, &curve, &params)
-    } else if sentences.is_empty() {
-        score::window_candidates(duration, &curve, &quiet, &params)
     } else {
-        score::candidates(&sentences, &curve, &params)
+        score::in_windows(&sentences, &curve, &quiet, &params, &scouting.windows)
     };
+
+    if !opt.tight && opt.fixed_seconds.is_none() {
+        if has_audio {
+            for c in &mut cands {
+                score::trim_silence(c, &loud_db, opt.params.min_len);
+            }
+        }
+        cands = score::diverse(cands, duration, wanted);
+    }
 
     let mut moments: Vec<Moment> = cands
         .iter()
@@ -245,7 +399,15 @@ pub async fn run(
                 score: c.score,
                 signal_score: c.score,
                 llm_score: 0.0,
-                title: if text.is_empty() { format!("Момент {:.0}:{:02.0}", (c.start / 60.0).floor(), c.start % 60.0) } else { first_words(&text, 60) },
+                title: if text.is_empty() {
+                    format!(
+                        "Момент {:.0}:{:02.0}",
+                        (c.start / 60.0).floor(),
+                        c.start % 60.0
+                    )
+                } else {
+                    first_words(&text, 60)
+                },
                 caption: String::new(),
                 hashtags: vec![],
                 climax: c.climax,
@@ -254,6 +416,7 @@ pub async fn run(
         })
         .collect();
 
+    let all_parts = opt.tight || opt.fixed_seconds.is_some();
     // --- LLM: заголовок, подпись, лучшая секунда и оценка ---
     if opt.use_llm && !sentences.is_empty() && !moments.is_empty() {
         match (models.llm.is_file(), llm::find_worker()) {
@@ -268,10 +431,16 @@ pub async fn run(
                     }
                     r => r,
                 };
+                if client.as_ref().is_ok_and(|c| !c.on_gpu()) {
+                    if gpu > 0 {
+                        notes.push("Для языковой модели недостаточно свободной видеопамяти, выбран процессор".into());
+                    }
+                    gpu = 0;
+                }
                 match client.as_mut() {
                     Err(e) => notes.push(format!("Языковая модель недоступна: {e:#}")),
                     // на процессоре ~18 с на фрагмент: всё видео так не оценить
-                    Ok(_) if opt.tight && gpu == 0 => {
+                    Ok(_) if all_parts && gpu == 0 => {
                         notes.push("Языковая модель работает только на процессоре: для нарезки всего видео это слишком долго, заголовки взяты из текста".into());
                         if let Ok(c) = client {
                             c.shutdown().await;
@@ -279,14 +448,25 @@ pub async fn run(
                     }
                     Ok(_) => {
                         // в режиме «вплотную» оцениваем каждый фрагмент, иначе только лучшие
-                        let n = if opt.tight { moments.len() } else { moments.len().min(opt.llm_top) };
-                        moments.truncate(n);
+                        let n = moments.len().min(opt.llm_top);
+                        // Оцениваем только top-N, но нарезка всей записи не теряет остальные части.
+                        if !all_parts {
+                            moments.truncate(n);
+                        }
                         let mut failed = 0;
                         let mut client = client.ok();
-                        for (i, m) in moments.iter_mut().enumerate() {
+                        for (i, m) in moments.iter_mut().take(n).enumerate() {
                             check()?;
-                            let what = if opt.tight { "фрагмент" } else { "момент" };
-                            say("llm", 0.86 + 0.13 * i as f64 / n as f64, &format!("Оцениваю {what} {} из {n}", i + 1));
+                            let what = if all_parts {
+                                "фрагмент"
+                            } else {
+                                "момент"
+                            };
+                            say(
+                                "llm",
+                                0.86 + 0.13 * i as f64 / n as f64,
+                                &format!("Оцениваю {what} {} из {n}", i + 1),
+                            );
                             let prompt = llm::build_prompt(&sentences, m.start, m.end);
                             let len = m.end - m.start;
                             let mut verdict = match client.as_mut() {
@@ -299,7 +479,7 @@ pub async fn run(
                                     c.shutdown().await;
                                 }
                                 gpu = 0;
-                                if opt.tight {
+                                if all_parts {
                                     notes.push("Видеокарта не справилась с запросом: на процессоре всё видео не оценить, остальные фрагменты идут без языковой модели".into());
                                     failed += n - i;
                                     break;
@@ -313,7 +493,8 @@ pub async fn run(
                             match verdict {
                                 Ok(v) => {
                                     m.llm_score = v.score();
-                                    m.score = (1.0 - opt.llm_weight) * m.signal_score + opt.llm_weight * m.llm_score;
+                                    m.score = (1.0 - opt.llm_weight) * m.signal_score
+                                        + opt.llm_weight * m.llm_score;
                                     m.title = v.title;
                                     m.caption = v.caption;
                                     m.hashtags = v.hashtags;
@@ -334,23 +515,55 @@ pub async fn run(
                     }
                 }
             }
-            (false, _) => notes.push("Модель LLM не найдена: заголовки берутся из текста, подписей нет".into()),
-            (_, None) => notes.push("Не собран llm-worker: заголовки берутся из текста, подписей нет".into()),
+            (false, _) => notes
+                .push("Модель LLM не найдена: заголовки берутся из текста, подписей нет".into()),
+            (_, None) => {
+                notes.push("Не собран llm-worker: заголовки берутся из текста, подписей нет".into())
+            }
         }
     }
 
-    if opt.tight {
+    if all_parts {
         moments.sort_by(|a, b| a.start.total_cmp(&b.start));
     } else {
         moments.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut kept: Vec<Moment> = Vec::new();
+        for m in moments {
+            if !kept
+                .iter()
+                .any(|k| similar_text(&k.transcript, &m.transcript))
+            {
+                kept.push(m);
+            }
+        }
+        moments = kept;
     }
     say("done", 1.0, "Готово");
-    Ok(Analysis { signals, words, sentences, moments, notes })
+    Ok(Analysis {
+        signals,
+        words,
+        sentences,
+        moments,
+        notes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_transcripts_are_deduplicated_but_short_phrases_are_not() {
+        assert!(similar_text(
+            "Это одна и та же длинная фраза для проверки повторов.",
+            "Это одна и та же длинная фраза для проверки повторов!"
+        ));
+        assert!(!similar_text("Привет всем", "Привет всем"));
+        assert!(!similar_text(
+            "это длинная история про игры и стримы на канале",
+            "совсем другой сюжет о еде природе и путешествии по горам"
+        ));
+    }
 
     #[test]
     fn title_fallback_is_cut_on_a_char_boundary() {
@@ -363,9 +576,21 @@ mod tests {
     #[test]
     fn text_in_picks_only_overlapping_sentences() {
         let s = vec![
-            Sentence { start: 0.0, end: 5.0, text: "раз".into() },
-            Sentence { start: 10.0, end: 15.0, text: " два ".into() },
-            Sentence { start: 20.0, end: 25.0, text: "три".into() },
+            Sentence {
+                start: 0.0,
+                end: 5.0,
+                text: "раз".into(),
+            },
+            Sentence {
+                start: 10.0,
+                end: 15.0,
+                text: " два ".into(),
+            },
+            Sentence {
+                start: 20.0,
+                end: 25.0,
+                text: "три".into(),
+            },
         ];
         assert_eq!(text_in(&s, 9.0, 21.0), "два три");
     }

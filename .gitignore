@@ -27,3 +27,10 @@ windows/vendor
 *.db
 *.sqlite
 .claude/settings.local.json
+
+# Изолированные данные и скриншоты проверок фабрики
+.factory-tests/
+.taste-skill/inspect/
+.taste-skill/before/
+.taste-skill/after/
+.cache/

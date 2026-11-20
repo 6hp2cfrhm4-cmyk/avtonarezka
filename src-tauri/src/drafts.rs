@@ -3,12 +3,15 @@
 //! Жизнь черновика: `queued` → `rendering` → `ready` → `approved` | `rejected`.
 //! Финал: `approved` → `final_queued` → `final_rendering` → `final_done`. Сбой — `failed`.
 
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
+use crate::host::{AppHandle, Emitter, Manager, State};
 use rand::Rng;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::{
@@ -30,6 +33,9 @@ fn err(e: impl std::fmt::Display) -> String {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DraftConfig {
+    pub cam_rect: Option<crate::analyze::face::Rect>,
+    /// Проверка относится только к этому клипу и не заменяется ручной калибровкой.
+    pub face_check: Option<crate::analyze::face::detector::Check>,
     pub style: Style,
     pub banner_id: Option<i64>,
     pub background_id: Option<i64>,
@@ -65,18 +71,21 @@ fn upgrade_layout(style: &mut Style) -> bool {
     old
 }
 
-pub(crate) fn kv_get(db: &Connection, key: &str) -> Option<String> {
-    db.query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0)).ok()
-}
+pub(crate) use crate::db::{kv_get, kv_set};
 
-pub(crate) fn kv_set(db: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
-    db.execute("INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
-    Ok(())
+pub(crate) fn upgrade_defaults(d: &mut Defaults) {
+    if d.layout_v < LAYOUT_V {
+        upgrade_layout(&mut d.style);
+        d.layout_v = LAYOUT_V;
+    }
 }
 
 pub(crate) fn load_defaults(db: &Connection) -> Defaults {
     let saved = kv_get(db, "draft_defaults");
-    let mut d: Defaults = saved.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    let mut d: Defaults = saved
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
     if d.layout_v < LAYOUT_V {
         upgrade_layout(&mut d.style);
         d.layout_v = LAYOUT_V;
@@ -96,7 +105,11 @@ pub(crate) const GAMEPLAY_START: f64 = 0.01;
 /// Если файл короче — с нуля: ролик зациклит его.
 pub(crate) fn pick_offset(rng: &mut impl Rng, media_len: f64, need: f64) -> f64 {
     let room = media_len - need - 1.0;
-    if room <= 0.0 { 0.0 } else { (rng.random_range(0.0..room) * 2.0).round() / 2.0 }
+    if room <= 0.0 {
+        0.0
+    } else {
+        (rng.random_range(0.0..room) * 2.0).round() / 2.0
+    }
 }
 
 /// Ассеты из настроек по умолчанию. Читаются из базы один раз на всю пачку черновиков,
@@ -110,9 +123,20 @@ struct DefaultAssets {
 impl DefaultAssets {
     fn load(db: &Connection, d: &Defaults) -> Self {
         Self {
-            banner: d.banner_id.and_then(|id| load_asset(db, id)).filter(|a| a.kind == "banner"),
-            backgrounds: d.background_ids.iter().filter_map(|id| load_asset(db, *id)).filter(|a| a.kind == "background").collect(),
-            music: d.music_id.and_then(|id| load_asset(db, id)).filter(|a| a.kind == "music"),
+            banner: d
+                .banner_id
+                .and_then(|id| load_asset(db, id))
+                .filter(|a| a.kind == "banner"),
+            backgrounds: d
+                .background_ids
+                .iter()
+                .filter_map(|id| load_asset(db, *id))
+                .filter(|a| a.kind == "background")
+                .collect(),
+            music: d
+                .music_id
+                .and_then(|id| load_asset(db, id))
+                .filter(|a| a.kind == "music"),
         }
     }
 }
@@ -125,21 +149,51 @@ impl DefaultAssets {
 
     /// Фон для каждого принятого момента проекта по таймкодам (см. `gameplay`): `moment_id → место на ленте`.
     /// Считается по всем принятым моментам сразу, поэтому места не зависят от того, для каких уже есть черновики.
-    fn gameplay_slices(&self, db: &Connection, project_id: i64, accepted: &[(i64, f64, f64)]) -> HashMap<i64, Slice> {
-        let tape: Vec<(i64, f64)> = self.backgrounds.iter().map(|b| (b.id, b.meta.duration)).collect();
-        let clips: Vec<Clip> = accepted.iter().map(|&(id, start, end)| Clip { id, start, need: self.need(end - start) }).collect();
-        gameplay::allocate(db, project_id, &tape, &clips).into_iter().map(|s| (s.clip, s)).collect()
+    fn gameplay_slices(
+        &self,
+        db: &Connection,
+        project_id: i64,
+        accepted: &[(i64, f64, f64)],
+    ) -> HashMap<i64, Slice> {
+        let tape: Vec<(i64, f64)> = self
+            .backgrounds
+            .iter()
+            .map(|b| (b.id, b.meta.duration))
+            .collect();
+        let clips: Vec<Clip> = accepted
+            .iter()
+            .map(|&(id, start, end)| Clip {
+                id,
+                start,
+                need: self.need(end - start),
+            })
+            .collect();
+        gameplay::allocate(db, project_id, &tape, &clips)
+            .into_iter()
+            .map(|s| (s.clip, s))
+            .collect()
     }
 }
 
-fn new_config(a: &DefaultAssets, d: &Defaults, clip_len: f64, slice: Option<&Slice>, rng: &mut impl Rng) -> DraftConfig {
+fn new_config(
+    a: &DefaultAssets,
+    d: &Defaults,
+    clip_len: f64,
+    slice: Option<&Slice>,
+    rng: &mut impl Rng,
+) -> DraftConfig {
     DraftConfig {
+        cam_rect: None,
+        face_check: None,
         style: d.style.clone(),
         banner_id: a.banner.as_ref().map(|b| b.id),
         background_id: slice.map(|s| s.asset),
         gameplay_offset: slice.map_or(0.0, |s| s.offset),
         music_id: a.music.as_ref().map(|m| m.id),
-        music_offset: a.music.as_ref().map_or(0.0, |m| pick_offset(rng, m.meta.duration, a.need(clip_len))),
+        music_offset: a
+            .music
+            .as_ref()
+            .map_or(0.0, |m| pick_offset(rng, m.meta.duration, a.need(clip_len))),
     }
 }
 
@@ -148,7 +202,9 @@ fn accepted_moments(db: &Connection, project_id: i64) -> CmdResult<Vec<(i64, f64
     let mut st = db
         .prepare("SELECT id, start, \"end\" FROM moments WHERE project_id = ?1 AND status = 'accepted' ORDER BY start")
         .map_err(err)?;
-    let rows = st.query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(err)?;
+    let rows = st
+        .query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(err)?;
     rows.collect::<Result<_, _>>().map_err(err)
 }
 
@@ -166,7 +222,8 @@ pub(crate) fn generate(db: &Connection, project_id: i64) -> CmdResult<usize> {
         .collect::<Result<_, _>>()
         .map_err(err)?;
 
-    let defaults = load_defaults(db);
+    let defaults = crate::factory::profiles::project_defaults(db, project_id)
+        .unwrap_or_else(|| load_defaults(db));
     let assets = DefaultAssets::load(db, &defaults);
     let slices = assets.gameplay_slices(db, project_id, &accepted);
     let mut rng = rand::rng();
@@ -174,7 +231,9 @@ pub(crate) fn generate(db: &Connection, project_id: i64) -> CmdResult<usize> {
     // одна транзакция: сотни отдельных коммитов (каждый с fsync) подвешивали окно
     let tx = db.unchecked_transaction().map_err(err)?;
     {
-        let mut renumber = tx.prepare_cached("UPDATE drafts SET part = ?2 WHERE moment_id = ?1").map_err(err)?;
+        let mut renumber = tx
+            .prepare_cached("UPDATE drafts SET part = ?2 WHERE moment_id = ?1")
+            .map_err(err)?;
         let mut insert = tx.prepare_cached("INSERT INTO drafts (moment_id, part, style_json, status) VALUES (?1, ?2, ?3, 'queued')").map_err(err)?;
         for (i, (moment_id, start, end)) in accepted.iter().enumerate() {
             let part = i as i64 + 1;
@@ -182,8 +241,34 @@ pub(crate) fn generate(db: &Connection, project_id: i64) -> CmdResult<usize> {
                 renumber.execute(params![moment_id, part]).map_err(err)?;
                 continue;
             }
-            let cfg = new_config(&assets, &defaults, end - start, slices.get(moment_id), &mut rng);
-            insert.execute(params![moment_id, part, serde_json::to_string(&cfg).map_err(err)?]).map_err(err)?;
+            let mut cfg = new_config(
+                &assets,
+                &defaults,
+                end - start,
+                slices.get(moment_id),
+                &mut rng,
+            );
+            cfg.cam_rect = crate::factory::profiles::project_camera(db, project_id);
+            insert
+                .execute(params![
+                    moment_id,
+                    part,
+                    serde_json::to_string(&cfg).map_err(err)?
+                ])
+                .map_err(err)?;
+            let draft_id = tx.last_insert_rowid();
+            crate::analytics::features::capture(&tx, draft_id)?;
+            if let Some(pick) =
+                crate::campaigns::assign(&tx, project_id, draft_id, chrono::Utc::now().timestamp())?
+            {
+                cfg.banner_id = Some(pick.banner_id);
+                cfg.style.banner.enabled = true;
+                tx.execute(
+                    "UPDATE drafts SET style_json=?2 WHERE id=?1",
+                    params![draft_id, serde_json::to_string(&cfg).map_err(err)?],
+                )
+                .map_err(err)?;
+            }
             created += 1;
         }
     }
@@ -242,13 +327,20 @@ fn draft_from_row(r: &rusqlite::Row) -> rusqlite::Result<DraftDto> {
 }
 
 pub(crate) fn list(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<DraftDto>> {
-    let mut st = db.prepare(&format!("{DRAFT_SELECT} WHERE m.project_id = ?1 AND m.status = 'accepted' ORDER BY d.part"))?;
+    let mut st = db.prepare(&format!(
+        "{DRAFT_SELECT} WHERE m.project_id = ?1 AND m.status = 'accepted' ORDER BY d.part"
+    ))?;
     let rows = st.query_map([project_id], draft_from_row)?;
     rows.collect()
 }
 
 pub(crate) fn get(db: &Connection, id: i64) -> CmdResult<DraftDto> {
-    db.query_row(&format!("{DRAFT_SELECT} WHERE d.id = ?1"), [id], draft_from_row).map_err(|_| "черновик не найден".to_string())
+    db.query_row(
+        &format!("{DRAFT_SELECT} WHERE d.id = ?1"),
+        [id],
+        draft_from_row,
+    )
+    .map_err(|_| "черновик не найден".to_string())
 }
 
 fn set_status(db: &Connection, id: i64, status: &str, error: Option<&str>) {
@@ -260,30 +352,73 @@ fn set_status(db: &Connection, id: i64, status: &str, error: Option<&str>) {
 
 /// Собирает задание на рендер из того, что лежит в базе. Ничего не запускает и не читает медиафайлы,
 /// только проверяет, что они на месте.
-pub(crate) fn build_job(db: &Connection, draft_id: i64, profile: Profile, encoder: Encoder, out: PathBuf) -> CmdResult<RenderJob> {
+pub(crate) fn build_job(
+    db: &Connection,
+    draft_id: i64,
+    profile: Profile,
+    encoder: Encoder,
+    out: PathBuf,
+) -> CmdResult<RenderJob> {
+    crate::campaigns::ensure_banner(db, draft_id, &get(db, draft_id)?.config)?;
     let d = get(db, draft_id)?;
-    let (src_path, src_duration, has_audio, src_w, src_h): (String, f64, i64, f64, f64) = db
-        .query_row("SELECT path, duration, has_audio, width, height FROM projects WHERE id = ?1", [d.project_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })
+    let (mut src_path, mut src_duration, mut has_audio, mut src_w, mut src_h): (
+        String,
+        f64,
+        i64,
+        f64,
+        f64,
+    ) = db
+        .query_row(
+            "SELECT path, duration, has_audio, width, height FROM projects WHERE id = ?1",
+            [d.project_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
         .map_err(err)?;
     if !Path::new(&src_path).is_file() {
         return Err(format!("Исходное видео не найдено: {src_path}"));
     }
 
     let asset = |id: Option<i64>, kind: &str| -> CmdResult<Option<MediaRef>> {
-        let Some(a) = id.and_then(|i| load_asset(db, i)).filter(|a| a.kind == kind) else { return Ok(None) };
+        let Some(a) = id
+            .and_then(|i| load_asset(db, i))
+            .filter(|a| a.kind == kind)
+        else {
+            return Ok(None);
+        };
         if !Path::new(&a.path).is_file() {
             return Err(format!("Файл «{}» не найден: {}", a.name, a.path));
         }
-        Ok(Some(MediaRef { path: PathBuf::from(&a.path), duration: a.meta.duration, has_audio: a.meta.has_audio }))
+        Ok(Some(MediaRef {
+            path: PathBuf::from(&a.path),
+            duration: a.meta.duration,
+            has_audio: a.meta.has_audio,
+        }))
     };
-    let gameplay = asset(d.config.background_id, "background")?.ok_or("Не выбран фон: добавь геймплей в библиотеке и выбери его в настройках")?;
+    let needs_gp = d.config.style.layout == render::Layout::GameplayStack
+        || (d.config.style.layout == render::Layout::ReactionPip
+            && d.config.style.reaction.background);
+    let gameplay = match asset(d.config.background_id, "background")? {
+        Some(g) => g,
+        None if !needs_gp => MediaRef {
+            path: PathBuf::from(&src_path),
+            duration: src_duration,
+            has_audio: false,
+        },
+        None => {
+            return Err(
+                "Не выбран фон: добавь геймплей в библиотеке и выбери его в настройках".into(),
+            )
+        }
+    };
     let banner = asset(d.config.banner_id, "banner")?;
     let music = asset(d.config.music_id, "music")?;
 
-    let words: Vec<Word> = db
-        .query_row("SELECT words_json FROM analysis WHERE project_id = ?1", [d.project_id], |r| r.get::<_, String>(0))
+    let mut words: Vec<Word> = db
+        .query_row(
+            "SELECT words_json FROM analysis WHERE project_id = ?1",
+            [d.project_id],
+            |r| r.get::<_, String>(0),
+        )
         .ok()
         .and_then(|j| serde_json::from_str::<Vec<Word>>(&j).ok())
         .unwrap_or_default()
@@ -291,12 +426,43 @@ pub(crate) fn build_job(db: &Connection, draft_id: i64, profile: Profile, encode
         .filter(|w| w.end > d.start && w.start < d.end)
         .collect();
 
+    let mut offset = 0.0;
+    if crate::factory::media::proxy_project(db, d.project_id) {
+        let s = crate::factory::media::segment(db, d.project_id, d.start, d.end)?.ok_or(
+            "Не загружен фрагмент высокого качества. Повтори рендер с доступным источником.",
+        )?;
+        src_path = s.path.to_string_lossy().into_owned();
+        src_duration = s.duration;
+        has_audio = s.has_audio as i64;
+        src_w = s.width;
+        src_h = s.height;
+        offset = s.offset;
+        for word in &mut words {
+            word.start -= offset;
+            word.end -= offset;
+        }
+    }
+
+    let mut style = d.config.style;
+    style.banner.alpha = d
+        .config
+        .banner_id
+        .and_then(|id| load_asset(db, id))
+        .is_some_and(|a| a.meta.alpha);
     Ok(RenderJob {
+        cam_rect: d
+            .config
+            .cam_rect
+            .filter(|_| d.config.face_check.as_ref().is_some_and(|c| c.present())),
         decode: Default::default(),
-        source: MediaRef { path: PathBuf::from(src_path), duration: src_duration, has_audio: has_audio != 0 },
+        source: MediaRef {
+            path: PathBuf::from(src_path),
+            duration: src_duration,
+            has_audio: has_audio != 0,
+        },
         source_aspect: if src_h > 0.0 { src_w / src_h } else { 0.0 },
-        start: d.start,
-        end: d.end,
+        start: d.start - offset,
+        end: d.end - offset,
         banner_at: banner.as_ref().map(|_| (d.climax - d.start).max(0.0)),
         banner,
         gameplay,
@@ -305,7 +471,15 @@ pub(crate) fn build_job(db: &Connection, draft_id: i64, profile: Profile, encode
         music_offset: d.config.music_offset,
         words,
         part: Some(d.part as u32),
-        style: d.config.style,
+        hook: db
+            .query_row(
+                "SELECT CASE WHEN llm_score>0 THEN title END FROM moments WHERE id=?1",
+                [d.moment_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten(),
+        style,
         profile,
         encoder,
         out,
@@ -347,9 +521,14 @@ struct RenderFailed {
 
 /// Папка для готовых роликов: из настроек или `~/Videos/Автонарезка`.
 pub(crate) fn output_dir(db: &Connection) -> PathBuf {
-    kv_get(db, "output_dir").map(PathBuf::from).unwrap_or_else(|| {
-        crate::platform::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Videos").join("Автонарезка")
-    })
+    kv_get(db, "output_dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::platform::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Videos")
+                .join("Автонарезка")
+        })
 }
 
 /// Включено ли декодирование на видеокарте (NVDEC). По умолчанию выключено: замер на 1080p показал, что оно не быстрее
@@ -362,9 +541,22 @@ pub(crate) fn gpu_decode_allowed(db: &Connection) -> bool {
 
 /// Имя файла без символов, которые ломают пути.
 pub(crate) fn safe_name(s: &str) -> String {
-    let t: String = s.chars().map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_') { c } else { '_' }).collect();
+    let t: String = s
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     let t = t.trim().trim_matches('_').to_string();
-    if t.is_empty() { "ролик".into() } else { t.chars().take(80).collect() }
+    if t.is_empty() {
+        "ролик".into()
+    } else {
+        t.chars().take(80).collect()
+    }
 }
 
 /// Свободное имя: `имя.mp4`, затем `имя_2.mp4` и так далее.
@@ -373,7 +565,10 @@ pub(crate) fn free_path(dir: &Path, stem: &str) -> PathBuf {
     if !first.exists() {
         return first;
     }
-    (2..).map(|n| dir.join(format!("{stem}_{n}.mp4"))).find(|p| !p.exists()).unwrap()
+    (2..)
+        .map(|n| dir.join(format!("{stem}_{n}.mp4")))
+        .find(|p| !p.exists())
+        .unwrap()
 }
 
 /// Ставит рендер в очередь. Повторный вызов для уже идущего рендера ничего не делает.
@@ -402,20 +597,39 @@ fn queue_render(app: AppHandle, draft_id: i64, kind: RenderKind, announce: bool)
         running.insert(draft_id, tx);
     }
     if announce {
-        let queued = if kind == RenderKind::Draft { "queued" } else { "final_queued" };
+        let queued = if kind == RenderKind::Draft {
+            "queued"
+        } else {
+            "final_queued"
+        };
         set_status(&state.db.0.lock().unwrap(), draft_id, queued, None);
-        let _ = app.emit("render-progress", RenderProgress { draft_id, kind, fraction: 0.0 });
+        let _ = app.emit(
+            "render-progress",
+            RenderProgress {
+                draft_id,
+                kind,
+                fraction: 0.0,
+            },
+        );
     }
 
-    tauri::async_runtime::spawn(async move {
+    crate::host::spawn(async move {
         let state = app.state::<AppState>();
-        let slots = if kind == RenderKind::Draft { state.draft_slots.clone() } else { state.final_slots.clone() };
+        let slots = if kind == RenderKind::Draft {
+            state.draft_slots.clone()
+        } else {
+            state.final_slots.clone()
+        };
         let _permit = slots.acquire_owned().await;
 
         let result = if *rx.borrow() {
             Err(anyhow::anyhow!("рендер отменён"))
         } else {
-            let rendering = if kind == RenderKind::Draft { "rendering" } else { "final_rendering" };
+            let rendering = if kind == RenderKind::Draft {
+                "rendering"
+            } else {
+                "final_rendering"
+            };
             set_status(&state.db.0.lock().unwrap(), draft_id, rendering, None);
             run_one(&app, draft_id, kind, rx.clone()).await
         };
@@ -435,47 +649,115 @@ fn queue_render(app: AppHandle, draft_id: i64, kind: RenderKind, announce: bool)
                     (RenderKind::Final, false) => "final_failed",
                     (RenderKind::Draft, _) => "failed",
                 };
-                set_status(&state.db.0.lock().unwrap(), draft_id, status, (!cancelled || kind == RenderKind::Draft).then_some(message.as_str()));
-                let _ = app.emit("render-error", RenderFailed { draft_id, kind, message, cancelled });
+                set_status(
+                    &state.db.0.lock().unwrap(),
+                    draft_id,
+                    status,
+                    (!cancelled || kind == RenderKind::Draft).then_some(message.as_str()),
+                );
+                let _ = app.emit(
+                    "render-error",
+                    RenderFailed {
+                        draft_id,
+                        kind,
+                        message,
+                        cancelled,
+                    },
+                );
             }
         }
     });
 }
 
-async fn run_one(app: &AppHandle, draft_id: i64, kind: RenderKind, cancel: watch::Receiver<bool>) -> anyhow::Result<()> {
+async fn run_one(
+    app: &AppHandle,
+    draft_id: i64,
+    kind: RenderKind,
+    cancel: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
-    let nvenc = *state.nvenc.get_or_init(|| async { media::check_env().await.nvenc }).await;
-    let mut encoder = if nvenc { Encoder::Nvenc } else { Encoder::X264 };
-    let cuda = *state.cuda.get_or_init(|| async { media::check_env().await.cuda }).await;
+    let _source_use = state.source_use.read().await;
+    crate::factory::media::prepare_draft(app, draft_id, cancel.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    verify_camera(app, draft_id, cancel.clone()).await?;
+    let nvenc = *state
+        .nvenc
+        .get_or_init(|| async { media::check_env().await.nvenc })
+        .await;
+    let encoder = if nvenc { Encoder::Nvenc } else { Encoder::X264 };
+    let cuda = *state
+        .cuda
+        .get_or_init(|| async { media::check_env().await.cuda })
+        .await;
     // декодирование на видеокарте: только вместе с NVENC (значит, карта NVIDIA есть) и если не отключено
-    let mut decode = if nvenc && cuda && gpu_decode_allowed(&state.db.0.lock().unwrap()) { Decode::Nvidia } else { Decode::Cpu };
-    let profile = if kind == RenderKind::Draft { Profile::Draft } else { Profile::Final };
+    let decode = if nvenc && cuda && gpu_decode_allowed(&state.db.0.lock().unwrap()) {
+        Decode::Nvidia
+    } else {
+        Decode::Cpu
+    };
+    let profile = if kind == RenderKind::Draft {
+        Profile::Draft
+    } else {
+        Profile::Final
+    };
 
     let (project_id, title, part) = {
         let d = get(&state.db.0.lock().unwrap(), draft_id).map_err(|e| anyhow::anyhow!(e))?;
         (d.project_id, d.title, d.part)
     };
     let out = match kind {
-        RenderKind::Draft => state.data_dir.join("drafts").join(project_id.to_string()).join(format!("draft_{draft_id}.mp4")),
+        RenderKind::Draft => state
+            .data_dir
+            .join("drafts")
+            .join(project_id.to_string())
+            .join(format!("draft_{draft_id}.mp4")),
         RenderKind::Final => {
             let db = state.db.0.lock().unwrap();
-            let project_title: String = db.query_row("SELECT title FROM projects WHERE id = ?1", [project_id], |r| r.get(0)).unwrap_or_default();
+            let project_title: String = db
+                .query_row(
+                    "SELECT title FROM projects WHERE id = ?1",
+                    [project_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
             let dir = output_dir(&db);
             std::fs::create_dir_all(&dir)?;
-            free_path(&dir, &format!("{}_часть{part}_{}", safe_name(&project_title), safe_name(&title)))
+            free_path(
+                &dir,
+                &format!(
+                    "{}_часть{part}_{}",
+                    safe_name(&project_title),
+                    safe_name(&title)
+                ),
+            )
         }
     };
 
     let work = state.data_dir.join("tmp");
     let fonts = state.fonts_dir();
-    loop {
-        let mut job = build_job(&state.db.0.lock().unwrap(), draft_id, profile, encoder, out.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    {
+        let mut job = build_job(
+            &state.db.0.lock().unwrap(),
+            draft_id,
+            profile,
+            encoder,
+            out.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
         job.decode = decode;
         let (handle, mut last) = (app.clone(), 0.0f64);
         let res = render::render(&job, &work, Some(&fonts), cancel.clone(), move |f| {
             if f - last >= 0.02 || f >= 1.0 {
                 last = f;
-                let _ = handle.emit("render-progress", RenderProgress { draft_id, kind, fraction: f });
+                let _ = handle.emit(
+                    "render-progress",
+                    RenderProgress {
+                        draft_id,
+                        kind,
+                        fraction: f,
+                    },
+                );
             }
         })
         .await;
@@ -483,7 +765,9 @@ async fn run_one(app: &AppHandle, draft_id: i64, kind: RenderKind, cancel: watch
             Ok(()) => {
                 if kind == RenderKind::Draft {
                     let poster = out.with_extension("jpg");
-                    let at = job.freeze().map_or(job.clip_len() * 0.4, |(tb, d)| tb + (d * 0.5).min(1.5));
+                    let at = job
+                        .freeze()
+                        .map_or(job.clip_len() * 0.4, |(tb, d)| tb + (d * 0.5).min(1.5));
                     let ok = media::make_poster(&out, &poster, at).await.is_ok();
                     // блокировка базы берётся после последнего await
                     state.db.0.lock().unwrap().execute(
@@ -498,38 +782,120 @@ async fn run_one(app: &AppHandle, draft_id: i64, kind: RenderKind, cancel: watch
                 }
                 return Ok(());
             }
-            // NVDEC мог отказать (нет поддержки в сборке, драйвер): один раз декодируем на процессоре
-            Err(e) if decode == Decode::Nvidia && !*cancel.borrow() => {
-                tracing::warn!("NVDEC не справился ({e:#}), повторяю с декодированием на процессоре");
-                decode = Decode::Cpu;
-            }
-            // NVENC мог отказать (занят, нет драйвера): один раз повторяем на процессоре
-            Err(e) if encoder == Encoder::Nvenc && !*cancel.borrow() => {
-                tracing::warn!("NVENC не справился ({e:#}), повторяю на процессоре");
-                encoder = Encoder::X264;
-            }
             Err(e) => return Err(e),
         }
     }
 }
 
-/// Финал без надписи «Часть N» для выкладки через пул аккаунтов. Это отдельный файл, обычный финал не меняется.
-/// Надпись рисуется только при номере части, поэтому у копии номер просто не передаётся.
-pub(crate) async fn render_pool_copy(app: &AppHandle, draft_id: i64, out: &Path, on_progress: impl FnMut(f64)) -> anyhow::Result<()> {
+async fn verify_camera(
+    app: &AppHandle,
+    draft_id: i64,
+    cancel: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    use crate::analyze::face::detector::{self, Check};
     let state = app.state::<AppState>();
-    let nvenc = *state.nvenc.get_or_init(|| async { media::check_env().await.nvenc }).await;
+    let d = get(&state.db.0.lock().unwrap(), draft_id).map_err(anyhow::Error::msg)?;
+    if d.config.style.layout == render::Layout::GameplayStack {
+        return Ok(());
+    }
+    let mut cfg = d.config.clone();
+    let job = build_job(
+        &state.db.0.lock().unwrap(),
+        draft_id,
+        Profile::Draft,
+        Encoder::X264,
+        PathBuf::new(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let fingerprint = format!(
+        "{}:{}:{:.3}:{:.3}:{:?}",
+        job.source.path.display(),
+        crate::factory::qc::file_stamp(&job.source.path),
+        job.start,
+        job.end,
+        cfg.cam_rect
+    );
+    if cfg
+        .face_check
+        .as_ref()
+        .is_some_and(|c| c.fingerprint == fingerprint && c.error.is_none())
+    {
+        return Ok(());
+    }
+    let result = async {
+        let rect = cfg
+            .cam_rect
+            .ok_or_else(|| anyhow::anyhow!("Сначала подтверди область камеры в профиле канала"))?;
+        if !crate::model_download::face_ready(&state.models_dir()) {
+            anyhow::bail!("YuNet не загружена. Открой настройку камеры канала");
+        }
+        let _ml = state.ml_gate.acquire().await?;
+        let meta = media::probe(&job.source.path).await?;
+        detector::check_clip(
+            &job.source.path,
+            &state.models_dir().join(crate::model_download::FACE_REL),
+            job.start,
+            job.clip_len(),
+            meta.width,
+            meta.height,
+            rect,
+            cancel.clone(),
+        )
+        .await
+    }
+    .await;
+    if *cancel.borrow() {
+        anyhow::bail!("Рендер остановлен");
+    }
+    let mut check = result.unwrap_or_else(|e| Check::unavailable(format!("{e:#}")));
+    check.fingerprint = fingerprint;
+    cfg.face_check = Some(check);
+    state.db.0.lock().unwrap().execute(
+        "UPDATE drafts SET style_json=?2,updated_at=unixepoch() WHERE id=?1",
+        params![draft_id, serde_json::to_string(&cfg)?],
+    )?;
+    Ok(())
+}
+
+/// Подготавливаем HQ и проверку лица до фиксации графа выходного варианта.
+/// Хэш и ffmpeg затем используют один снимок, даже если редактор изменился во время рендера.
+/// Обобщённый прежний render_pool_copy: обычный финал не меняется, у копии без Части номер не передаётся.
+pub(crate) async fn output_job(
+    app: &AppHandle,
+    draft_id: i64,
+    out: &Path,
+    remove_part: bool,
+) -> anyhow::Result<RenderJob> {
+    let state = app.state::<AppState>();
+    let (_prepare_tx, prepare_rx) = watch::channel(false);
+    crate::factory::media::prepare_draft(app, draft_id, prepare_rx.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    verify_camera(app, draft_id, prepare_rx).await?;
+    let nvenc = *state
+        .nvenc
+        .get_or_init(|| async { media::check_env().await.nvenc })
+        .await;
     let encoder = if nvenc { Encoder::Nvenc } else { Encoder::X264 };
-    let cuda = *state.cuda.get_or_init(|| async { media::check_env().await.cuda }).await;
-    let mut job = build_job(&state.db.0.lock().unwrap(), draft_id, Profile::Final, encoder, out.to_path_buf()).map_err(|e| anyhow::anyhow!(e))?;
+    let cuda = *state
+        .cuda
+        .get_or_init(|| async { media::check_env().await.cuda })
+        .await;
+    let mut job = build_job(
+        &state.db.0.lock().unwrap(),
+        draft_id,
+        Profile::Final,
+        encoder,
+        out.to_path_buf(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     if nvenc && cuda && gpu_decode_allowed(&state.db.0.lock().unwrap()) {
         job.decode = Decode::Nvidia;
     }
-    job.part = None;
-    // отмены у этого рендера нет; сигнал держим живым, пока идёт рендер
-    let (_cancel_tx, cancel) = watch::channel(false);
-    let work = state.data_dir.join("tmp");
-    let fonts = state.fonts_dir();
-    render::render(&job, &work, Some(&fonts), cancel, on_progress).await
+    if remove_part {
+        job.part = None;
+    }
+    Ok(job)
 }
 
 /// Что менять в моменте вместе с настройками ролика.
@@ -543,11 +909,12 @@ pub struct Bounds {
 
 /// Допустимо ли вручную перевести черновик в такой статус из текущего.
 pub(crate) fn can_set_status(current: &str, new: &str) -> bool {
-    ["ready", "approved", "rejected"].contains(&new) && ["ready", "approved", "rejected", "final_failed"].contains(&current)
+    ["ready", "approved", "rejected"].contains(&new)
+        && ["ready", "approved", "rejected", "final_failed"].contains(&current)
 }
 
 /// `async`: команда идёт не в главном потоке окна, иначе пока она работает, интерфейс стоит.
-#[tauri::command(async)]
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn drafts_generate(app: AppHandle, project_id: i64) -> CmdResult<usize> {
     generate_and_render(&app, project_id)
 }
@@ -558,7 +925,12 @@ pub(crate) fn generate_and_render(app: &AppHandle, project_id: i64) -> CmdResult
     let (created, ids): (usize, Vec<i64>) = {
         let db = state.db.0.lock().unwrap();
         let created = generate(&db, project_id)?;
-        let ids = list(&db, project_id).map_err(err)?.into_iter().filter(|d| d.status == "queued").map(|d| d.id).collect();
+        let ids = list(&db, project_id)
+            .map_err(err)?
+            .into_iter()
+            .filter(|d| d.status == "queued")
+            .map(|d| d.id)
+            .collect();
         (created, ids)
     };
     spawn_renders(app, &ids, RenderKind::Draft);
@@ -574,17 +946,17 @@ pub(crate) fn approve_ready(db: &Connection, project_id: i64) -> rusqlite::Resul
     )
 }
 
-#[tauri::command(async)]
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn drafts_approve_ready(state: State<'_, AppState>, project_id: i64) -> CmdResult<usize> {
     approve_ready(&state.db.0.lock().unwrap(), project_id).map_err(err)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn drafts_list(state: State<'_, AppState>, project_id: i64) -> CmdResult<Vec<DraftDto>> {
     list(&state.db.0.lock().unwrap(), project_id).map_err(err)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn draft_set_status(state: State<'_, AppState>, id: i64, status: String) -> CmdResult<()> {
     let db = state.db.0.lock().unwrap();
     let cur = get(&db, id)?.status;
@@ -596,16 +968,27 @@ pub fn draft_set_status(state: State<'_, AppState>, id: i64, status: String) -> 
 }
 
 /// Сохраняет настройки (и при необходимости границы момента) и пересобирает черновик.
-#[tauri::command]
-pub fn draft_update(app: AppHandle, state: State<'_, AppState>, id: i64, config: DraftConfig, bounds: Option<Bounds>) -> CmdResult<MomentDto> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn draft_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    config: DraftConfig,
+    bounds: Option<Bounds>,
+) -> CmdResult<MomentDto> {
     let moment = {
         let db = state.db.0.lock().unwrap();
         let d = get(&db, id)?;
+        crate::campaigns::ensure_banner(&db, id, &config)?;
         let moment = match bounds {
             Some(b) => update_moment(&db, d.moment_id, b.start, b.end, Some(b.climax))?,
             None => update_moment(&db, d.moment_id, d.start, d.end, Some(d.climax))?,
         };
-        db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&config).map_err(err)?]).map_err(err)?;
+        db.execute(
+            "UPDATE drafts SET style_json = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(&config).map_err(err)?],
+        )
+        .map_err(err)?;
         moment
     };
     spawn_render(app, id, RenderKind::Draft);
@@ -625,7 +1008,9 @@ pub(crate) fn fill_missing_assets(db: &Connection, id: i64) -> CmdResult<bool> {
         return Ok(false);
     }
     let slices = assets.gameplay_slices(db, d.project_id, &accepted_moments(db, d.project_id)?);
-    let Some(place) = slices.get(&d.moment_id) else { return Ok(false) };
+    let Some(place) = slices.get(&d.moment_id) else {
+        return Ok(false);
+    };
     d.config.background_id = Some(place.asset);
     d.config.gameplay_offset = place.offset;
     if d.config.banner_id.is_none() {
@@ -637,11 +1022,15 @@ pub(crate) fn fill_missing_assets(db: &Connection, id: i64) -> CmdResult<bool> {
             d.config.music_offset = pick_offset(&mut rand::rng(), m.meta.duration, d.end - d.start);
         }
     }
-    db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&d.config).map_err(err)?]).map_err(err)?;
+    db.execute(
+        "UPDATE drafts SET style_json = ?2 WHERE id = ?1",
+        params![id, serde_json::to_string(&d.config).map_err(err)?],
+    )
+    .map_err(err)?;
     Ok(true)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn draft_rerender(app: AppHandle, state: State<'_, AppState>, id: i64) {
     let _ = fill_missing_assets(&state.db.0.lock().unwrap(), id);
     spawn_render(app, id, RenderKind::Draft);
@@ -663,51 +1052,73 @@ pub(crate) fn realign_gameplay(db: &Connection, project_id: i64) -> CmdResult<Ve
         if !matches!(d.status.as_str(), "ready" | "failed" | "rejected") {
             continue;
         }
-        let Some(place) = slices.get(&d.moment_id) else { continue };
+        let Some(place) = slices.get(&d.moment_id) else {
+            continue;
+        };
         let mut cfg = d.config.clone();
         cfg.background_id = Some(place.asset);
         cfg.gameplay_offset = place.offset;
         upgrade_layout(&mut cfg.style);
 
-        let (before, after) = (serde_json::to_string(&d.config).map_err(err)?, serde_json::to_string(&cfg).map_err(err)?);
+        let (before, after) = (
+            serde_json::to_string(&d.config).map_err(err)?,
+            serde_json::to_string(&cfg).map_err(err)?,
+        );
         if before == after {
             continue;
         }
-        db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![d.id, after]).map_err(err)?;
+        db.execute(
+            "UPDATE drafts SET style_json = ?2 WHERE id = ?1",
+            params![d.id, after],
+        )
+        .map_err(err)?;
         set_status(db, d.id, "queued", None);
         changed.push(d.id);
     }
     Ok(changed)
 }
 
-#[tauri::command(async)]
-pub fn drafts_realign_gameplay(app: AppHandle, state: State<'_, AppState>, project_id: i64) -> CmdResult<usize> {
+#[cfg_attr(feature = "desktop", tauri::command(async))]
+pub fn drafts_realign_gameplay(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: i64,
+) -> CmdResult<usize> {
     let ids = realign_gameplay(&state.db.0.lock().unwrap(), project_id)?;
     spawn_renders(&app, &ids, RenderKind::Draft);
     Ok(ids.len())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn draft_cancel(state: State<'_, AppState>, id: i64) {
     if let Some(tx) = state.renders.lock().unwrap().get(&id) {
         let _ = tx.send(true);
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn defaults_get(state: State<'_, AppState>) -> Defaults {
     load_defaults(&state.db.0.lock().unwrap())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn defaults_set(state: State<'_, AppState>, mut defaults: Defaults) -> CmdResult<()> {
     // то, что сохраняет пользователь, уже новой раскладки: старые умолчания второй раз не «обновляются»
     defaults.layout_v = LAYOUT_V;
-    kv_set(&state.db.0.lock().unwrap(), "draft_defaults", &serde_json::to_string(&defaults).map_err(err)?).map_err(err)
+    let db = state.db.0.lock().unwrap();
+    let tx = db.unchecked_transaction().map_err(err)?;
+    let json = serde_json::to_string(&defaults).map_err(err)?;
+    kv_set(&tx, "draft_defaults", &json).map_err(err)?;
+    tx.execute(
+        "UPDATE templates SET config=?1,updated_at=unixepoch() WHERE is_default=1",
+        [&json],
+    )
+    .map_err(err)?;
+    tx.commit().map_err(err)
 }
 
 /// Запускает финальный рендер одобренных черновиков.
-#[tauri::command(async)]
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn finals_start(app: AppHandle, project_id: i64) -> CmdResult<usize> {
     start_finals(&app, project_id)
 }
@@ -717,7 +1128,12 @@ pub(crate) fn start_finals(app: &AppHandle, project_id: i64) -> CmdResult<usize>
     let state = app.state::<AppState>();
     let ids: Vec<i64> = {
         let db = state.db.0.lock().unwrap();
-        let ids: Vec<i64> = list(&db, project_id).map_err(err)?.into_iter().filter(|d| d.status == "approved" || d.status == "final_failed").map(|d| d.id).collect();
+        let ids: Vec<i64> = list(&db, project_id)
+            .map_err(err)?
+            .into_iter()
+            .filter(|d| d.status == "approved" || d.status == "final_failed")
+            .map(|d| d.id)
+            .collect();
         if ids.is_empty() {
             return Err("Нет одобренных черновиков".into());
         }
@@ -734,7 +1150,8 @@ pub(crate) fn start_finals(app: &AppHandle, project_id: i64) -> CmdResult<usize>
 
 /// Открывает путь в программе по умолчанию. Не ждёт её завершения.
 fn open_in_system(path: &Path) -> CmdResult<()> {
-    crate::platform::open_path(path).map_err(|e| format!("Не удалось открыть: {e}{}", crate::platform::OPENER_HINT))
+    crate::platform::open_path(path)
+        .map_err(|e| format!("Не удалось открыть: {e}{}", crate::platform::OPENER_HINT))
 }
 
 /// Файл готового ролика или папка, где он лежит. Путь берётся из базы по id, а не от интерфейса.
@@ -744,28 +1161,36 @@ pub(crate) fn final_location(db: &Connection, draft_id: i64, folder: bool) -> Cm
     if !file.is_file() {
         return Err(format!("Файл не найден: {}", file.display()));
     }
-    Ok(if folder { file.parent().map(Path::to_path_buf).ok_or("Нет папки у файла")? } else { file })
+    Ok(if folder {
+        file.parent()
+            .map(Path::to_path_buf)
+            .ok_or("Нет папки у файла")?
+    } else {
+        file
+    })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn final_open(state: State<'_, AppState>, id: i64, folder: bool) -> CmdResult<()> {
     let path = final_location(&state.db.0.lock().unwrap(), id, folder)?;
     open_in_system(&path)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn output_dir_open(state: State<'_, AppState>) -> CmdResult<()> {
     let dir = output_dir(&state.db.0.lock().unwrap());
     std::fs::create_dir_all(&dir).map_err(|e| format!("Не удалось создать папку: {e}"))?;
     open_in_system(&dir)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn output_dir_get(state: State<'_, AppState>) -> String {
-    output_dir(&state.db.0.lock().unwrap()).display().to_string()
+    output_dir(&state.db.0.lock().unwrap())
+        .display()
+        .to_string()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn output_dir_set(state: State<'_, AppState>, path: String) -> CmdResult<()> {
     std::fs::create_dir_all(&path).map_err(|e| format!("Не удалось создать папку: {e}"))?;
     kv_set(&state.db.0.lock().unwrap(), "output_dir", &path).map_err(err)
@@ -774,7 +1199,10 @@ pub fn output_dir_set(state: State<'_, AppState>, path: String) -> CmdResult<()>
 /// После перезапуска приложения незавершённые рендеры прерваны.
 pub(crate) fn recover_interrupted(db: &Connection) {
     let _ = db.execute("UPDATE drafts SET status = 'failed', error = 'Рендер прерван: приложение было закрыто' WHERE status IN ('queued', 'rendering')", []);
-    let _ = db.execute("UPDATE drafts SET status = 'approved' WHERE status IN ('final_queued', 'final_rendering')", []);
+    let _ = db.execute(
+        "UPDATE drafts SET status = 'approved' WHERE status IN ('final_queued', 'final_rendering')",
+        [],
+    );
 }
 
 #[cfg(test)]
@@ -805,14 +1233,32 @@ mod tests {
         )
         .unwrap();
         let words = serde_json::to_string(&vec![
-            Word { text: "до".into(), start: 90.0, end: 90.4 },
-            Word { text: "внутри".into(), start: 110.0, end: 110.5 },
-            Word { text: "после".into(), start: 500.0, end: 500.4 },
+            Word {
+                text: "до".into(),
+                start: 90.0,
+                end: 90.4,
+            },
+            Word {
+                text: "внутри".into(),
+                start: 110.0,
+                end: 110.5,
+            },
+            Word {
+                text: "после".into(),
+                start: 500.0,
+                end: 500.4,
+            },
         ])
         .unwrap();
         db.execute("INSERT INTO analysis (project_id, signals_json, words_json, sentences_json) VALUES (1, '{}', ?1, '[]')", [words]).unwrap();
         // моменты: 3 принятых (позже по времени идут раньше в таблице), один отклонён, один в очереди
-        for (start, end, status) in [(300.0, 340.0, "accepted"), (100.0, 140.0, "accepted"), (200.0, 230.0, "rejected"), (400.0, 440.0, "candidate"), (600.0, 650.0, "accepted")] {
+        for (start, end, status) in [
+            (300.0, 340.0, "accepted"),
+            (100.0, 140.0, "accepted"),
+            (200.0, 230.0, "rejected"),
+            (400.0, 440.0, "candidate"),
+            (600.0, 650.0, "accepted"),
+        ] {
             db.execute(
                 "INSERT INTO moments (project_id, start, \"end\", title, climax_t, status) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
                 params![start, end, format!("м{start}"), start + 20.0, status],
@@ -822,7 +1268,12 @@ mod tests {
         let asset = |kind: &str, name: &str, dur: f64, audio: bool| {
             db.execute(
                 "INSERT INTO assets (kind, path, name, meta_json) VALUES (?1, ?2, ?3, ?4)",
-                params![kind, touch(&dir, &format!("{name}.mp4")), name, format!("{{\"duration\":{dur},\"hasAudio\":{audio}}}")],
+                params![
+                    kind,
+                    touch(&dir, &format!("{name}.mp4")),
+                    name,
+                    format!("{{\"duration\":{dur},\"hasAudio\":{audio}}}")
+                ],
             )
             .unwrap();
         };
@@ -838,7 +1289,12 @@ mod tests {
     }
 
     fn full_defaults() -> Defaults {
-        Defaults { banner_id: Some(1), background_ids: vec![2, 3], music_id: Some(4), ..Default::default() }
+        Defaults {
+            banner_id: Some(1),
+            background_ids: vec![2, 3],
+            music_id: Some(4),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -846,9 +1302,16 @@ mod tests {
         let mut rng = rand::rng();
         for _ in 0..500 {
             let o = pick_offset(&mut rng, 900.0, 60.0);
-            assert!((0.0..=839.0).contains(&o) && (o * 2.0).fract() == 0.0, "{o}");
+            assert!(
+                (0.0..=839.0).contains(&o) && (o * 2.0).fract() == 0.0,
+                "{o}"
+            );
         }
-        assert_eq!(pick_offset(&mut rng, 30.0, 60.0), 0.0, "короткий файл — с нуля");
+        assert_eq!(
+            pick_offset(&mut rng, 30.0, 60.0),
+            0.0,
+            "короткий файл — с нуля"
+        );
         assert_eq!(pick_offset(&mut rng, 60.5, 60.0), 0.0);
     }
 
@@ -858,7 +1321,10 @@ mod tests {
         set_defaults(&e, &full_defaults());
         assert_eq!(generate(&e.db, 1).unwrap(), 3);
         let drafts = list(&e.db, 1).unwrap();
-        assert_eq!(drafts.iter().map(|d| (d.part, d.start)).collect::<Vec<_>>(), vec![(1, 100.0), (2, 300.0), (3, 600.0)]);
+        assert_eq!(
+            drafts.iter().map(|d| (d.part, d.start)).collect::<Vec<_>>(),
+            vec![(1, 100.0), (2, 300.0), (3, 600.0)]
+        );
         assert!(drafts.iter().all(|d| d.status == "queued"));
         for d in &drafts {
             assert_eq!(d.config.banner_id, Some(1));
@@ -867,7 +1333,9 @@ mod tests {
             assert_eq!(d.config.background_id, Some(2));
             assert_eq!(d.config.gameplay_offset, d.start);
         }
-        let st: String = e.db.query_row("SELECT status FROM projects WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let st: String =
+            e.db.query_row("SELECT status FROM projects WHERE id = 1", [], |r| r.get(0))
+                .unwrap();
         assert_eq!(st, "drafts");
     }
 
@@ -877,7 +1345,10 @@ mod tests {
         generate(&e.db, 1).unwrap(); // умолчаний ещё нет: фон не выбран
         let id = list(&e.db, 1).unwrap()[0].id;
         assert_eq!(get(&e.db, id).unwrap().config.background_id, None);
-        assert!(!fill_missing_assets(&e.db, id).unwrap(), "выбирать пока нечего");
+        assert!(
+            !fill_missing_assets(&e.db, id).unwrap(),
+            "выбирать пока нечего"
+        );
 
         set_defaults(&e, &full_defaults());
         assert!(fill_missing_assets(&e.db, id).unwrap());
@@ -885,7 +1356,10 @@ mod tests {
         // момент 100..140: фон берётся с той же секунды
         assert_eq!((c.background_id, c.gameplay_offset), (Some(2), 100.0));
         assert_eq!((c.banner_id, c.music_id), (Some(1), Some(4)));
-        assert!(!fill_missing_assets(&e.db, id).unwrap(), "выбранное не перезаписывается");
+        assert!(
+            !fill_missing_assets(&e.db, id).unwrap(),
+            "выбранное не перезаписывается"
+        );
     }
 
     fn add_project(e: &Env, id: i64, moments: &[(f64, f64)]) {
@@ -900,26 +1374,50 @@ mod tests {
     }
 
     fn gameplay_of(e: &Env, project_id: i64) -> Vec<(i64, Option<i64>, f64)> {
-        list(&e.db, project_id).unwrap().iter().map(|d| (d.part, d.config.background_id, d.config.gameplay_offset)).collect()
+        list(&e.db, project_id)
+            .unwrap()
+            .iter()
+            .map(|d| (d.part, d.config.background_id, d.config.gameplay_offset))
+            .collect()
     }
 
     #[test]
     fn the_next_video_continues_the_gameplay_where_the_previous_one_ended() {
         let e = env("tape");
-        set_defaults(&e, &Defaults { banner_id: Some(1), background_ids: vec![2], ..Default::default() });
+        set_defaults(
+            &e,
+            &Defaults {
+                banner_id: Some(1),
+                background_ids: vec![2],
+                ..Default::default()
+            },
+        );
         generate(&e.db, 1).unwrap();
         // клипы 100..140, 300..340, 600..650 и баннер 4 с: лента дошла до 654-й секунды фона
-        assert_eq!(gameplay_of(&e, 1), vec![(1, Some(2), 100.0), (2, Some(2), 300.0), (3, Some(2), 600.0)]);
+        assert_eq!(
+            gameplay_of(&e, 1),
+            vec![
+                (1, Some(2), 100.0),
+                (2, Some(2), 300.0),
+                (3, Some(2), 600.0)
+            ]
+        );
 
         add_project(&e, 2, &[(50.0, 90.0), (120.0, 160.0)]);
         generate(&e.db, 2).unwrap();
-        assert_eq!(gameplay_of(&e, 2), vec![(1, Some(2), 704.0), (2, Some(2), 774.0)]);
+        assert_eq!(
+            gameplay_of(&e, 2),
+            vec![(1, Some(2), 704.0), (2, Some(2), 774.0)]
+        );
 
         // повторный запуск и новые моменты в первом видео ленту второго не сдвигают
         e.db.execute("INSERT INTO moments (project_id, start, \"end\", title, status) VALUES (1, 10, 30, 'раньше', 'accepted')", []).unwrap();
         generate(&e.db, 1).unwrap();
         generate(&e.db, 2).unwrap();
-        assert_eq!(gameplay_of(&e, 2), vec![(1, Some(2), 704.0), (2, Some(2), 774.0)]);
+        assert_eq!(
+            gameplay_of(&e, 2),
+            vec![(1, Some(2), 704.0), (2, Some(2), 774.0)]
+        );
 
         // третье видео идёт сразу за вторым (его последний клип кончается на 774 + 44 = 818-й секунде)
         add_project(&e, 3, &[(0.0, 40.0)]);
@@ -930,7 +1428,13 @@ mod tests {
     #[test]
     fn restarting_the_tape_begins_the_next_generation_from_the_start() {
         let e = env("restart");
-        set_defaults(&e, &Defaults { background_ids: vec![2], ..Default::default() });
+        set_defaults(
+            &e,
+            &Defaults {
+                background_ids: vec![2],
+                ..Default::default()
+            },
+        );
         generate(&e.db, 1).unwrap();
         gameplay::reset(&e.db);
         add_project(&e, 2, &[(50.0, 90.0)]);
@@ -941,7 +1445,14 @@ mod tests {
     #[test]
     fn realign_changes_only_drafts_that_can_still_change_and_upgrades_the_old_layout() {
         let e = env("realign");
-        set_defaults(&e, &Defaults { banner_id: Some(1), background_ids: vec![2], ..Default::default() });
+        set_defaults(
+            &e,
+            &Defaults {
+                banner_id: Some(1),
+                background_ids: vec![2],
+                ..Default::default()
+            },
+        );
         generate(&e.db, 1).unwrap();
         let ids: Vec<i64> = list(&e.db, 1).unwrap().iter().map(|d| d.id).collect();
 
@@ -951,28 +1462,65 @@ mod tests {
             c.gameplay_offset = GAMEPLAY_START;
             c.style.top_fit = TopFit::Fill;
             c.style.top_crop_bottom = 0.2;
-            e.db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&c).unwrap()]).unwrap();
+            e.db.execute(
+                "UPDATE drafts SET style_json = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&c).unwrap()],
+            )
+            .unwrap();
         }
-        e.db.execute("UPDATE drafts SET status = 'ready' WHERE id = ?1", [ids[0]]).unwrap();
-        e.db.execute("UPDATE drafts SET status = 'approved' WHERE id = ?1", [ids[1]]).unwrap();
-        e.db.execute("UPDATE drafts SET status = 'failed' WHERE id = ?1", [ids[2]]).unwrap();
+        e.db.execute("UPDATE drafts SET status = 'ready' WHERE id = ?1", [ids[0]])
+            .unwrap();
+        e.db.execute(
+            "UPDATE drafts SET status = 'approved' WHERE id = ?1",
+            [ids[1]],
+        )
+        .unwrap();
+        e.db.execute(
+            "UPDATE drafts SET status = 'failed' WHERE id = ?1",
+            [ids[2]],
+        )
+        .unwrap();
         // у третьего раскладка настроена вручную: её не трогаем
         let mut c = get(&e.db, ids[2]).unwrap().config;
         c.style.top_crop_bottom = 0.3;
-        e.db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![ids[2], serde_json::to_string(&c).unwrap()]).unwrap();
+        e.db.execute(
+            "UPDATE drafts SET style_json = ?2 WHERE id = ?1",
+            params![ids[2], serde_json::to_string(&c).unwrap()],
+        )
+        .unwrap();
 
         let changed = realign_gameplay(&e.db, 1).unwrap();
         assert_eq!(changed, vec![ids[0], ids[2]], "одобренный не меняется");
 
         let first = get(&e.db, ids[0]).unwrap();
-        assert_eq!((first.config.gameplay_offset, first.config.style.top_fit, first.config.style.top_crop_bottom), (100.0, TopFit::Auto, 0.0));
+        assert_eq!(
+            (
+                first.config.gameplay_offset,
+                first.config.style.top_fit,
+                first.config.style.top_crop_bottom
+            ),
+            (100.0, TopFit::Auto, 0.0)
+        );
         assert_eq!(first.status, "queued");
         let approved = get(&e.db, ids[1]).unwrap();
-        assert_eq!((approved.config.gameplay_offset, approved.status.as_str()), (GAMEPLAY_START, "approved"));
+        assert_eq!(
+            (approved.config.gameplay_offset, approved.status.as_str()),
+            (GAMEPLAY_START, "approved")
+        );
         let third = get(&e.db, ids[2]).unwrap().config;
-        assert_eq!((third.gameplay_offset, third.style.top_fit, third.style.top_crop_bottom), (600.0, TopFit::Fill, 0.3));
+        assert_eq!(
+            (
+                third.gameplay_offset,
+                third.style.top_fit,
+                third.style.top_crop_bottom
+            ),
+            (600.0, TopFit::Fill, 0.3)
+        );
 
-        assert!(realign_gameplay(&e.db, 1).unwrap().is_empty(), "повторный пересчёт ничего не меняет");
+        assert!(
+            realign_gameplay(&e.db, 1).unwrap().is_empty(),
+            "повторный пересчёт ничего не меняет"
+        );
     }
 
     #[test]
@@ -990,7 +1538,10 @@ mod tests {
         old.style.top_crop_bottom = 0.2;
         set_defaults(&e, &old);
         let d = load_defaults(&e.db);
-        assert_eq!((d.style.top_fit, d.style.top_crop_bottom, d.layout_v), (TopFit::Auto, 0.0, LAYOUT_V));
+        assert_eq!(
+            (d.style.top_fit, d.style.top_crop_bottom, d.layout_v),
+            (TopFit::Auto, 0.0, LAYOUT_V)
+        );
 
         // человек сам вернул «Заполнить» и срез: после обновления это его выбор
         let mut mine = load_defaults(&e.db);
@@ -998,7 +1549,10 @@ mod tests {
         mine.style.top_crop_bottom = 0.2;
         set_defaults(&e, &mine);
         let again = load_defaults(&e.db);
-        assert_eq!((again.style.top_fit, again.style.top_crop_bottom), (TopFit::Fill, 0.2));
+        assert_eq!(
+            (again.style.top_fit, again.style.top_crop_bottom),
+            (TopFit::Fill, 0.2)
+        );
 
         // ручная раскладка при обновлении не затирается
         let mut custom = Defaults::default();
@@ -1014,13 +1568,20 @@ mod tests {
         set_defaults(&e, &full_defaults());
         generate(&e.db, 1).unwrap();
         let before: Vec<i64> = list(&e.db, 1).unwrap().iter().map(|d| d.id).collect();
-        assert_eq!(generate(&e.db, 1).unwrap(), 0, "повторный запуск ничего не создаёт");
+        assert_eq!(
+            generate(&e.db, 1).unwrap(),
+            0,
+            "повторный запуск ничего не создаёт"
+        );
 
         // принят ещё один момент, который в видео идёт раньше всех
         e.db.execute("INSERT INTO moments (project_id, start, \"end\", title, status) VALUES (1, 10, 50, 'раньше', 'accepted')", []).unwrap();
         assert_eq!(generate(&e.db, 1).unwrap(), 1);
         let drafts = list(&e.db, 1).unwrap();
-        assert_eq!(drafts.iter().map(|d| d.part).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            drafts.iter().map(|d| d.part).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         assert_eq!(drafts[0].start, 10.0);
         // старые черновики сохранили свои настройки и id
         assert!(before.iter().all(|id| drafts.iter().any(|d| d.id == *id)));
@@ -1031,14 +1592,19 @@ mod tests {
         let e = env("hide");
         set_defaults(&e, &full_defaults());
         generate(&e.db, 1).unwrap();
-        e.db.execute("UPDATE moments SET status = 'rejected' WHERE start = 300", []).unwrap();
+        e.db.execute(
+            "UPDATE moments SET status = 'rejected' WHERE start = 300",
+            [],
+        )
+        .unwrap();
         assert_eq!(list(&e.db, 1).unwrap().len(), 2);
     }
 
     #[test]
     fn generate_without_accepted_moments_is_an_error() {
         let e = env("none");
-        e.db.execute("UPDATE moments SET status = 'candidate'", []).unwrap();
+        e.db.execute("UPDATE moments SET status = 'candidate'", [])
+            .unwrap();
         assert!(generate(&e.db, 1).is_err());
     }
 
@@ -1047,37 +1613,133 @@ mod tests {
         let e = env("noassets");
         assert_eq!(generate(&e.db, 1).unwrap(), 3);
         let id = list(&e.db, 1).unwrap()[0].id;
-        let msg = build_job(&e.db, id, Profile::Draft, Encoder::X264, e.dir.join("o.mp4")).unwrap_err();
+        let msg = build_job(
+            &e.db,
+            id,
+            Profile::Draft,
+            Encoder::X264,
+            e.dir.join("o.mp4"),
+        )
+        .unwrap_err();
         assert!(msg.contains("Не выбран фон"), "{msg}");
     }
 
     #[test]
     fn job_carries_the_clip_banner_time_part_and_only_words_inside() {
         let e = env("job");
-        set_defaults(&e, &Defaults { banner_id: Some(1), background_ids: vec![2], music_id: Some(4), ..Default::default() });
+        set_defaults(
+            &e,
+            &Defaults {
+                banner_id: Some(1),
+                background_ids: vec![2],
+                music_id: Some(4),
+                ..Default::default()
+            },
+        );
         generate(&e.db, 1).unwrap();
         let d = &list(&e.db, 1).unwrap()[0]; // момент 100..140, баннер на 120
-        let job = build_job(&e.db, d.id, Profile::Draft, Encoder::X264, e.dir.join("o.mp4")).unwrap();
+        let job = build_job(
+            &e.db,
+            d.id,
+            Profile::Draft,
+            Encoder::X264,
+            e.dir.join("o.mp4"),
+        )
+        .unwrap();
 
         assert_eq!((job.start, job.end), (100.0, 140.0));
-        assert_eq!(job.banner_at, Some(20.0), "секунда баннера считается от начала клипа");
+        assert_eq!(
+            job.banner_at,
+            Some(20.0),
+            "секунда баннера считается от начала клипа"
+        );
         assert_eq!(job.part, Some(1));
-        assert_eq!(job.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(), vec!["внутри"]);
+        assert_eq!(
+            job.words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["внутри"]
+        );
         assert_eq!(job.banner.as_ref().unwrap().duration, 4.0);
         assert!(job.banner.as_ref().unwrap().has_audio);
         assert!(job.music.is_some() && !job.gameplay.has_audio);
         assert_eq!(job.source.duration, 3600.0);
-        assert!((job.source_aspect - 1920.0 / 1080.0).abs() < 1e-9, "форма кадра нужна, чтобы 16:9 показать целиком");
-        assert_eq!(job.gameplay_offset, 100.0, "фон идёт с того же таймкода, что и клип");
-        assert!((job.out_len() - 44.0).abs() < 1e-9, "клип 40 с + баннер 4 с");
+        assert!(
+            (job.source_aspect - 1920.0 / 1080.0).abs() < 1e-9,
+            "форма кадра нужна, чтобы 16:9 показать целиком"
+        );
+        assert_eq!(
+            job.gameplay_offset, 100.0,
+            "фон идёт с того же таймкода, что и клип"
+        );
+        assert!(
+            (job.out_len() - 44.0).abs() < 1e-9,
+            "клип 40 с + баннер 4 с"
+        );
+    }
+
+    #[test]
+    fn high_quality_section_shifts_source_and_words_without_changing_project_timeline() {
+        let e = env("source-section");
+        set_defaults(&e, &full_defaults());
+        generate(&e.db, 1).unwrap();
+        let d = list(&e.db, 1).unwrap().remove(0);
+        e.db.execute("INSERT INTO source_files(path,project_id,kind) SELECT path,id,'proxy' FROM projects WHERE id=1",[]).unwrap();
+        assert!(build_job(
+            &e.db,
+            d.id,
+            Profile::Final,
+            Encoder::X264,
+            e.dir.join("out.mp4")
+        )
+        .unwrap_err()
+        .contains("высокого качества"));
+        let path = touch(&e.dir, "section.mp4");
+        e.db.execute("INSERT INTO source_segments(project_id,start,\"end\",path,duration,width,height,has_audio) VALUES(1,98,142,?1,44,1280,720,1)",[&path]).unwrap();
+        let job = build_job(
+            &e.db,
+            d.id,
+            Profile::Final,
+            Encoder::X264,
+            e.dir.join("out.mp4"),
+        )
+        .unwrap();
+        assert_eq!(job.source.path, PathBuf::from(&path));
+        assert_eq!((job.start, job.end), (2.0, 42.0));
+        assert_eq!((job.words[0].start, job.words[0].end), (12.0, 12.5));
+        assert_eq!(job.banner_at, Some(20.0));
+        assert_eq!(get(&e.db, d.id).unwrap().start, 100.0);
+        std::fs::remove_file(path).unwrap();
+        assert!(build_job(
+            &e.db,
+            d.id,
+            Profile::Final,
+            Encoder::X264,
+            e.dir.join("out.mp4")
+        )
+        .is_err());
     }
 
     #[test]
     fn no_banner_means_no_freeze() {
         let e = env("nobanner");
-        set_defaults(&e, &Defaults { background_ids: vec![2], ..Default::default() });
+        set_defaults(
+            &e,
+            &Defaults {
+                background_ids: vec![2],
+                ..Default::default()
+            },
+        );
         generate(&e.db, 1).unwrap();
-        let job = build_job(&e.db, list(&e.db, 1).unwrap()[0].id, Profile::Draft, Encoder::X264, e.dir.join("o.mp4")).unwrap();
+        let job = build_job(
+            &e.db,
+            list(&e.db, 1).unwrap()[0].id,
+            Profile::Draft,
+            Encoder::X264,
+            e.dir.join("o.mp4"),
+        )
+        .unwrap();
         assert!(job.banner.is_none() && job.banner_at.is_none() && job.freeze().is_none());
         assert!((job.out_len() - 40.0).abs() < 1e-9);
     }
@@ -1087,13 +1749,25 @@ mod tests {
         let e = env("missing");
         set_defaults(&e, &full_defaults());
         generate(&e.db, 1).unwrap();
-        let path: String = e.db.query_row("SELECT path FROM assets WHERE id = 2", [], |r| r.get(0)).unwrap();
+        let path: String =
+            e.db.query_row("SELECT path FROM assets WHERE id = 2", [], |r| r.get(0))
+                .unwrap();
         std::fs::remove_file(&path).unwrap();
         // выбран фон 2 или 3; удаляем нужный, чтобы ошибка была наверняка
         for d in list(&e.db, 1).unwrap() {
             if d.config.background_id == Some(2) {
-                let msg = build_job(&e.db, d.id, Profile::Draft, Encoder::X264, e.dir.join("o.mp4")).unwrap_err();
-                assert!(msg.contains("parkour") && msg.contains("не найден"), "{msg}");
+                let msg = build_job(
+                    &e.db,
+                    d.id,
+                    Profile::Draft,
+                    Encoder::X264,
+                    e.dir.join("o.mp4"),
+                )
+                .unwrap_err();
+                assert!(
+                    msg.contains("parkour") && msg.contains("не найден"),
+                    "{msg}"
+                );
             }
         }
     }
@@ -1110,9 +1784,20 @@ mod tests {
         cfg.style.split = 0.6;
         cfg.style.gameplay_freeze = true;
         cfg.music_id = None;
-        e.db.execute("UPDATE drafts SET style_json = ?2 WHERE id = ?1", params![d.id, serde_json::to_string(&cfg).unwrap()]).unwrap();
+        e.db.execute(
+            "UPDATE drafts SET style_json = ?2 WHERE id = ?1",
+            params![d.id, serde_json::to_string(&cfg).unwrap()],
+        )
+        .unwrap();
 
-        let job = build_job(&e.db, d.id, Profile::Final, Encoder::Nvenc, e.dir.join("o.mp4")).unwrap();
+        let job = build_job(
+            &e.db,
+            d.id,
+            Profile::Final,
+            Encoder::Nvenc,
+            e.dir.join("o.mp4"),
+        )
+        .unwrap();
         assert_eq!(job.gameplay_offset, 123.5);
         assert_eq!(job.style.split, 0.6);
         assert!(job.style.gameplay_freeze && job.music.is_none());
@@ -1131,15 +1816,26 @@ mod tests {
         let e = env("loc");
         generate(&e.db, 1).unwrap();
         let id = list(&e.db, 1).unwrap()[0].id;
-        assert!(final_location(&e.db, id, false).unwrap_err().contains("ещё не готов"));
+        assert!(final_location(&e.db, id, false)
+            .unwrap_err()
+            .contains("ещё не готов"));
 
         let file = touch(&e.dir, "out.mp4");
-        e.db.execute("UPDATE drafts SET final_path = ?2, status = 'final_done' WHERE id = ?1", params![id, file]).unwrap();
-        assert_eq!(final_location(&e.db, id, false).unwrap(), PathBuf::from(&file));
+        e.db.execute(
+            "UPDATE drafts SET final_path = ?2, status = 'final_done' WHERE id = ?1",
+            params![id, file],
+        )
+        .unwrap();
+        assert_eq!(
+            final_location(&e.db, id, false).unwrap(),
+            PathBuf::from(&file)
+        );
         assert_eq!(final_location(&e.db, id, true).unwrap(), e.dir);
 
         std::fs::remove_file(&file).unwrap();
-        assert!(final_location(&e.db, id, false).unwrap_err().contains("не найден"));
+        assert!(final_location(&e.db, id, false)
+            .unwrap_err()
+            .contains("не найден"));
         assert!(final_location(&e.db, 9999, false).is_err());
     }
 
@@ -1148,7 +1844,10 @@ mod tests {
         assert!(can_set_status("ready", "approved"));
         assert!(can_set_status("approved", "rejected"));
         assert!(can_set_status("rejected", "ready"));
-        assert!(!can_set_status("rendering", "approved"), "нельзя одобрить то, что ещё считается");
+        assert!(
+            !can_set_status("rendering", "approved"),
+            "нельзя одобрить то, что ещё считается"
+        );
         assert!(!can_set_status("failed", "approved"));
         assert!(!can_set_status("ready", "final_done"));
     }
@@ -1158,13 +1857,25 @@ mod tests {
         let e = env("recover");
         generate(&e.db, 1).unwrap();
         let ids: Vec<i64> = list(&e.db, 1).unwrap().iter().map(|d| d.id).collect();
-        e.db.execute("UPDATE drafts SET status = 'rendering' WHERE id = ?1", [ids[0]]).unwrap();
-        e.db.execute("UPDATE drafts SET status = 'final_rendering' WHERE id = ?1", [ids[1]]).unwrap();
+        e.db.execute(
+            "UPDATE drafts SET status = 'rendering' WHERE id = ?1",
+            [ids[0]],
+        )
+        .unwrap();
+        e.db.execute(
+            "UPDATE drafts SET status = 'final_rendering' WHERE id = ?1",
+            [ids[1]],
+        )
+        .unwrap();
         recover_interrupted(&e.db);
         let by = |i: i64| get(&e.db, i).unwrap();
         assert_eq!(by(ids[0]).status, "failed");
         assert!(by(ids[0]).error.unwrap().contains("прерван"));
-        assert_eq!(by(ids[1]).status, "approved", "чистовик возвращается в очередь одобренных");
+        assert_eq!(
+            by(ids[1]).status,
+            "approved",
+            "чистовик возвращается в очередь одобренных"
+        );
     }
 
     #[test]
@@ -1183,12 +1894,21 @@ mod tests {
         }
         let started = std::time::Instant::now();
         assert_eq!(generate(&e.db, 1).unwrap(), 503); // 3 из env() и 500 новых
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
 
         let drafts = list(&e.db, 1).unwrap();
         assert_eq!(drafts.len(), 503);
-        assert!(drafts.iter().enumerate().all(|(i, d)| d.part == i as i64 + 1 && d.status == "queued"));
-        assert!(drafts.iter().all(|d| d.config.banner_id == Some(1) && d.config.music_id == Some(4)));
+        assert!(drafts
+            .iter()
+            .enumerate()
+            .all(|(i, d)| d.part == i as i64 + 1 && d.status == "queued"));
+        assert!(drafts
+            .iter()
+            .all(|d| d.config.banner_id == Some(1) && d.config.music_id == Some(4)));
         // повтор ничего не создаёт и не ломает нумерацию
         assert_eq!(generate(&e.db, 1).unwrap(), 0);
         assert_eq!(list(&e.db, 1).unwrap().len(), 503);
@@ -1200,13 +1920,24 @@ mod tests {
         generate(&e.db, 1).unwrap();
         let ids: Vec<i64> = list(&e.db, 1).unwrap().iter().map(|d| d.id).collect();
         for (id, st) in ids.iter().zip(["ready", "ready", "rejected"]) {
-            e.db.execute("UPDATE drafts SET status = ?2 WHERE id = ?1", params![id, st]).unwrap();
+            e.db.execute(
+                "UPDATE drafts SET status = ?2 WHERE id = ?1",
+                params![id, st],
+            )
+            .unwrap();
         }
         assert_eq!(approve_ready(&e.db, 1).unwrap(), 2);
         let st = |i: i64| get(&e.db, i).unwrap().status;
-        assert_eq!((st(ids[0]), st(ids[1]), st(ids[2])), ("approved".into(), "approved".into(), "rejected".into()));
+        assert_eq!(
+            (st(ids[0]), st(ids[1]), st(ids[2])),
+            ("approved".into(), "approved".into(), "rejected".into())
+        );
         assert_eq!(approve_ready(&e.db, 1).unwrap(), 0);
-        assert_eq!(approve_ready(&e.db, 99).unwrap(), 0, "чужой проект не затрагивается");
+        assert_eq!(
+            approve_ready(&e.db, 99).unwrap(),
+            0,
+            "чужой проект не затрагивается"
+        );
     }
 
     #[test]

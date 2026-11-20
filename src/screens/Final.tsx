@@ -9,6 +9,8 @@ import Tilt from "../components/Tilt";
 import TikTokPanel from "../components/TikTokPanel";
 import PublishDialog from "../components/PublishDialog";
 import AutoPublishPanel, { STATE_LABEL as JOB_LABEL } from "../components/AutoPublishPanel";
+import { OutputPreview } from "../components/OutputProfiles";
+import CaptionComposer from "../components/CaptionComposer";
 
 const FINAL: DraftStatus[] = ["approved", "final_queued", "final_rendering", "final_done", "final_failed"];
 const LABEL: Partial<Record<DraftStatus, string>> = {
@@ -108,6 +110,8 @@ export default function FinalScreen() {
       </div>
 
       <AutoPublishPanel />
+      <details className="factory-details"><summary>Выходные варианты для площадок</summary><OutputPreview clips={finals.filter(d => d.status === "final_done").map(d => ({ id: d.id, title: d.title }))} /></details>
+      <details className="factory-details"><summary>Подписи для площадок</summary><CaptionComposer clips={finals.filter(d => d.status === "final_done").map(d => ({ id: d.id, title: d.title }))} /></details>
 
       {finals.length === 0 ? (
         <motion.div initial={{ opacity: 0, rotateX: 15, y: 30 }} animate={{ opacity: 1, rotateX: 0, y: 0 }} className="glass grid place-items-center gap-5 rounded-[28px] p-14 text-center">

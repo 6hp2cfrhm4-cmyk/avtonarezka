@@ -2,7 +2,13 @@
 
 use reqwest::Url;
 
-const HOSTS: [&str; 5] = ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"];
+const HOSTS: [&str; 5] = [
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+];
 const PATH_PREFIXES: [&str; 4] = ["shorts", "live", "embed", "v"];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -18,7 +24,9 @@ fn invalid(message: impl Into<String>) -> UrlError {
 }
 
 fn is_video_id(s: &str) -> bool {
-    s.len() == 11 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    s.len() == 11
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// 11-символьный id видео или понятная ошибка.
@@ -27,7 +35,11 @@ pub fn extract_video_id(text: &str) -> Result<String, UrlError> {
     if raw.is_empty() {
         return Err(invalid("Вставьте ссылку на YouTube-видео."));
     }
-    let raw = if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+    let raw = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
 
     let parsed = Url::parse(&raw).map_err(|_| invalid("Не YouTube-ссылка."))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -35,15 +47,29 @@ pub fn extract_video_id(text: &str) -> Result<String, UrlError> {
     }
     let host = parsed.host_str().unwrap_or("").to_lowercase();
     if !HOSTS.contains(&host.as_str()) {
-        let shown = if host.is_empty() { "неизвестный хост" } else { &host };
+        let shown = if host.is_empty() {
+            "неизвестный хост"
+        } else {
+            &host
+        };
         return Err(invalid(format!("Не YouTube-ссылка: {shown}.")));
     }
 
     let query: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
-    let param = |name: &str| query.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    let param = |name: &str| {
+        query
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
 
     let candidate: Option<String> = if host == "youtu.be" {
-        parsed.path().trim_start_matches('/').split('/').next().map(str::to_owned)
+        parsed
+            .path()
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .map(str::to_owned)
     } else if parsed.path() == "/watch" {
         param("v").map(str::to_owned)
     } else {
@@ -90,7 +116,11 @@ mod tests {
             format!("www.youtube.com/watch?v={VID}"),
         ] {
             assert_eq!(extract_video_id(&text).as_deref(), Ok(VID), "{text}");
-            assert_eq!(normalize_youtube_url(&text), Ok(format!("https://www.youtube.com/watch?v={VID}")), "{text}");
+            assert_eq!(
+                normalize_youtube_url(&text),
+                Ok(format!("https://www.youtube.com/watch?v={VID}")),
+                "{text}"
+            );
         }
     }
 
@@ -108,7 +138,10 @@ mod tests {
             "https://www.youtube.com/".to_string(),
             "not a url at all".to_string(),
         ] {
-            assert!(matches!(normalize_youtube_url(&text), Err(UrlError::Invalid(_))), "{text:?}");
+            assert!(
+                matches!(normalize_youtube_url(&text), Err(UrlError::Invalid(_))),
+                "{text:?}"
+            );
         }
     }
 
@@ -122,7 +155,10 @@ mod tests {
 
     #[test]
     fn playlists_are_reported_separately() {
-        assert_eq!(normalize_youtube_url("https://www.youtube.com/playlist?list=PLabc123"), Err(UrlError::Playlist));
+        assert_eq!(
+            normalize_youtube_url("https://www.youtube.com/playlist?list=PLabc123"),
+            Err(UrlError::Playlist)
+        );
     }
 
     #[test]

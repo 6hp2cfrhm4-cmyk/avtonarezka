@@ -8,7 +8,7 @@ import { useUi } from "../store";
 import { Switch } from "./Controls";
 
 export const STATE_LABEL: Record<JobState, string> = {
-  drafting: "Пишу описание",
+  drafting: "Подбираю хэштеги",
   ready: "Готово к выкладке",
   queued: "В очереди",
   sending: "Выкладывается",
@@ -51,7 +51,7 @@ const fmtHHMM = (min: number) => {
   return `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
 };
 
-/** Автовыкладка: каждому готовому ролику своё описание от модели, дальше очередь с паузой и суточным лимитом. */
+/** Автовыкладка: ручной необязательный текст и локальные хэштеги, очередь с паузой и суточным лимитом. */
 export default function AutoPublishPanel() {
   const project = useUi((s) => s.project);
   const drafts = useUi((s) => s.drafts);
@@ -95,7 +95,8 @@ export default function AutoPublishPanel() {
   const titleFor = (j: PublishJob) => (j.readyId !== null ? j.name : j.draftId !== null ? titleOf.get(j.draftId) : undefined) ?? "Ролик";
   const jobs = queue?.jobs ?? [];
   const byDraft = useMemo(() => new Map(jobs.map((j) => [j.draftId, j])), [jobs]);
-  const todo = finals.filter((d) => !byDraft.has(d.id)).length;
+  const editableCount = finals.filter(d => !byDraft.has(d.id) || ["ready", "failed"].includes(byDraft.get(d.id)!.state)).length + jobs.filter(j => j.readyId !== null && ["ready", "failed"].includes(j.state)).length;
+  const todo = finals.filter(d => !byDraft.has(d.id) || ["ready", "failed"].includes(byDraft.get(d.id)!.state)).length;
   const count = (st: JobState[]) => jobs.filter((j) => st.includes(j.state)).length;
   // после «Повторить» задача сразу в очереди, и запустить нужно именно её
   const startable = count(["ready", "queued"]);
@@ -147,17 +148,17 @@ export default function AutoPublishPanel() {
         <div>
           <div className="font-display text-lg font-extrabold">Автовыкладка в TikTok</div>
           <p className="mt-1 max-w-2xl text-sm text-white/55">
-            Модель пишет для каждого ролика свой длинный текст и до {queue.maxTags} хэштегов ({queue.windowMin}–{queue.windowMax} знаков вместе с хэштегами), либо вы задаёте один свой текст на все ролики. Потом ролики выходят по одному через браузер: по кругу с аккаунтов пула и только в окне публикации.
+            Текст необязателен: введи общий для всех роликов или свой для каждого. Модель подбирает только хэштеги (до {queue.maxTags}). Потом ролики выходят по одному через браузер: по кругу с аккаунтов пула и только в окне публикации.
           </p>
         </div>
         <span className={`chip ${queue.running ? "!border-accent/50 !text-accent" : ""}`}>
-          {queue.generating ? "Пишу описания" : queue.running ? "Очередь идёт" : "Очередь стоит"}
+          {queue.generating ? "Подбираю хэштеги" : queue.running ? "Очередь идёт" : "Очередь стоит"}
         </span>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-black/20 p-4">
         <p className="max-w-2xl text-sm text-white/60">
-          Готовые 1080×1920 из папки выкладываются без рендера. Им задаётся текст кнопкой «Один текст на все» или вручную.
+          Готовые 1080×1920 из папки выкладываются без рендера. Текст необязателен: используй «Свой текст на все» или «Править» у ролика.
         </p>
         <button className="btn" disabled={queue.running} onClick={() => void pickReady()}>
           Выбрать из папки
@@ -196,12 +197,12 @@ export default function AutoPublishPanel() {
           className="btn"
           disabled={queue.generating || todo === 0 || queue.running}
           onClick={() => void run(api.queuePrepare(project.id).then(reload))}
-          title={todo === 0 ? "У всех готовых роликов уже есть описание" : undefined}
+          title={todo === 0 ? "Нет доступных роликов для подбора хэштегов" : undefined}
         >
-          {queue.generating ? "Пишу описания…" : `Составить описания${todo > 0 ? ` (${todo})` : ""}`}
+          {queue.generating ? "Подбираю хэштеги…" : `Сгенерировать хэштеги${todo > 0 ? ` (${todo})` : ""}`}
         </button>
         {queue.generating && <button className="btn" onClick={() => void run(api.queuePrepareCancel().then(reload))}>Остановить</button>}
-        <button className="btn" disabled={queue.generating || finals.length === 0} onClick={() => setApplyOpen(true)} title="Один текст и хэштеги на все ролики, без модели">
+        <button className="btn" disabled={queue.generating || editableCount === 0} onClick={() => setApplyOpen(true)} title="Один текст для всех; собственные хэштеги сохраняются">
           Свой текст на все
         </button>
         {!queue.running && (
@@ -256,11 +257,11 @@ export default function AutoPublishPanel() {
           <ApplyTextDialog
             queue={queue}
             // ролики, которые получат текст: без задачи, готовые или упавшие (идущие в работу и выложенные не трогаем)
-            count={finals.filter((d) => { const j = byDraft.get(d.id); return !j || j.state === "ready" || j.state === "failed"; }).length}
-            replaces={jobs.filter((j) => j.state === "ready" || j.state === "failed").length}
+            count={editableCount}
+            replaces={jobs.filter((j) => ["ready", "failed"].includes(j.state) && j.caption.trim()).length}
             onClose={() => setApplyOpen(false)}
-            onApply={async (caption, tags) => {
-              const n = await api.queueApplyText(project.id, caption, tags);
+            onApply={async (caption, tags, preserveTags) => {
+              const n = await api.queueApplyText(project.id, caption, tags, preserveTags);
               notify(`Текст назначен роликам: ${n}`);
               await reload();
               setApplyOpen(false);
@@ -376,7 +377,7 @@ const JobRow = memo(function JobRow({ job, title, working, q, onChanged }: { job
 
   const tagList = parseTags(tags);
   const len = editing ? captionLen(text, tagList) : job.len;
-  const fits = len > 0 && len <= q.captionLimit;
+  const fits = len <= q.captionLimit;
   const editable = job.state === "ready" || job.state === "failed";
   const run = (p: Promise<unknown>) => p.then(() => onChanged()).catch((e) => notify(errText(e), "error"));
 
@@ -409,7 +410,7 @@ const JobRow = memo(function JobRow({ job, title, working, q, onChanged }: { job
 
       {job.state === "drafting" && (
         <div className="mt-2 text-xs text-white/55">
-          {job.readyId !== null ? "Нужен текст: задай его кнопкой «Один текст на все» или вручную" : (working ?? "Жду своей очереди у модели…")}
+          {job.readyId !== null ? "Текст можно задать кнопкой «Свой текст на все» или вручную" : (working ?? "Жду своей очереди у модели…")}
         </div>
       )}
 
@@ -463,7 +464,7 @@ const JobRow = memo(function JobRow({ job, title, working, q, onChanged }: { job
         )}
         {editing ? (
           <>
-            <button className="btn !py-1.5 !text-xs btn-primary" disabled={!fits || !text.trim() || tagList.length > q.maxTags || tagList.length === 0} onClick={() => void save()}>Сохранить</button>
+            <button className="btn !py-1.5 !text-xs btn-primary" disabled={!fits || tagList.length > q.maxTags} onClick={() => void save()}>Сохранить</button>
             <button className="btn !py-1.5 !text-xs" onClick={() => { setEditing(false); setErr(null); setText(job.caption); setTags(job.hashtags.join(" ")); }}>Отмена</button>
           </>
         ) : (
@@ -552,7 +553,7 @@ function StartDialog({ queue, count, onClose, onStart }: { queue: QueueState; co
 const SHARED_KEY = "avto.sharedText";
 
 /** Один свой текст и хэштеги на все готовые ролики: модель не нужна. Прежние описания этих роликов заменяются. */
-function ApplyTextDialog({ queue, count, replaces, onClose, onApply }: { queue: QueueState; count: number; replaces: number; onClose: () => void; onApply: (caption: string, tags: string[]) => Promise<unknown> }) {
+function ApplyTextDialog({ queue, count, replaces, onClose, onApply }: { queue: QueueState; count: number; replaces: number; onClose: () => void; onApply: (caption: string, tags: string[], preserveTags: boolean) => Promise<unknown> }) {
   const notify = useUi((s) => s.notify);
   const saved = (() => {
     try {
@@ -563,11 +564,12 @@ function ApplyTextDialog({ queue, count, replaces, onClose, onApply }: { queue: 
   })();
   const [caption, setCaption] = useState(saved?.caption ?? "");
   const [tags, setTags] = useState(saved?.tags ?? "");
+  const [replaceTags, setReplaceTags] = useState(false);
   const [busy, setBusy] = useState(false);
-  const tagList = parseTags(tags);
+  const tagList = replaceTags ? parseTags(tags) : [];
   const len = captionLen(caption, tagList);
-  const fits = len > 0 && len <= queue.captionLimit;
-  const valid = fits && caption.trim() !== "" && tagList.length >= 1 && tagList.length <= queue.maxTags;
+  const fits = len <= queue.captionLimit;
+  const valid = fits && tagList.length <= queue.maxTags;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -578,7 +580,7 @@ function ApplyTextDialog({ queue, count, replaces, onClose, onApply }: { queue: 
   const apply = async () => {
     setBusy(true);
     try {
-      await onApply(caption, tagList);
+      await onApply(caption, tagList, !replaceTags);
       try {
         localStorage.setItem(SHARED_KEY, JSON.stringify({ caption, tags }));
       } catch {
@@ -603,23 +605,24 @@ function ApplyTextDialog({ queue, count, replaces, onClose, onApply }: { queue: 
       >
         <div>
           <div className="font-display text-xl font-extrabold">Один текст на все ролики</div>
-          <p className="mt-1 text-sm text-white/55">Описание и хэштеги одинаковые у всех роликов. Модель не запускается.</p>
+          <p className="mt-1 text-sm text-white/55">Текст одинаковый у всех роликов. Их собственные хэштеги сохраняются.</p>
         </div>
         <label className="block text-sm text-white/75">
           Описание
-          <textarea className={`${field} mt-1.5 h-56 resize-y text-sm leading-relaxed`} value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="Текст под роликом" />
+          <textarea className={`${field} mt-1.5 h-56 resize-y text-sm leading-relaxed`} value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="Необязательный текст под роликом" />
         </label>
-        <label className="block text-sm text-white/75">
-          Хэштеги (от 1 до {queue.maxTags}, через пробел)
+        <label className="flex items-center gap-2 text-sm text-white/75"><input type="checkbox" checked={replaceTags} onChange={e => setReplaceTags(e.target.checked)} />Заменить хэштеги общими</label>
+        {replaceTags && <label className="block text-sm text-white/75">
+          Хэштеги (необязательно, до {queue.maxTags}, через пробел)
           <input className={`${field} mt-1.5`} value={tags} onChange={(e) => setTags(e.target.value)} placeholder="юмор сериал тикток" />
-        </label>
+        </label>}
         {tagList.length > queue.maxTags && <div className="text-xs text-danger">Хэштегов {tagList.length}, а можно не больше {queue.maxTags}</div>}
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-black/30 px-4 py-3 text-xs text-white/60">
           <span>Получат этот текст: {count} {count === 1 ? "ролик" : "роликов"}</span>
           <span className={`tabular-nums ${fits || len === 0 ? "text-white/60" : "text-danger"}`}>{len} / {queue.captionLimit} знаков</span>
         </div>
         {replaces > 0 && <div className="rounded-xl border border-[#ffb020]/30 bg-[#ffb020]/8 px-4 py-3 text-xs leading-relaxed text-[#ffd88a]">У {replaces} из них уже есть описание: оно будет заменено этим. Ролики, которые уже стоят в очереди, выкладываются или выложены, не меняются.</div>}
-        <div className="text-xs leading-relaxed text-white/45">Одинаковый длинный текст под разными роликами TikTok может счесть повтором. Если нужно разное, лучше «Составить описания».</div>
+        <div className="text-xs leading-relaxed text-white/45">Текст можно оставить пустым. Для отдельного ролика открой «Править» в списке подписей.</div>
         <div className="flex justify-end gap-2">
           <button className="btn" onClick={onClose}>Отмена</button>
           <button className="btn btn-primary" disabled={!valid || busy || count === 0} onClick={() => void apply()}>{busy ? "Назначаю…" : "Назначить всем"}</button>

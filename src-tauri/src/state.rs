@@ -1,28 +1,40 @@
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{Arc, Mutex}};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use tokio::sync::{watch, OnceCell, Semaphore};
 
 use crate::{db::Db, media_server::MediaServer, tiktok::secrets::Secrets};
 
 pub struct AppState {
+    pub source_use: tokio::sync::RwLock<()>,
+    pub power: crate::operations::power::PowerState,
+    pub lifecycle: crate::operations::lifecycle::Lifecycle,
+    pub analytics_gate: tokio::sync::Mutex<()>,
     pub db: Db,
     pub media: MediaServer,
     pub data_dir: PathBuf,
     /// Запущенные анализы: `project_id` → сигнал отмены.
     pub analyses: Mutex<HashMap<i64, watch::Sender<bool>>>,
+    pub camera_scan: Mutex<Option<(String, watch::Sender<bool>)>>,
     /// Идущие и ожидающие рендеры: `draft_id` → сигнал отмены.
     pub renders: Mutex<HashMap<i64, watch::Sender<bool>>>,
     /// Одновременно рендерим два черновика, но только один финал.
-    pub draft_slots: Arc<Semaphore>,
-    pub final_slots: Arc<Semaphore>,
+    pub draft_slots: Arc<crate::factory::resources::Lane>,
+    pub final_slots: Arc<crate::factory::resources::Lane>,
     /// Есть ли рабочий NVENC; проверяется один раз.
     pub nvenc: OnceCell<bool>,
+    /// Whisper и LLM (включая подписи) никогда не занимают видеопамять одновременно.
+    pub ml_gate: Arc<Semaphore>,
     /// Есть ли CUDA в ffmpeg (декодирование NVDEC); проверяется один раз.
     pub cuda: OnceCell<bool>,
     /// Ключи и токены TikTok: связка ключей системы или, если её нет, память.
     pub secrets: Secrets,
     /// Идущий вход в TikTok: сигнал отмены.
     pub login: Mutex<Option<watch::Sender<bool>>>,
+    pub platform_login: Mutex<Option<watch::Sender<bool>>>,
     /// Ролики, которые прямо сейчас уходят в TikTok.
     pub posting: Mutex<HashSet<i64>>,
     /// Идёт загрузка моделей при запуске или по кнопке.
@@ -41,6 +53,9 @@ pub struct AppState {
     pub youtube_slots: Arc<Semaphore>,
     /// Пачка ссылок и файлов: раннер и то, что он сейчас скачивает или анализирует.
     pub batch: crate::batch::BatchState,
+    pub monitor: crate::factory::monitor::MonitorState,
+    pub output_prepares: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub source_prepares: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl AppState {

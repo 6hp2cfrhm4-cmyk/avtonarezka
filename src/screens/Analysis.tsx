@@ -1,16 +1,18 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { api, errText, fmtDuration, type AnalysisOptions, type ModelsStatus } from "../lib/api";
+import { api, defaultAnalysisSettings, errText, fmtDuration, type AnalysisSettings, type ModelsStatus } from "../lib/api";
 import { onEvent } from "../lib/events";
 import { useUi } from "../store";
 import { Arrow, Check } from "../components/icons";
+import SignalInputs from "../components/SignalInputs";
 import { Field, Switch } from "../components/Controls";
 
 const STAGES = [
   { id: "audio", label: "Звук", hint: "Громкость по секундам" },
   { id: "events", label: "События", hint: "Смех, крики, аплодисменты" },
-  { id: "speech", label: "Речь", hint: "Whisper, слова и фразы" },
   { id: "video", label: "Картинка", hint: "Динамика и смены сцен" },
+  { id: "scout", label: "Скаут", hint: "Горячие окна записи" },
+  { id: "speech", label: "Речь", hint: "Whisper, слова и фразы" },
   { id: "score", label: "Отбор", hint: "Кривая интереса" },
   { id: "llm", label: "Оценка ИИ", hint: "Заголовки и кульминации" },
 ];
@@ -21,14 +23,27 @@ const pieces = (n: number) =>
 export default function AnalysisScreen() {
   const { project, analysis, moments, go, notify } = useUi();
   const [models, setModels] = useState<ModelsStatus | null>(null);
-  const [opt, setOpt] = useState<Required<Omit<AnalysisOptions, "gpuLayers">>>({
-    useEvents: true,
-    useSpeech: true,
-    useLlm: true,
-    minLen: 20,
-    maxLen: 60,
-    topK: 20,
-  });
+  const [opt, updateOpt] = useState<AnalysisSettings>(defaultAnalysisSettings);
+  const [loaded, setLoaded] = useState(false);
+  const [saved, setSaved] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const setOpt = (next: AnalysisSettings) => { updateOpt(next); setSaved(false); };
+
+  const loadSettings = () => {
+    setSettingsError(null);
+    return api.analysisOptionsGet().then((options) => { updateOpt(options); setLoaded(true); })
+      .catch((e) => setSettingsError(errText(e)));
+  };
+  useEffect(() => { void loadSettings(); }, []);
+
+  const saveSettings = async () => {
+    setSaving(true);
+    setSettingsError(null);
+    try { updateOpt(await api.analysisOptionsSet(opt)); setSaved(true); }
+    catch (e) { setSettingsError(errText(e)); }
+    finally { setSaving(false); }
+  };
 
   useEffect(() => {
     const load = () => api.modelsStatus().then(setModels).catch((e) => notify(errText(e), "error"));
@@ -50,6 +65,7 @@ export default function AnalysisScreen() {
     useUi.getState().setAnalysis({ running: true, stage: "audio", fraction: 0, message: "Запускаю…", notes: [] });
     try {
       await api.analysisStart(project.id, opt);
+      setSaved(true);
     } catch (e) {
       useUi.getState().setAnalysis({ running: false });
       notify(errText(e), "error");
@@ -60,7 +76,7 @@ export default function AnalysisScreen() {
     <div className="flex min-h-full flex-col gap-6 pb-4">
       <div>
         <h1 className="font-display text-3xl font-extrabold tracking-tight">
-          {project.tight ? "Режу видео на фрагменты" : "Ищу лучшие моменты"}
+          {project.tight || opt.fixedSeconds !== null ? "Режу видео на фрагменты" : "Ищу лучшие моменты"}
         </h1>
         <p className="mt-2 max-w-2xl text-white/55">
           {project.title} · {fmtDuration(project.duration)}. Всё считается на этом компьютере, видео никуда не уходит.
@@ -68,7 +84,7 @@ export default function AnalysisScreen() {
         </p>
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-[1.5fr_1fr]">
+      <div className="grid items-start gap-6 xl:grid-cols-[1.5fr_1fr]">
         <section className="glass flex flex-col gap-7 rounded-[28px] p-7">
           <div className="grid grid-cols-3 gap-4" style={{ perspective: 1100 }}>
             {STAGES.map((s, i) => {
@@ -115,7 +131,7 @@ export default function AnalysisScreen() {
                 {analysis.running
                   ? analysis.message
                   : done
-                    ? project.tight
+                    ? project.tight || opt.fixedSeconds !== null
                       ? `Готово: видео нарезано на ${pieces(moments.length)}`
                       : `Готово: найдено моментов — ${moments.length}`
                     : "Готов к запуску"}
@@ -139,7 +155,7 @@ export default function AnalysisScreen() {
               </button>
             ) : (
               <>
-                <button className="btn btn-primary" onClick={() => void start()}>
+                <button className="btn btn-primary" disabled={!loaded || saving} onClick={() => void start()}>
                   {done ? "Пересчитать" : "Начать анализ"}
                 </button>
                 {done && (
@@ -167,11 +183,37 @@ export default function AnalysisScreen() {
           </AnimatePresence>
         </section>
 
-        <section className="glass flex flex-col gap-5 rounded-[28px] p-7">
-          <h2 className="font-display text-sm font-semibold uppercase tracking-[0.18em] text-white/45">Настройки</h2>
+        <section className="flex flex-col gap-5 rounded-[28px] border border-white/10 bg-[#141518] p-7">
+          <h2 className="font-display text-sm font-semibold">Настройки анализа</h2>
+          {settingsError && <div role="alert" className="text-sm text-[#ffd3db]">{settingsError}
+            {!loaded && <button className="btn ml-2" onClick={() => void loadSettings()}>Повторить</button>}
+          </div>}
+          <fieldset disabled={!loaded || saving || analysis.running} className="flex min-w-0 flex-col gap-5 disabled:opacity-70">
+          <label className="flex flex-col gap-2 text-sm font-semibold">
+            Режим нарезки
+            <select className="analysis-select w-full rounded-xl border border-white/20 bg-[#222328] px-3 py-2.5 text-sm text-white" value={opt.fixedSeconds === null ? "highlights" : "fixed"}
+              onChange={(e) => setOpt({ ...opt, fixedSeconds: e.target.value === "fixed" ? 30 : null })}>
+              <option value="highlights">{project.tight ? "Всё видео по фразам" : "Лучшие моменты"}</option>
+              <option value="fixed">По N секунд</option>
+            </select>
+          </label>
+          {opt.fixedSeconds !== null && <Field label="Длина фрагмента" value={`${opt.fixedSeconds} с`} hint="Границы сдвигаются к паузам. Всё видео сохраняется, короткий хвост объединяется с последней частью.">
+            <input aria-label="Длина фрагмента" type="range" className="range" min={5} max={180} step={5} value={opt.fixedSeconds}
+              onChange={(e) => setOpt({ ...opt, fixedSeconds: +e.target.value })} />
+          </Field>}
 
           <Toggle label="Смех, крики, аплодисменты" ok={models?.yamnet} value={opt.useEvents} onChange={(v) => setOpt({ ...opt, useEvents: v })} />
           <Toggle label="Распознавание речи" ok={models?.whisper} value={opt.useSpeech} onChange={(v) => setOpt({ ...opt, useSpeech: v })} />
+          <label className="flex flex-col gap-2 text-sm font-semibold">
+            Язык речи
+            <select className="analysis-select w-full rounded-xl border border-white/20 bg-[#222328] px-3 py-2.5 text-sm text-white" value={opt.language} onChange={(e) => setOpt({ ...opt, language: e.target.value })}>
+              <option value="ru">Русский</option><option value="auto">Определить автоматически</option>
+              <option value="en">Английский</option><option value="uk">Украинский</option><option value="de">Немецкий</option>
+              <option value="fr">Французский</option><option value="es">Испанский</option><option value="pt">Португальский</option>
+              <option value="it">Итальянский</option><option value="tr">Турецкий</option><option value="zh">Китайский</option>
+              <option value="ja">Японский</option><option value="ko">Корейский</option>
+            </select>
+          </label>
           <Toggle
             label="Языковая модель"
             ok={models?.llm && models.worker}
@@ -180,6 +222,7 @@ export default function AnalysisScreen() {
             onChange={(v) => setOpt({ ...opt, useLlm: v })}
           />
 
+          {opt.fixedSeconds === null && <>
           <Field label={project.tight ? "Фрагмент не короче" : "Минимальная длина"} value={`${opt.minLen} с`}>
             <input type="range" className="range" min={10} max={60} step={5} value={opt.minLen}
               onChange={(e) => setOpt({ ...opt, minLen: +e.target.value, maxLen: Math.max(opt.maxLen, +e.target.value + 10) })} />
@@ -198,6 +241,37 @@ export default function AnalysisScreen() {
                 onChange={(e) => setOpt({ ...opt, topK: +e.target.value })} />
             </Field>
           )}
+          </>}
+          <label className="factory-check"><input type="checkbox" checked={opt.scoutEnabled} onChange={e => setOpt({ ...opt, scoutEnabled: e.target.checked })} />Скаут для записей длиннее 10 минут</label>
+          <Field label="Доля записи для Whisper" value={`${Math.round(opt.scoutCoverage * 100)}%`} hint="Окна с контекстом выбираются по всей записи. При сплошной нарезке распознаётся всё видео.">
+            <input aria-label="Доля записи для Whisper" type="range" className="range" min={0.1} max={0.75} step={0.05} value={opt.scoutCoverage} onChange={e => setOpt({ ...opt, scoutCoverage: +e.target.value })} />
+          </Field>
+          <details className="rounded-xl border border-white/10 p-4">
+            <summary className="cursor-pointer text-sm font-semibold">Расширенные</summary>
+            <div className="mt-5 flex flex-col gap-5">
+              <p className="text-xs leading-relaxed text-white/65">Веса сигналов нормируются автоматически. Отсутствующие сигналы исключаются. Если все веса равны нулю, используются стандартные.</p>
+              {([['loudness', 'Громкость'], ['motion', 'Движение'], ['events', 'Смех и события'], ['speech', 'Темп речи'], ['chat', 'Чат'], ['viewer_clips', 'Клипы зрителей'], ['camera', 'Активность камеры']] as const).map(([key, label]) => (
+                <Field key={key} label={label} value={opt.weights[key].toFixed(2)}>
+                  <input aria-label={`Вес: ${label}`} type="range" className="range" min={0} max={1} step={0.05} value={opt.weights[key]}
+                    onChange={(e) => setOpt({ ...opt, weights: { ...opt.weights, [key]: +e.target.value } })} />
+                </Field>
+              ))}
+              <Field label="Сколько фрагментов оценить ИИ" value={opt.llmTop}>
+                <input aria-label="Сколько фрагментов оценить ИИ" type="range" className="range" min={1} max={60} step={1} value={opt.llmTop}
+                  onChange={(e) => setOpt({ ...opt, llmTop: +e.target.value })} />
+              </Field>
+              <Field label="Доля оценки ИИ" value={`${Math.round(opt.llmWeight * 100)}%`}>
+                <input aria-label="Доля оценки ИИ" type="range" className="range" min={0} max={1} step={0.05} value={opt.llmWeight}
+                  onChange={(e) => setOpt({ ...opt, llmWeight: +e.target.value })} />
+              </Field>
+            </div>
+          </details>
+          <div className="flex flex-wrap items-center gap-3">
+            <button className="btn" disabled={saved} onClick={() => void saveSettings()}>Сохранить настройки</button>
+            <span role="status" className="text-xs text-white/65">{saving ? "Сохраняю…" : saved ? "Сохранено" : "Есть изменения"}</span>
+          </div>
+          </fieldset>
+          <SignalInputs projectId={project.id} disabled={analysis.running} />
         </section>
       </div>
     </div>

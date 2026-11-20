@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Автонарезка
-GenericName=Нарезка видео для TikTok
-Comment=Вертикальные рекламные ролики из длинного видео
+GenericName=Фабрика вертикальных роликов
+Comment=Источники, локальный анализ, монтаж и календарь публикаций
 Exec=avtonarezka
 Icon=avtonarezka
 Terminal=false

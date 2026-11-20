@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import type { AppInfo, Asset, Defaults, Draft, Moment, Post, Project, PublishJob, QueueState, TikTokStatus, YoutubeProgressEvent } from "./lib/api";
 
+export type AppArea = "factory" | "channels" | "templates" | "campaigns" | "calendar" | "analytics" | "accounts" | "studio" | "settings" | "disk" | "server" | "modes" | "trends" | "live" | "integrations";
+
 export type ScreenId = "import" | "analysis" | "moments" | "drafts" | "final";
 
 export const SCREENS: { id: ScreenId; label: string; hint: string }[] = [
@@ -31,6 +33,8 @@ export interface DownloadJob extends YoutubeProgressEvent {
 }
 
 interface UiState {
+  area: AppArea;
+  setArea: (area: AppArea) => void;
   screen: ScreenId;
   dir: 1 | -1;
   project: Project | null;
@@ -114,6 +118,8 @@ function sameDraft(a: Draft, b: Draft): boolean {
 }
 
 export const useUi = create<UiState>((set, get) => ({
+  area: "factory",
+  setArea: (area) => set({ area }),
   screen: "import",
   dir: 1,
   project: null,
@@ -185,7 +191,7 @@ export const useUi = create<UiState>((set, get) => ({
   setAnalysis: (a) => set((s) => ({ analysis: { ...s.analysis, ...a } })),
   setMoments: (moments) => set({ moments }),
   patchMoment: (m) => set((s) => ({ moments: s.moments.map((x) => (x.id === m.id ? m : x)) })),
-  go: (s) => set({ screen: s, dir: order(s) >= order(get().screen) ? 1 : -1 }),
+  go: (s) => set({ area: "studio", screen: s, dir: order(s) >= order(get().screen) ? 1 : -1 }),
   setProject: (project) => set({ project }),
   setProjects: (projects) => set({ projects }),
   setInfo: (info) => set({ info }),

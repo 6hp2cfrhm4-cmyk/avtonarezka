@@ -23,9 +23,15 @@ pub async fn decode_pcm16k(path: &Path) -> anyhow::Result<Vec<i16>> {
     child.stdout.take().unwrap().read_to_end(&mut bytes).await?;
     let out = child.wait_with_output().await?;
     if !out.status.success() {
-        bail!("ffmpeg не смог прочитать звук: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "ffmpeg не смог прочитать звук: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    Ok(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect())
 }
 
 /// Громкость в dBFS на каждый отрезок `HOP`.
@@ -54,12 +60,18 @@ pub fn robust_z(v: &[f32]) -> Vec<f32> {
     let med = median(&mut tmp);
     let mut dev: Vec<f32> = v.iter().map(|x| (x - med).abs()).collect();
     let mad = (1.4826 * median(&mut dev)).max(1e-3);
-    v.iter().map(|x| ((x - med) / mad).clamp(-3.0, 8.0)).collect()
+    v.iter()
+        .map(|x| ((x - med) / mad).clamp(-3.0, 8.0))
+        .collect()
 }
 
 /// Секунды, в которые тихо: подходят для границ между частями.
 pub fn quiet_points(db: &[f32], below_db: f32) -> Vec<f64> {
-    db.iter().enumerate().filter(|(_, d)| **d < below_db).map(|(i, _)| (i as f64 + 0.5) * HOP).collect()
+    db.iter()
+        .enumerate()
+        .filter(|(_, d)| **d < below_db)
+        .map(|(i, _)| (i as f64 + 0.5) * HOP)
+        .collect()
 }
 
 #[cfg(test)]

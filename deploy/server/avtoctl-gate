@@ -1,0 +1,17 @@
+#!/bin/sh
+# Ограничитель SSH-ключа проекта (правило G6). Его вызывает sshd через command="..." в authorized_keys;
+# что клиент запросил на самом деле, лежит в SSH_ORIGINAL_COMMAND. Разрешены только перечисленные глаголы.
+# Никакого shell, проброса портов и произвольных команд.
+set -eu
+cmd="${SSH_ORIGINAL_COMMAND:-serve}"
+case "$cmd" in
+  serve)
+    exec sudo -n -u avtonarezka /opt/avtonarezka/bin/avtoctl serve ;;
+  daemon-status)
+    exec sudo -n /usr/bin/systemctl is-active avtonarezka-daemon.service ;;
+  daemon-restart)
+    exec sudo -n /usr/bin/systemctl restart avtonarezka-daemon.service ;;
+  *)
+    echo "avtoctl-gate: команда не разрешена" >&2
+    exit 126 ;;
+esac

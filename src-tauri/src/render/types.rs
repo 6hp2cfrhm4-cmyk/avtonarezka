@@ -4,6 +4,55 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+pub enum Layout {
+    #[default]
+    GameplayStack,
+    ReactionPip,
+    ReactionStack,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum FacePosition {
+    #[default]
+    SeamLeft,
+    SeamCenter,
+    BottomRight,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReactionStyle {
+    pub background: bool,
+    pub circle: bool,
+    pub size_pct: f64,
+    pub position: FacePosition,
+    pub zoom: f64,
+    pub ring_px: f64,
+    pub ring_color: String,
+    pub shadow: bool,
+    pub pop: bool,
+    pub freeze: bool,
+}
+impl Default for ReactionStyle {
+    fn default() -> Self {
+        Self {
+            background: true,
+            circle: true,
+            size_pct: 0.30,
+            position: FacePosition::SeamLeft,
+            zoom: 1.1,
+            ring_px: 6.0,
+            ring_color: "ffffff".into(),
+            shadow: true,
+            pop: true,
+            freeze: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
 pub enum TopFit {
     /// Горизонтальный исходник (16:9 и подобные) вписывается целиком, остальные заполняют область.
     #[default]
@@ -31,6 +80,8 @@ pub enum BannerAnim {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BannerStyle {
+    /// Alpha PNG/WebM: без удаления зелёного. Автоматически из ассета.
+    pub alpha: bool,
     pub enabled: bool,
     /// Цвет фона баннера, RRGGBB.
     pub key_color: String,
@@ -52,6 +103,7 @@ impl Default for BannerStyle {
     fn default() -> Self {
         Self {
             enabled: true,
+            alpha: false,
             key_color: "00ff00".into(),
             similarity: 0.18,
             blend: 0.08,
@@ -145,13 +197,21 @@ pub struct AudioMix {
 
 impl Default for AudioMix {
     fn default() -> Self {
-        Self { main: 1.0, banner: 1.0, gameplay: 0.0, music: 0.18, loudnorm: true }
+        Self {
+            main: 1.0,
+            banner: 1.0,
+            gameplay: 0.0,
+            music: 0.18,
+            loudnorm: true,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Style {
+    pub layout: Layout,
+    pub reaction: ReactionStyle,
     /// Доля высоты кадра под верхнее видео.
     pub split: f64,
     pub top_fit: TopFit,
@@ -164,12 +224,16 @@ pub struct Style {
     pub banner: BannerStyle,
     pub subtitles: SubtitleStyle,
     pub part_label: PartLabelStyle,
+    /// Заголовок LLM в первые три секунды; старые шаблоны сохраняют прежний вид.
+    pub hook_enabled: bool,
     pub audio: AudioMix,
 }
 
 impl Default for Style {
     fn default() -> Self {
         Self {
+            layout: Layout::default(),
+            reaction: ReactionStyle::default(),
             split: 0.5,
             top_fit: TopFit::Auto,
             top_crop_bottom: 0.0,
@@ -177,6 +241,7 @@ impl Default for Style {
             banner: BannerStyle::default(),
             subtitles: SubtitleStyle::default(),
             part_label: PartLabelStyle::default(),
+            hook_enabled: false,
             audio: AudioMix::default(),
         }
     }
@@ -235,6 +300,9 @@ pub struct Word {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderJob {
+    /// Подтверждённая для этого фрагмента область камеры в координатах исходника.
+    #[serde(default)]
+    pub cam_rect: Option<crate::analyze::face::Rect>,
     /// Кто декодирует видео. Кадры всё равно возвращаются в память: фильтры наложения пока на процессоре.
     #[serde(default)]
     pub decode: Decode,
@@ -253,6 +321,8 @@ pub struct RenderJob {
     pub music_offset: f64,
     pub words: Vec<Word>,
     pub part: Option<u32>,
+    #[serde(default)]
+    pub hook: Option<String>,
     pub style: Style,
     pub profile: Profile,
     pub encoder: Encoder,
@@ -269,7 +339,11 @@ impl RenderJob {
         match self.style.top_fit {
             TopFit::Auto => {
                 let kept = 1.0 - self.style.top_crop_bottom.clamp(0.0, 0.4);
-                if self.source_aspect / kept >= WIDE_ASPECT { TopFit::Contain } else { TopFit::Fill }
+                if self.source_aspect / kept >= WIDE_ASPECT {
+                    TopFit::Contain
+                } else {
+                    TopFit::Fill
+                }
             }
             fixed => fixed,
         }
@@ -296,5 +370,31 @@ impl RenderJob {
     /// Длина готового ролика: клип плюс время, пока играет баннер.
     pub fn out_len(&self) -> f64 {
         self.clip_len() + self.freeze().map_or(0.0, |(_, d)| d)
+    }
+}
+
+/// Ограничения только отдельного экспортного файла; Style и старые проекты совместимы.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputLimits {
+    pub max_seconds: Option<f64>,
+    pub video_kbps: u32,
+    pub audio_kbps: u32,
+}
+impl OutputLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .max_seconds
+            .is_some_and(|s| !s.is_finite() || !(1.0..=3600.0).contains(&s))
+        {
+            return Err("Длительность варианта: от 1 до 3600 секунд".into());
+        }
+        if !(200..=30000).contains(&self.video_kbps) {
+            return Err("Битрейт видео: от 200 до 30000 кбит/с".into());
+        }
+        if ![64, 96, 128, 160, 192, 256, 320].contains(&self.audio_kbps) {
+            return Err("Выбери битрейт аудио из списка".into());
+        }
+        Ok(())
     }
 }

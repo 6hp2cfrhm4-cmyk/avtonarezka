@@ -4,9 +4,9 @@
 //!
 //! Расчёт — чистая функция [`plan`]; чтение и запись положения ленты в базе — [`allocate`].
 
+use crate::host::State;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::State;
 
 use crate::{
     drafts::{kv_get, kv_set, GAMEPLAY_START as START},
@@ -62,12 +62,18 @@ pub fn plan(assets: &[(i64, f64)], from: Cursor, clips: &[Clip]) -> (Vec<Slice>,
     order.sort_by(|a, b| a.start.total_cmp(&b.start));
 
     let mut out = Vec::with_capacity(order.len());
-    let mut end = Cursor { asset: assets[idx].0, pos: base };
+    let mut end = Cursor {
+        asset: assets[idx].0,
+        pos: base,
+    };
     for c in &order {
         let mut offset = (base + c.start).max(START);
         if offset + c.need > assets[idx].1 {
             // свой же фон проверяется последним: при одном фоне лента начинает новый круг
-            match (1..=n).map(|k| (idx + k) % n).find(|&j| assets[j].1 >= c.need + START) {
+            match (1..=n)
+                .map(|k| (idx + k) % n)
+                .find(|&j| assets[j].1 >= c.need + START)
+            {
                 Some(j) => {
                     idx = j;
                     offset = START;
@@ -79,8 +85,15 @@ pub fn plan(assets: &[(i64, f64)], from: Cursor, clips: &[Clip]) -> (Vec<Slice>,
                 }
             }
         }
-        out.push(Slice { clip: c.id, asset: assets[idx].0, offset: r3(offset) });
-        end = Cursor { asset: assets[idx].0, pos: r3((offset + c.need).min(assets[idx].1)) };
+        out.push(Slice {
+            clip: c.id,
+            asset: assets[idx].0,
+            offset: r3(offset),
+        });
+        end = Cursor {
+            asset: assets[idx].0,
+            pos: r3((offset + c.need).min(assets[idx].1)),
+        };
     }
     (out, end)
 }
@@ -95,7 +108,11 @@ struct Saved {
 }
 
 fn save(db: &Connection, key: &str, c: Cursor, project: i64) {
-    if let Ok(json) = serde_json::to_string(&Saved { asset: c.asset, pos: c.pos, project }) {
+    if let Ok(json) = serde_json::to_string(&Saved {
+        asset: c.asset,
+        pos: c.pos,
+        project,
+    }) {
         let _ = kv_set(db, key, &json);
     }
 }
@@ -105,8 +122,15 @@ fn save(db: &Connection, key: &str, c: Cursor, project: i64) {
 /// Начало ленты для проекта запоминается при первом расчёте, поэтому повторный расчёт (новые моменты, «Повторить»)
 /// даёт те же места и ленту не сдвигает. Ленту двигает только проект, который начал её последним:
 /// момент, добавленный задним числом в старый проект, следующему видео не мешает.
-pub fn allocate(db: &Connection, project_id: i64, assets: &[(i64, f64)], clips: &[Clip]) -> Vec<Slice> {
-    let Some(first) = assets.first() else { return vec![] };
+pub fn allocate(
+    db: &Connection,
+    project_id: i64,
+    assets: &[(i64, f64)],
+    clips: &[Clip],
+) -> Vec<Slice> {
+    let Some(first) = assets.first() else {
+        return vec![];
+    };
     let load = |key: &str| {
         kv_get(db, key)
             .and_then(|j| serde_json::from_str::<Saved>(&j).ok())
@@ -116,10 +140,16 @@ pub fn allocate(db: &Connection, project_id: i64, assets: &[(i64, f64)], clips: 
     let stored = load(&base_key);
     let tape = load(CURSOR_KEY);
 
-    let from = stored
-        .as_ref()
-        .or(tape.as_ref())
-        .map_or(Cursor { asset: first.0, pos: 0.0 }, |s| Cursor { asset: s.asset, pos: s.pos });
+    let from = stored.as_ref().or(tape.as_ref()).map_or(
+        Cursor {
+            asset: first.0,
+            pos: 0.0,
+        },
+        |s| Cursor {
+            asset: s.asset,
+            pos: s.pos,
+        },
+    );
     let (slices, end) = plan(assets, from, clips);
 
     if stored.is_none() {
@@ -134,7 +164,10 @@ pub fn allocate(db: &Connection, project_id: i64, assets: &[(i64, f64)], clips: 
 /// Начать ленту с начала: забыть, докуда она дошла и откуда начинался каждый проект.
 /// Готовые черновики не меняются, пока их не пересчитают.
 pub fn reset(db: &Connection) {
-    let _ = db.execute("DELETE FROM kv WHERE key = ?1 OR key LIKE ?2", [CURSOR_KEY, &format!("{BASE_PREFIX}%")]);
+    let _ = db.execute(
+        "DELETE FROM kv WHERE key = ?1 OR key LIKE ?2",
+        [CURSOR_KEY, &format!("{BASE_PREFIX}%")],
+    );
 }
 
 #[derive(Serialize)]
@@ -145,15 +178,18 @@ pub struct TapeDto {
     pub pos: f64,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn gameplay_tape(state: State<'_, AppState>) -> Option<TapeDto> {
     let db = state.db.0.lock().unwrap();
     kv_get(&db, CURSOR_KEY)
         .and_then(|j| serde_json::from_str::<Saved>(&j).ok())
-        .map(|s| TapeDto { asset_id: s.asset, pos: s.pos })
+        .map(|s| TapeDto {
+            asset_id: s.asset,
+            pos: s.pos,
+        })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn gameplay_tape_reset(state: State<'_, AppState>) {
     reset(&state.db.0.lock().unwrap());
 }
@@ -176,15 +212,41 @@ mod tests {
 
     #[test]
     fn clips_take_the_background_at_their_own_timecodes() {
-        let (s, end) = plan(&[(2, 900.0)], at(2, 0.0), &[clip(1, 100.0, 44.0), clip(2, 300.0, 44.0), clip(3, 600.0, 54.0)]);
-        assert_eq!(places(&s), vec![(1, 2, 100.0), (2, 2, 300.0), (3, 2, 600.0)]);
-        assert_eq!(end, at(2, 654.0), "лента остановилась в конце последнего клипа");
+        let (s, end) = plan(
+            &[(2, 900.0)],
+            at(2, 0.0),
+            &[
+                clip(1, 100.0, 44.0),
+                clip(2, 300.0, 44.0),
+                clip(3, 600.0, 54.0),
+            ],
+        );
+        assert_eq!(
+            places(&s),
+            vec![(1, 2, 100.0), (2, 2, 300.0), (3, 2, 600.0)]
+        );
+        assert_eq!(
+            end,
+            at(2, 654.0),
+            "лента остановилась в конце последнего клипа"
+        );
     }
 
     #[test]
     fn clips_are_laid_out_in_timecode_order_whatever_the_input_order() {
-        let (s, _) = plan(&[(2, 900.0)], at(2, 0.0), &[clip(3, 600.0, 50.0), clip(1, 100.0, 40.0), clip(2, 300.0, 40.0)]);
-        assert_eq!(places(&s).iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let (s, _) = plan(
+            &[(2, 900.0)],
+            at(2, 0.0),
+            &[
+                clip(3, 600.0, 50.0),
+                clip(1, 100.0, 40.0),
+                clip(2, 300.0, 40.0),
+            ],
+        );
+        assert_eq!(
+            places(&s).iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -196,7 +258,11 @@ mod tests {
     #[test]
     fn the_next_video_continues_where_the_previous_one_ended() {
         let assets = [(2, 900.0)];
-        let (_, end) = plan(&assets, at(2, 0.0), &[clip(1, 100.0, 44.0), clip(2, 600.0, 54.0)]);
+        let (_, end) = plan(
+            &assets,
+            at(2, 0.0),
+            &[clip(1, 100.0, 44.0), clip(2, 600.0, 54.0)],
+        );
         assert_eq!(end, at(2, 654.0));
         let (s, end2) = plan(&assets, end, &[clip(1, 100.0, 44.0), clip(2, 200.0, 44.0)]);
         assert_eq!(places(&s), vec![(1, 2, 754.0), (2, 2, 854.0)]);
@@ -206,9 +272,21 @@ mod tests {
     #[test]
     fn a_clip_that_does_not_fit_moves_the_tape_to_the_next_background_and_the_rest_follow() {
         let assets = [(1, 100.0), (2, 500.0)];
-        let (s, end) = plan(&assets, at(1, 0.0), &[clip(1, 10.0, 30.0), clip(2, 50.0, 30.0), clip(3, 80.0, 30.0), clip(4, 120.0, 30.0)]);
+        let (s, end) = plan(
+            &assets,
+            at(1, 0.0),
+            &[
+                clip(1, 10.0, 30.0),
+                clip(2, 50.0, 30.0),
+                clip(3, 80.0, 30.0),
+                clip(4, 120.0, 30.0),
+            ],
+        );
         // 80 + 30 > 100: третий клип начинает второй фон, четвёртый идёт в нём через 40 с (120 − 80)
-        assert_eq!(places(&s), vec![(1, 1, 10.0), (2, 1, 50.0), (3, 2, START), (4, 2, 40.01)]);
+        assert_eq!(
+            places(&s),
+            vec![(1, 1, 10.0), (2, 1, 50.0), (3, 2, START), (4, 2, 40.01)]
+        );
         assert_eq!(end, at(2, 70.01));
     }
 
@@ -222,7 +300,11 @@ mod tests {
     #[test]
     fn after_the_last_background_the_tape_starts_a_new_lap() {
         let assets = [(1, 100.0), (2, 100.0)];
-        let (s, end) = plan(&assets, at(2, 80.0), &[clip(1, 0.0, 30.0), clip(2, 50.0, 30.0)]);
+        let (s, end) = plan(
+            &assets,
+            at(2, 80.0),
+            &[clip(1, 0.0, 30.0), clip(2, 50.0, 30.0)],
+        );
         // в хвосте второго фона 20 с, клипу нужно 30: круг начинается с первого
         assert_eq!(places(&s), vec![(1, 1, START), (2, 1, 50.01)]);
         assert_eq!(end, at(1, 80.01));
@@ -230,27 +312,51 @@ mod tests {
 
     #[test]
     fn a_single_background_laps_over_itself() {
-        let (s, _) = plan(&[(2, 900.0)], at(2, 654.0), &[clip(1, 100.0, 44.0), clip(2, 200.0, 44.0), clip(3, 210.0, 44.0), clip(4, 300.0, 44.0)]);
-        assert_eq!(places(&s), vec![(1, 2, 754.0), (2, 2, 854.0), (3, 2, START), (4, 2, 90.01)]);
+        let (s, _) = plan(
+            &[(2, 900.0)],
+            at(2, 654.0),
+            &[
+                clip(1, 100.0, 44.0),
+                clip(2, 200.0, 44.0),
+                clip(3, 210.0, 44.0),
+                clip(4, 300.0, 44.0),
+            ],
+        );
+        assert_eq!(
+            places(&s),
+            vec![(1, 2, 754.0), (2, 2, 854.0), (3, 2, START), (4, 2, 90.01)]
+        );
     }
 
     #[test]
     fn a_background_shorter_than_the_clip_is_not_chosen_while_another_one_fits() {
         let assets = [(1, 100.0), (3, 30.0)];
-        let (s, _) = plan(&assets, at(1, 0.0), &[clip(1, 10.0, 44.0), clip(2, 70.0, 44.0)]);
+        let (s, _) = plan(
+            &assets,
+            at(1, 0.0),
+            &[clip(1, 10.0, 44.0), clip(2, 70.0, 44.0)],
+        );
         // второй клип не помещается в первый фон, а третий короче клипа: новый круг по первому
         assert_eq!(places(&s), vec![(1, 1, 10.0), (2, 1, START)]);
     }
 
     #[test]
     fn when_every_background_is_shorter_than_the_clip_they_start_from_zero_and_loop() {
-        let (s, _) = plan(&[(3, 30.0)], at(3, 0.0), &[clip(1, 100.0, 44.0), clip(2, 300.0, 44.0)]);
+        let (s, _) = plan(
+            &[(3, 30.0)],
+            at(3, 0.0),
+            &[clip(1, 100.0, 44.0), clip(2, 300.0, 44.0)],
+        );
         assert_eq!(places(&s), vec![(1, 3, 0.0), (2, 3, 0.0)]);
     }
 
     #[test]
     fn a_cursor_on_a_removed_background_means_the_start_of_the_list() {
-        let (s, _) = plan(&[(2, 900.0), (5, 900.0)], at(77, 500.0), &[clip(1, 100.0, 40.0)]);
+        let (s, _) = plan(
+            &[(2, 900.0), (5, 900.0)],
+            at(77, 500.0),
+            &[clip(1, 100.0, 40.0)],
+        );
         assert_eq!(places(&s), vec![(1, 2, 100.0)]);
     }
 
@@ -279,19 +385,38 @@ mod tests {
     }
 
     #[test]
-    fn the_second_project_starts_after_the_first_and_the_tape_survives_a_late_moment_in_the_old_one() {
+    fn the_second_project_starts_after_the_first_and_the_tape_survives_a_late_moment_in_the_old_one(
+    ) {
         let db = db();
         let assets = [(2, 900.0)];
-        allocate(&db, 1, &assets, &[clip(1, 100.0, 44.0), clip(2, 600.0, 54.0)]);
+        allocate(
+            &db,
+            1,
+            &assets,
+            &[clip(1, 100.0, 44.0), clip(2, 600.0, 54.0)],
+        );
 
         let second = allocate(&db, 2, &assets, &[clip(1, 100.0, 44.0)]);
         assert_eq!(places(&second), vec![(1, 2, 754.0)]);
 
         // в первом проекте добавили ещё один момент: лента второго проекта не двигается
-        let first = allocate(&db, 1, &assets, &[clip(1, 100.0, 44.0), clip(2, 600.0, 54.0), clip(3, 800.0, 40.0)]);
+        let first = allocate(
+            &db,
+            1,
+            &assets,
+            &[
+                clip(1, 100.0, 44.0),
+                clip(2, 600.0, 54.0),
+                clip(3, 800.0, 40.0),
+            ],
+        );
         assert_eq!(places(&first)[..2], [(1, 2, 100.0), (2, 2, 600.0)]);
         let third = allocate(&db, 3, &assets, &[clip(1, 0.0, 30.0)]);
-        assert_eq!(places(&third), vec![(1, 2, 798.0)], "третье видео идёт сразу за вторым");
+        assert_eq!(
+            places(&third),
+            vec![(1, 2, 798.0)],
+            "третье видео идёт сразу за вторым"
+        );
     }
 
     #[test]
@@ -299,7 +424,12 @@ mod tests {
         let db = db();
         let assets = [(2, 900.0)];
         allocate(&db, 1, &assets, &[clip(1, 100.0, 44.0)]);
-        allocate(&db, 1, &assets, &[clip(1, 100.0, 44.0), clip(2, 400.0, 44.0)]);
+        allocate(
+            &db,
+            1,
+            &assets,
+            &[clip(1, 100.0, 44.0), clip(2, 400.0, 44.0)],
+        );
         let next = allocate(&db, 2, &assets, &[clip(1, 0.0, 30.0)]);
         assert_eq!(places(&next), vec![(1, 2, 444.0)]);
     }
@@ -314,6 +444,10 @@ mod tests {
         assert_eq!(places(&again), vec![(1, 2, 100.0)]);
         // и первый проект после сброса тоже считается заново с нуля
         let p1 = allocate(&db, 1, &assets, &[clip(1, 100.0, 44.0)]);
-        assert_eq!(places(&p1), vec![(1, 2, 244.0)], "ленту уже взял второй проект: она дошла до 144-й секунды");
+        assert_eq!(
+            places(&p1),
+            vec![(1, 2, 244.0)],
+            "ленту уже взял второй проект: она дошла до 144-й секунды"
+        );
     }
 }

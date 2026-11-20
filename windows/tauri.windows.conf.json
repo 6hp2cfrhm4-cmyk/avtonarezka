@@ -12,7 +12,11 @@
     ],
     "resources": {
       "../windows/vendor/tools/*": "tools/",
-      "../windows/vendor/vulkan/*": "vk/"
+      "../windows/vendor/vulkan/*": "vk/",
+      "../windows/ИНСТРУКЦИЯ.txt": "ИНСТРУКЦИЯ.txt",
+      "../docs/FACTORY_GUIDE.md": "docs/FACTORY_GUIDE.md",
+      "../docs/PLATFORM_AUDIT.md": "docs/PLATFORM_AUDIT.md",
+      "../FACTORY_PROGRESS.md": "docs/FACTORY_PROGRESS.md"
     },
     "windows": {
       "webviewInstallMode": { "type": "embedBootstrapper" },

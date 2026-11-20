@@ -10,7 +10,7 @@ export const VIDEO_EXT = ["mp4", "mov", "mkv", "webm", "avi", "m4v"];
 export const AUDIO_EXT = ["mp3", "wav", "m4a", "aac", "ogg", "flac", "opus"];
 
 const COLUMNS: { kind: AssetKind; title: string; hint: string; ext: string[]; filter: string }[] = [
-  { kind: "banner", title: "Баннер", hint: "Видео на зелёном фоне. Играет в самый интересный момент", ext: VIDEO_EXT, filter: "Видео" },
+  { kind: "banner", title: "Баннер", hint: "Видео с хромакеем, PNG или WebM VP9 с альфой. Играет в самый интересный момент", ext: [...VIDEO_EXT, "png"], filter: "Баннер" },
   { kind: "background", title: "Фон", hint: "Геймплей для нижней половины. Идёт по таймкодам видео, а остаток достаётся следующему. Несколько фонов проигрываются по порядку выбора", ext: VIDEO_EXT, filter: "Видео" },
   { kind: "music", title: "Музыка", hint: "Тихо играет под роликом", ext: AUDIO_EXT, filter: "Аудио" },
 ];
@@ -190,7 +190,7 @@ function AssetRow({ a, selected, onToggle, onRemove }: { a: Asset; selected: boo
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-semibold">{a.name}</div>
         <div className="text-xs text-white/40">
-          {fmtDuration(a.duration)}
+          {fmtDuration(a.duration)}{a.kind === "banner" && (a.alpha ? " · альфа" : a.greenCorners != null ? ` · зелёные углы ${Math.round(a.greenCorners * 100)}%` : "")}
           {a.width > 0 && ` · ${a.width}×${a.height}`}
         </div>
       </div>

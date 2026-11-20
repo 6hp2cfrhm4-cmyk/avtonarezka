@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
+use crate::host::State;
 use rusqlite::params;
 use serde::Serialize;
-use tauri::State;
 
 use crate::{
     media::{self, EnvReport, VideoInfo},
@@ -22,7 +22,7 @@ pub struct AppInfo {
     env: EnvReport,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn app_info(state: State<'_, AppState>) -> CmdResult<AppInfo> {
     Ok(AppInfo {
         version: env!("CARGO_PKG_VERSION"),
@@ -32,7 +32,7 @@ pub async fn app_info(state: State<'_, AppState>) -> CmdResult<AppInfo> {
 }
 
 /// URL для `<video src>` / `<img src>`.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn media_url(state: State<'_, AppState>, path: String) -> String {
     state.media.register(PathBuf::from(path))
 }
@@ -53,10 +53,10 @@ pub struct Project {
     tight: bool,
 }
 
-const PROJECT_COLS: &str =
+pub(crate) const PROJECT_COLS: &str =
     "id, path, title, duration, width, height, fps, has_audio, status, created_at, tight";
 
-fn project_from_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+pub(crate) fn project_from_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
     Ok(Project {
         id: r.get(0)?,
         path: r.get(1)?,
@@ -73,7 +73,7 @@ fn project_from_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
 }
 
 /// Добавляет видео в проекты. Тот же файл (по отпечатку) второй раз не дублируется.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn import_video(state: State<'_, AppState>, path: String) -> CmdResult<Project> {
     let p = PathBuf::from(&path);
     let info: VideoInfo = media::probe(&p).await.map_err(err)?;
@@ -88,7 +88,16 @@ pub async fn import_video(state: State<'_, AppState>, path: String) -> CmdResult
         "INSERT INTO projects (path, hash, title, duration, width, height, fps, has_audio)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(hash) DO UPDATE SET path = excluded.path",
-        params![path, hash, title, info.duration, info.width, info.height, info.fps, info.has_audio as i64],
+        params![
+            path,
+            hash,
+            title,
+            info.duration,
+            info.width,
+            info.height,
+            info.fps,
+            info.has_audio as i64
+        ],
     )
     .map_err(err)?;
     db.query_row(
@@ -99,30 +108,43 @@ pub async fn import_video(state: State<'_, AppState>, path: String) -> CmdResult
     .map_err(err)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn list_projects(state: State<'_, AppState>) -> CmdResult<Vec<Project>> {
     let db = state.db.0.lock().unwrap();
     let mut stmt = db
-        .prepare(&format!("SELECT {PROJECT_COLS} FROM projects ORDER BY created_at DESC, id DESC"))
+        .prepare(&format!(
+            "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at DESC, id DESC"
+        ))
         .map_err(err)?;
     let rows = stmt.query_map([], project_from_row).map_err(err)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(err)
 }
 
 /// Отметка «видео уже размечено, резать вплотную». Применяется при следующем анализе.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn project_set_tight(state: State<'_, AppState>, id: i64, tight: bool) -> CmdResult<Project> {
     let db = state.db.0.lock().unwrap();
-    let n = db.execute("UPDATE projects SET tight = ?2 WHERE id = ?1", params![id, tight as i64]).map_err(err)?;
+    let n = db
+        .execute(
+            "UPDATE projects SET tight = ?2 WHERE id = ?1",
+            params![id, tight as i64],
+        )
+        .map_err(err)?;
     if n == 0 {
         return Err("проект не найден".into());
     }
-    db.query_row(&format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"), [id], project_from_row).map_err(err)
+    db.query_row(
+        &format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"),
+        [id],
+        project_from_row,
+    )
+    .map_err(err)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_project(state: State<'_, AppState>, id: i64) -> CmdResult<()> {
     let db = state.db.0.lock().unwrap();
-    db.execute("DELETE FROM projects WHERE id = ?1", [id]).map_err(err)?;
+    db.execute("DELETE FROM projects WHERE id = ?1", [id])
+        .map_err(err)?;
     Ok(())
 }

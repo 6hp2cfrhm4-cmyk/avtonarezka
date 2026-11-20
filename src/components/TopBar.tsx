@@ -1,6 +1,18 @@
 import type { EnvReport } from "../lib/api";
 import { installYtdlpHint, MIN_YTDLP, updateYtdlpHint } from "../lib/youtube";
+import { useCallback } from "react";
+import { api, errText } from "../lib/api";
+import { useFactoryData } from "./FactoryControls";
 import { ACCENTS, useUi } from "../store";
+
+/** Быстрый переключатель сцены. Событие scene-changed обновляет список. */
+function SceneSwitch() {
+  const read = useCallback(() => api.modesState(), []);
+  const { data, refresh } = useFactoryData(read);
+  const notify = useUi((s) => s.notify);
+  if (!data || !data.scenes.length) return null;
+  return <select className="chip cursor-pointer bg-transparent" aria-label="Сцена" title="Сцена: какие потоки работают" value={data.active ?? ""} onChange={async (e) => { try { await api.sceneActivate(+e.target.value); await refresh(); } catch (x) { notify(errText(x), "error"); } }}>{data.active == null && <option value="">Сцена не выбрана</option>}{data.scenes.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select>;
+}
 
 export default function TopBar() {
   const info = useUi((s) => s.info);
@@ -28,13 +40,15 @@ export default function TopBar() {
 
       <div className="flex items-center gap-3">
         {info && (
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap justify-end items-center gap-1.5">
             <Status ok={!!info.env.ffmpeg} label="ffmpeg" />
             <Status ok={info.env.nvenc} label="NVENC" warn="CPU" />
             <Status ok={info.env.libass} label="субтитры" />
             <YtdlpStatus env={info.env} />
+            <Status ok={!!info.env.twitchDownloader} label="Чат Twitch" warn="необязателен" title={info.env.twitchDownloader ?? "TwitchDownloaderCLI не установлен. Чат можно импортировать файлом; установка только с твоего согласия."} />
           </div>
         )}
+        <SceneSwitch />
         <div className="glass flex items-center gap-1.5 rounded-full px-2.5 py-1.5">
           {ACCENTS.map((c) => (
             <button

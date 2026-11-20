@@ -30,7 +30,10 @@ pub struct Endpoints {
 
 impl Endpoints {
     pub fn production() -> Self {
-        Self { auth: "https://www.tiktok.com".into(), api: "https://open.tiktokapis.com".into() }
+        Self {
+            auth: "https://www.tiktok.com".into(),
+            api: "https://open.tiktokapis.com".into(),
+        }
     }
 
     /// В debug-сборке адреса можно подменить (`AVTO_TIKTOK_AUTH`, `AVTO_TIKTOK_API`): так весь поток проверяется
@@ -70,9 +73,14 @@ pub fn challenge_of(verifier: &str) -> String {
 /// Проверочная строка: 64 символа из разрешённого набора (допустимо 43–128).
 pub fn new_pkce(rng: &mut impl Rng) -> Pkce {
     const SET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-    let verifier: String = (0..64).map(|_| SET[rng.random_range(0..SET.len())] as char).collect();
+    let verifier: String = (0..64)
+        .map(|_| SET[rng.random_range(0..SET.len())] as char)
+        .collect();
     let challenge = challenge_of(&verifier);
-    Pkce { verifier, challenge }
+    Pkce {
+        verifier,
+        challenge,
+    }
 }
 
 pub fn random_state(rng: &mut impl Rng) -> String {
@@ -84,7 +92,14 @@ pub fn redirect_uri(port: u16) -> String {
     format!("http://127.0.0.1:{port}/callback/")
 }
 
-pub fn authorize_url(ep: &Endpoints, client_key: &str, scope: &str, redirect_uri: &str, state: &str, challenge: &str) -> anyhow::Result<String> {
+pub fn authorize_url(
+    ep: &Endpoints,
+    client_key: &str,
+    scope: &str,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+) -> anyhow::Result<String> {
     let url = reqwest::Url::parse_with_params(
         &format!("{}/v2/auth/authorize/", ep.auth.trim_end_matches('/')),
         [
@@ -137,20 +152,31 @@ pub fn humanize(code: &str, message: &str) -> String {
 /// Тело ответа Content Posting API → данные или ошибка. Успех — `error.code == "ok"`.
 pub fn parse_envelope(status: u16, body: &Value) -> Result<Value, ApiError> {
     let code = body["error"]["code"].as_str().unwrap_or("");
-    if code == "ok" || (code.is_empty() && (200..300).contains(&status) && body.get("error").is_none()) {
+    if code == "ok"
+        || (code.is_empty() && (200..300).contains(&status) && body.get("error").is_none())
+    {
         return Ok(body["data"].clone());
     }
     // OAuth-ошибки приходят в другой форме: {"error":"...","error_description":"..."}
     let (code, message) = match &body["error"] {
-        Value::String(c) => (c.clone(), body["error_description"].as_str().unwrap_or("").to_string()),
-        Value::Object(_) => (code.to_string(), body["error"]["message"].as_str().unwrap_or("").to_string()),
+        Value::String(c) => (
+            c.clone(),
+            body["error_description"].as_str().unwrap_or("").to_string(),
+        ),
+        Value::Object(_) => (
+            code.to_string(),
+            body["error"]["message"].as_str().unwrap_or("").to_string(),
+        ),
         _ => (format!("http_{status}"), String::new()),
     };
     Err(ApiError {
         human: humanize(&code, &message),
         code,
         http: status,
-        log_id: body["error"]["log_id"].as_str().or_else(|| body["log_id"].as_str()).map(str::to_string),
+        log_id: body["error"]["log_id"]
+            .as_str()
+            .or_else(|| body["log_id"].as_str())
+            .map(str::to_string),
     })
 }
 
@@ -168,12 +194,17 @@ pub struct Tokens {
 }
 
 pub fn now_unix() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 pub fn parse_tokens(status: u16, v: &Value, now: i64) -> anyhow::Result<Tokens> {
     let Some(access) = v["access_token"].as_str().filter(|a| !a.is_empty()) else {
-        return Err(parse_envelope(status, v).err().map(anyhow::Error::from).unwrap_or_else(|| anyhow!("TikTok не вернул токен доступа")));
+        return Err(parse_envelope(status, v)
+            .err()
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow!("TikTok не вернул токен доступа")));
     };
     Ok(Tokens {
         access_token: access.to_string(),
@@ -185,7 +216,8 @@ pub fn parse_tokens(status: u16, v: &Value, now: i64) -> anyhow::Result<Tokens> 
     })
 }
 
-pub type SaveFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+pub type SaveFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
 
 /// Обновляет токен заранее: за 5 минут до конца. `save` вызывается сразу после обновления — старый
 /// refresh-токен после этого перестаёт работать, и потерять новый значит потерять вход.
@@ -203,8 +235,12 @@ pub async fn ensure_fresh(
     if tokens.refresh_token.is_empty() || now >= tokens.refresh_expires_at {
         bail!("Срок входа в TikTok истёк. Подключи аккаунт заново.");
     }
-    let fresh = api.refresh(client_key, client_secret, &tokens.refresh_token, now).await?;
-    save(fresh.clone()).await.context("не удалось сохранить обновлённый вход")?;
+    let fresh = api
+        .refresh(client_key, client_secret, &tokens.refresh_token, now)
+        .await?;
+    save(fresh.clone())
+        .await
+        .context("не удалось сохранить обновлённый вход")?;
     Ok(fresh)
 }
 
@@ -225,9 +261,15 @@ pub fn plan_chunks(video_size: u64) -> anyhow::Result<ChunkPlan> {
         bail!("Файл больше 4 ГБ, TikTok такой не принимает");
     }
     Ok(if video_size <= SINGLE_CHUNK_MAX {
-        ChunkPlan { chunk_size: video_size, total: 1 }
+        ChunkPlan {
+            chunk_size: video_size,
+            total: 1,
+        }
     } else {
-        ChunkPlan { chunk_size: CHUNK_SIZE, total: video_size / CHUNK_SIZE }
+        ChunkPlan {
+            chunk_size: CHUNK_SIZE,
+            total: video_size / CHUNK_SIZE,
+        }
     })
 }
 
@@ -236,14 +278,23 @@ pub fn chunk_ranges(video_size: u64, plan: &ChunkPlan) -> Vec<(u64, u64)> {
     (0..plan.total)
         .map(|i| {
             let start = i * plan.chunk_size;
-            let end = if i + 1 == plan.total { video_size - 1 } else { start + plan.chunk_size - 1 };
+            let end = if i + 1 == plan.total {
+                video_size - 1
+            } else {
+                start + plan.chunk_size - 1
+            };
             (start, end)
         })
         .collect()
 }
 
 pub fn mime_of(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+        .as_deref()
+    {
         Some("mov") => "video/quicktime",
         Some("webm") => "video/webm",
         _ => "video/mp4",
@@ -254,7 +305,12 @@ pub fn mime_of(path: &Path) -> &'static str {
 pub fn normalize_hashtags(tags: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     tags.iter()
-        .map(|t| t.trim().trim_start_matches('#').split_whitespace().collect::<String>())
+        .map(|t| {
+            t.trim()
+                .trim_start_matches('#')
+                .split_whitespace()
+                .collect::<String>()
+        })
         .filter(|t| !t.is_empty() && seen.insert(t.to_lowercase()))
         .map(|t| format!("#{t}"))
         .collect()
@@ -362,10 +418,16 @@ pub fn parse_status(data: &Value) -> PostState {
     match data["status"].as_str().unwrap_or("") {
         "PUBLISH_COMPLETE" => PostState::Complete(
             // в документации поле написано с опечаткой — принимаем оба написания
-            data["publicaly_available_post_id"].as_array().or_else(|| data["publicly_available_post_id"].as_array()).map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default(),
+            data["publicaly_available_post_id"]
+                .as_array()
+                .or_else(|| data["publicly_available_post_id"].as_array())
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default(),
         ),
         "SEND_TO_USER_INBOX" => PostState::InInbox,
-        "FAILED" => PostState::Failed(fail_reason_human(data["fail_reason"].as_str().unwrap_or(""))),
+        "FAILED" => PostState::Failed(fail_reason_human(
+            data["fail_reason"].as_str().unwrap_or(""),
+        )),
         _ => PostState::Processing,
     }
 }
@@ -403,47 +465,114 @@ impl TikTok {
 
     async fn read(&self, resp: reqwest::Response) -> anyhow::Result<(u16, Value)> {
         let status = resp.status().as_u16();
-        let text = resp.text().await.context("не удалось прочитать ответ TikTok")?;
-        let v = serde_json::from_str(&text).map_err(|_| anyhow!("TikTok вернул не JSON (HTTP {status}): {}", cut(&text)))?;
+        let text = resp
+            .text()
+            .await
+            .context("не удалось прочитать ответ TikTok")?;
+        let v = serde_json::from_str(&text)
+            .map_err(|_| anyhow!("TikTok вернул не JSON (HTTP {status}): {}", cut(&text)))?;
         Ok((status, v))
     }
 
     async fn token_request(&self, form: &[(&str, &str)], now: i64) -> anyhow::Result<Tokens> {
-        let resp = self.http.post(self.url("/v2/oauth/token/")).form(form).send().await.context("нет связи с TikTok")?;
+        let resp = self
+            .http
+            .post(self.url("/v2/oauth/token/"))
+            .form(form)
+            .send()
+            .await
+            .context("нет связи с TikTok")?;
         let (status, v) = self.read(resp).await?;
         parse_tokens(status, &v, now)
     }
 
-    pub async fn exchange_code(&self, key: &str, secret: &str, code: &str, redirect_uri: &str, verifier: &str, now: i64) -> anyhow::Result<Tokens> {
+    pub async fn exchange_code(
+        &self,
+        key: &str,
+        secret: &str,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+        now: i64,
+    ) -> anyhow::Result<Tokens> {
         self.token_request(
-            &[("client_key", key), ("client_secret", secret), ("code", code), ("grant_type", "authorization_code"), ("redirect_uri", redirect_uri), ("code_verifier", verifier)],
+            &[
+                ("client_key", key),
+                ("client_secret", secret),
+                ("code", code),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", verifier),
+            ],
             now,
         )
         .await
     }
 
-    pub async fn refresh(&self, key: &str, secret: &str, refresh_token: &str, now: i64) -> anyhow::Result<Tokens> {
-        self.token_request(&[("client_key", key), ("client_secret", secret), ("grant_type", "refresh_token"), ("refresh_token", refresh_token)], now).await
+    pub async fn refresh(
+        &self,
+        key: &str,
+        secret: &str,
+        refresh_token: &str,
+        now: i64,
+    ) -> anyhow::Result<Tokens> {
+        self.token_request(
+            &[
+                ("client_key", key),
+                ("client_secret", secret),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ],
+            now,
+        )
+        .await
     }
 
     async fn post_json(&self, path: &str, access: &str, body: Value) -> anyhow::Result<Value> {
-        let resp = self.http.post(self.url(path)).bearer_auth(access).json(&body).send().await.context("нет связи с TikTok")?;
+        let resp = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(access)
+            .json(&body)
+            .send()
+            .await
+            .context("нет связи с TikTok")?;
         let (status, v) = self.read(resp).await?;
         Ok(parse_envelope(status, &v)?)
     }
 
     pub async fn creator_info(&self, access: &str) -> anyhow::Result<CreatorInfo> {
-        let d = self.post_json("/v2/post/publish/creator_info/query/", access, json!({})).await?;
-        let options: Vec<String> = d["privacy_level_options"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let d = self
+            .post_json("/v2/post/publish/creator_info/query/", access, json!({}))
+            .await?;
+        let options: Vec<String> = d["privacy_level_options"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(CreatorInfo {
             nickname: d["creator_nickname"].as_str().unwrap_or("").to_string(),
             // если TikTok не прислал варианты, безопасно предполагаем только приватную публикацию
-            privacy_options: if options.is_empty() { vec!["SELF_ONLY".into()] } else { options },
+            privacy_options: if options.is_empty() {
+                vec!["SELF_ONLY".into()]
+            } else {
+                options
+            },
             max_duration_sec: d["max_video_post_duration_sec"].as_f64(),
         })
     }
 
-    pub async fn init_upload(&self, access: &str, mode: Mode, post_info: Option<Value>, video_size: u64, plan: &ChunkPlan) -> anyhow::Result<Init> {
+    pub async fn init_upload(
+        &self,
+        access: &str,
+        mode: Mode,
+        post_info: Option<Value>,
+        video_size: u64,
+        plan: &ChunkPlan,
+    ) -> anyhow::Result<Init> {
         let source = json!({
             "source": "FILE_UPLOAD",
             "video_size": video_size,
@@ -451,17 +580,40 @@ impl TikTok {
             "total_chunk_count": plan.total,
         });
         let (path, body) = match mode {
-            Mode::Inbox => ("/v2/post/publish/inbox/video/init/", json!({ "source_info": source })),
-            Mode::Direct => ("/v2/post/publish/video/init/", json!({ "post_info": post_info.unwrap_or_else(|| json!({})), "source_info": source })),
+            Mode::Inbox => (
+                "/v2/post/publish/inbox/video/init/",
+                json!({ "source_info": source }),
+            ),
+            Mode::Direct => (
+                "/v2/post/publish/video/init/",
+                json!({ "post_info": post_info.unwrap_or_else(|| json!({})), "source_info": source }),
+            ),
         };
         let d = self.post_json(path, access, body).await?;
-        let publish_id = d["publish_id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("TikTok не вернул номер отправки"))?.to_string();
-        let upload_url = d["upload_url"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("TikTok не вернул адрес для загрузки"))?.to_string();
-        Ok(Init { publish_id, upload_url })
+        let publish_id = d["publish_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("TikTok не вернул номер отправки"))?
+            .to_string();
+        let upload_url = d["upload_url"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("TikTok не вернул адрес для загрузки"))?
+            .to_string();
+        Ok(Init {
+            publish_id,
+            upload_url,
+        })
     }
 
     pub async fn status(&self, access: &str, publish_id: &str) -> anyhow::Result<PostState> {
-        let d = self.post_json("/v2/post/publish/status/fetch/", access, json!({ "publish_id": publish_id })).await?;
+        let d = self
+            .post_json(
+                "/v2/post/publish/status/fetch/",
+                access,
+                json!({ "publish_id": publish_id }),
+            )
+            .await?;
         Ok(parse_status(&d))
     }
 
@@ -486,11 +638,15 @@ impl TikTok {
         mut on_progress: impl FnMut(u64),
     ) -> anyhow::Result<()> {
         self.check_upload_url(upload_url)?;
-        let mut file = tokio::fs::File::open(path).await.with_context(|| format!("не удалось открыть {}", path.display()))?;
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("не удалось открыть {}", path.display()))?;
         for (start, end) in chunk_ranges(size, plan) {
             let mut buf = vec![0u8; (end - start + 1) as usize];
             file.seek(SeekFrom::Start(start)).await?;
-            file.read_exact(&mut buf).await.context("файл изменился во время загрузки")?;
+            file.read_exact(&mut buf)
+                .await
+                .context("файл изменился во время загрузки")?;
             let body = Bytes::from(buf);
 
             let mut attempt = 0u32;
@@ -508,8 +664,11 @@ impl TikTok {
                     Ok(r) if r.status().is_success() => break,
                     Ok(r) if r.status().is_server_error() && attempt < 3 => {}
                     Ok(r) => bail!("{}", upload_error(r.status().as_u16())),
-                    Err(e) if attempt < 3 && (e.is_timeout() || e.is_connect() || e.is_request()) => {}
-                    Err(e) => return Err(anyhow!(e).context("связь с TikTok оборвалась при загрузке")),
+                    Err(e)
+                        if attempt < 3 && (e.is_timeout() || e.is_connect() || e.is_request()) => {}
+                    Err(e) => {
+                        return Err(anyhow!(e).context("связь с TikTok оборвалась при загрузке"))
+                    }
                 }
                 attempt += 1;
                 tokio::time::sleep(retry_delay * 2u32.pow(attempt - 1)).await;
@@ -537,7 +696,10 @@ mod tests {
     #[test]
     fn challenge_is_hex_sha256_not_base64() {
         // sha256("abc") — известный вектор
-        assert_eq!(challenge_of("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            challenge_of("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
@@ -546,7 +708,10 @@ mod tests {
         for _ in 0..100 {
             let p = new_pkce(&mut rng);
             assert!((43..=128).contains(&p.verifier.len()));
-            assert!(p.verifier.chars().all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
+            assert!(p
+                .verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
             assert_eq!(p.challenge, challenge_of(&p.verifier));
         }
         assert_ne!(new_pkce(&mut rng).verifier, new_pkce(&mut rng).verifier);
@@ -554,7 +719,15 @@ mod tests {
 
     #[test]
     fn authorize_url_carries_every_required_parameter_encoded() {
-        let url = authorize_url(&Endpoints::production(), "key 1", "video.upload", &redirect_uri(38475), "st", "ch").unwrap();
+        let url = authorize_url(
+            &Endpoints::production(),
+            "key 1",
+            "video.upload",
+            &redirect_uri(38475),
+            "st",
+            "ch",
+        )
+        .unwrap();
         let u = reqwest::Url::parse(&url).unwrap();
         assert_eq!(u.host_str(), Some("www.tiktok.com"));
         assert_eq!(u.path(), "/v2/auth/authorize/");
@@ -563,14 +736,24 @@ mod tests {
         assert_eq!(q["response_type"], "code");
         assert_eq!(q["scope"], "video.upload");
         assert_eq!(q["redirect_uri"], "http://127.0.0.1:38475/callback/");
-        assert_eq!((q["state"].as_str(), q["code_challenge"].as_str(), q["code_challenge_method"].as_str()), ("st", "ch", "S256"));
+        assert_eq!(
+            (
+                q["state"].as_str(),
+                q["code_challenge"].as_str(),
+                q["code_challenge_method"].as_str()
+            ),
+            ("st", "ch", "S256")
+        );
     }
 
     #[test]
     fn chunk_plan_matches_the_documented_example() {
         // из документации: 50 000 123 байт при куске 10 000 000 → 5 кусков, последний 10 000 123
         let size = 50_000_123;
-        let plan = ChunkPlan { chunk_size: 10_000_000, total: size / 10_000_000 };
+        let plan = ChunkPlan {
+            chunk_size: 10_000_000,
+            total: size / 10_000_000,
+        };
         assert_eq!(plan.total, 5);
         let r = chunk_ranges(size, &plan);
         assert_eq!(r[0], (0, 9_999_999));
@@ -579,7 +762,13 @@ mod tests {
 
     #[test]
     fn chunk_plan_rules() {
-        assert_eq!(plan_chunks(3_000_000).unwrap(), ChunkPlan { chunk_size: 3_000_000, total: 1 });
+        assert_eq!(
+            plan_chunks(3_000_000).unwrap(),
+            ChunkPlan {
+                chunk_size: 3_000_000,
+                total: 1
+            }
+        );
         assert_eq!(plan_chunks(50_000_000).unwrap().total, 1);
         let big = plan_chunks(55_000_123).unwrap();
         assert_eq!((big.chunk_size, big.total), (10_000_000, 5));
@@ -589,7 +778,14 @@ mod tests {
 
     #[test]
     fn ranges_are_contiguous_and_cover_the_file_exactly() {
-        for size in [1u64, 49_999_999, 50_000_001, 123_456_789, 999_999_999, MAX_VIDEO_BYTES] {
+        for size in [
+            1u64,
+            49_999_999,
+            50_000_001,
+            123_456_789,
+            999_999_999,
+            MAX_VIDEO_BYTES,
+        ] {
             let plan = plan_chunks(size).unwrap();
             let r = chunk_ranges(size, &plan);
             assert_eq!(r.len() as u64, plan.total);
@@ -612,7 +808,10 @@ mod tests {
 
     #[test]
     fn title_joins_hashtags_and_counts_utf16_units() {
-        assert_eq!(make_title(" Смотрите ", &["#юмор".into(), "кот".into(), "  ".into()]), "Смотрите #юмор #кот");
+        assert_eq!(
+            make_title(" Смотрите ", &["#юмор".into(), "кот".into(), "  ".into()]),
+            "Смотрите #юмор #кот"
+        );
         assert_eq!(make_title("", &["a".into()]), "#a");
         // эмодзи занимает две единицы UTF-16
         let long = "😀".repeat(1500);
@@ -623,9 +822,20 @@ mod tests {
 
     #[test]
     fn hashtags_are_normalised_deduplicated_and_idempotent() {
-        let n = normalize_hashtags(&["#Юмор".into(), "юмор".into(), " ## кот ".into(), "два слова".into(), "".into(), "#".into()]);
+        let n = normalize_hashtags(&[
+            "#Юмор".into(),
+            "юмор".into(),
+            " ## кот ".into(),
+            "два слова".into(),
+            "".into(),
+            "#".into(),
+        ]);
         assert_eq!(n, vec!["#Юмор", "#кот", "#дваслова"]);
-        assert_eq!(normalize_hashtags(&n), n, "повторная нормализация ничего не меняет");
+        assert_eq!(
+            normalize_hashtags(&n),
+            n,
+            "повторная нормализация ничего не меняет"
+        );
     }
 
     #[test]
@@ -635,36 +845,69 @@ mod tests {
 
         let err = json!({"data": {}, "error": {"code": "spam_risk_too_many_pending_share", "message": "m", "log_id": "L1"}});
         let e = parse_envelope(403, &err).unwrap_err();
-        assert_eq!((e.code.as_str(), e.http, e.log_id.as_deref()), ("spam_risk_too_many_pending_share", 403, Some("L1")));
+        assert_eq!(
+            (e.code.as_str(), e.http, e.log_id.as_deref()),
+            ("spam_risk_too_many_pending_share", 403, Some("L1"))
+        );
         assert!(e.human.contains("5 неопубликованных"));
 
-        let oauth = json!({"error": "invalid_request", "error_description": "bad code", "log_id": "L2"});
+        let oauth =
+            json!({"error": "invalid_request", "error_description": "bad code", "log_id": "L2"});
         let e = parse_envelope(400, &oauth).unwrap_err();
         assert_eq!(e.code, "invalid_request");
         assert!(e.human.contains("bad code") && e.log_id.as_deref() == Some("L2"));
 
         let unknown = json!({"error": {"code": "brand_new_error", "message": ""}});
-        assert_eq!(parse_envelope(500, &unknown).unwrap_err().human, "TikTok: brand_new_error");
+        assert_eq!(
+            parse_envelope(500, &unknown).unwrap_err().human,
+            "TikTok: brand_new_error"
+        );
     }
 
     #[test]
     fn tokens_parse_with_expiry_and_report_errors() {
         let v = json!({"access_token": "a", "refresh_token": "r", "expires_in": 7200, "refresh_expires_in": 100, "open_id": "o", "scope": "video.upload", "token_type": "Bearer"});
         let t = parse_tokens(200, &v, 1000).unwrap();
-        assert_eq!((t.expires_at, t.refresh_expires_at, t.scope.as_str()), (8200, 1100, "video.upload"));
-        let e = parse_tokens(400, &json!({"error": "invalid_grant", "error_description": "code expired"}), 0).unwrap_err();
+        assert_eq!(
+            (t.expires_at, t.refresh_expires_at, t.scope.as_str()),
+            (8200, 1100, "video.upload")
+        );
+        let e = parse_tokens(
+            400,
+            &json!({"error": "invalid_grant", "error_description": "code expired"}),
+            0,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("code expired"), "{e}");
         assert!(parse_tokens(200, &json!({}), 0).is_err());
     }
 
     #[test]
     fn status_values_map_to_states() {
-        assert_eq!(parse_status(&json!({"status": "PROCESSING_UPLOAD"})), PostState::Processing);
-        assert_eq!(parse_status(&json!({"status": "SEND_TO_USER_INBOX"})), PostState::InInbox);
-        assert_eq!(parse_status(&json!({"status": "PUBLISH_COMPLETE", "publicaly_available_post_id": [7, 8]})), PostState::Complete(vec![7, 8]));
-        assert_eq!(parse_status(&json!({"status": "PUBLISH_COMPLETE", "publicly_available_post_id": [9]})), PostState::Complete(vec![9]));
-        assert!(matches!(parse_status(&json!({"status": "FAILED", "fail_reason": "spam_risk_text"})), PostState::Failed(m) if m.contains("спам")));
-        assert!(matches!(parse_status(&json!({"status": "FAILED"})), PostState::Failed(m) if m.contains("без объяснения")));
+        assert_eq!(
+            parse_status(&json!({"status": "PROCESSING_UPLOAD"})),
+            PostState::Processing
+        );
+        assert_eq!(
+            parse_status(&json!({"status": "SEND_TO_USER_INBOX"})),
+            PostState::InInbox
+        );
+        assert_eq!(
+            parse_status(
+                &json!({"status": "PUBLISH_COMPLETE", "publicaly_available_post_id": [7, 8]})
+            ),
+            PostState::Complete(vec![7, 8])
+        );
+        assert_eq!(
+            parse_status(&json!({"status": "PUBLISH_COMPLETE", "publicly_available_post_id": [9]})),
+            PostState::Complete(vec![9])
+        );
+        assert!(
+            matches!(parse_status(&json!({"status": "FAILED", "fail_reason": "spam_risk_text"})), PostState::Failed(m) if m.contains("спам"))
+        );
+        assert!(
+            matches!(parse_status(&json!({"status": "FAILED"})), PostState::Failed(m) if m.contains("без объяснения"))
+        );
     }
 
     #[test]
@@ -672,7 +915,9 @@ mod tests {
         let ep = Endpoints::production();
         assert!(ep.is_production());
         let api = TikTok::new(ep).unwrap();
-        assert!(api.check_upload_url("https://upload.tiktok.example/x?y=1").is_ok());
+        assert!(api
+            .check_upload_url("https://upload.tiktok.example/x?y=1")
+            .is_ok());
         assert!(api.check_upload_url("http://evil.example/x").is_err());
         assert!(api.check_upload_url("не адрес").is_err());
     }

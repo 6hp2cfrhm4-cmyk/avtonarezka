@@ -10,8 +10,8 @@ use std::{
     time::Duration,
 };
 
+use crate::host::{AppHandle, Emitter, Manager, State};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::{
@@ -47,11 +47,16 @@ async fn fetch_thumb(data_dir: &Path, id: &str, from_info: Option<&str>) -> Opti
         }
     }
     let fallback = format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg");
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
     for url in from_info.into_iter().chain(Some(fallback.as_str())) {
         // только картинки YouTube: адрес пришёл из ответа yt-dlp, ходить по произвольным адресам незачем
         let host_ok = reqwest::Url::parse(url).ok().is_some_and(|u| {
-            u.scheme() == "https" && u.host_str().is_some_and(|h| h == "ytimg.com" || h.ends_with(".ytimg.com"))
+            u.scheme() == "https"
+                && u.host_str()
+                    .is_some_and(|h| h == "ytimg.com" || h.ends_with(".ytimg.com"))
         });
         if !host_ok {
             continue;
@@ -61,11 +66,20 @@ async fn fetch_thumb(data_dir: &Path, id: &str, from_info: Option<&str>) -> Opti
             Some("png") => "png",
             _ => "jpg",
         };
-        let Ok(resp) = client.get(url).send().await.and_then(|r| r.error_for_status()) else { continue };
+        let Ok(resp) = client
+            .get(url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        else {
+            continue;
+        };
         if resp.content_length().is_some_and(|n| n > MAX_THUMB) {
             continue;
         }
-        let Ok(bytes) = resp.bytes().await else { continue };
+        let Ok(bytes) = resp.bytes().await else {
+            continue;
+        };
         if bytes.is_empty() || bytes.len() as u64 > MAX_THUMB {
             continue;
         }
@@ -73,7 +87,9 @@ async fn fetch_thumb(data_dir: &Path, id: &str, from_info: Option<&str>) -> Opti
         // пишем во временный файл и переименовываем: оборванная обложка не должна остаться на месте
         let path = dir.join(format!("yt-{id}.{ext}"));
         let tmp = dir.join(format!("yt-{id}.{ext}.part"));
-        if tokio::fs::write(&tmp, &bytes).await.is_ok() && tokio::fs::rename(&tmp, &path).await.is_ok() {
+        if tokio::fs::write(&tmp, &bytes).await.is_ok()
+            && tokio::fs::rename(&tmp, &path).await.is_ok()
+        {
             return Some(path);
         }
     }
@@ -81,7 +97,7 @@ async fn fetch_thumb(data_dir: &Path, id: &str, from_info: Option<&str>) -> Opti
 }
 
 /// Проверяет ссылку и читает сведения о ролике: название, канал, длительность, обложка, доступное качество.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn youtube_analyze(state: State<'_, AppState>, url: String) -> CmdResult<VideoInfo> {
     let id = extract_video_id(&url).map_err(|e| e.to_string())?;
     let ytdlp = engine::find_ytdlp().ok_or_else(|| engine::NOT_FOUND.to_string())?;
@@ -183,16 +199,23 @@ async fn cancelled(rx: &mut watch::Receiver<bool>) {
 }
 
 /// Ставит загрузку в очередь. Возвращает id задачи; дальше всё сообщают события.
-#[tauri::command]
-pub fn youtube_download(app: AppHandle, state: State<'_, AppState>, args: StartArgs) -> CmdResult<String> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn youtube_download(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    args: StartArgs,
+) -> CmdResult<String> {
     let (job, ytdlp, out_dir, rx) = register(&state, args)?;
     let id = job.id.clone();
-    tauri::async_runtime::spawn(run(app, job, ytdlp, out_dir, rx));
+    crate::host::spawn(run(app, job, ytdlp, out_dir, rx));
     Ok(id)
 }
 
 /// Проверяет ссылку и заводит задачу в списке идущих (чтобы её можно было остановить).
-fn register(state: &AppState, args: StartArgs) -> CmdResult<(Job, PathBuf, PathBuf, watch::Receiver<bool>)> {
+fn register(
+    state: &AppState,
+    args: StartArgs,
+) -> CmdResult<(Job, PathBuf, PathBuf, watch::Receiver<bool>)> {
     let video_id = extract_video_id(&args.url).map_err(|e| e.to_string())?;
     select::height_limit(&args.preset)?;
     let ytdlp = engine::find_ytdlp().ok_or_else(|| engine::NOT_FOUND.to_string())?;
@@ -220,7 +243,11 @@ fn register(state: &AppState, args: StartArgs) -> CmdResult<(Job, PathBuf, PathB
 
 /// Для пачки: та же загрузка, что у кнопки, но результат возвращается прямо, без событий «готово».
 /// `on_started` получает id задачи, по нему пачку можно остановить через `cancel_job`.
-pub(crate) async fn download_for_batch(app: &AppHandle, args: StartArgs, on_started: impl FnOnce(&str)) -> Result<Project, String> {
+pub(crate) async fn download_for_batch(
+    app: &AppHandle,
+    args: StartArgs,
+    on_started: impl FnOnce(&str),
+) -> Result<Project, String> {
     let state = app.state::<AppState>();
     let (job, ytdlp, out_dir, rx) = register(&state, args)?;
     on_started(&job.id);
@@ -229,22 +256,47 @@ pub(crate) async fn download_for_batch(app: &AppHandle, args: StartArgs, on_star
     outcome.map_err(|(message, _)| message)
 }
 
-async fn run(app: AppHandle, job: Job, ytdlp: PathBuf, out_dir: PathBuf, cancel: watch::Receiver<bool>) {
+async fn run(
+    app: AppHandle,
+    job: Job,
+    ytdlp: PathBuf,
+    out_dir: PathBuf,
+    cancel: watch::Receiver<bool>,
+) {
     let outcome = fetch(&app, &job, ytdlp, out_dir, cancel).await;
     let state = app.state::<AppState>();
     state.downloads.lock().unwrap().remove(&job.id);
     match outcome {
         Ok(project) => {
-            let _ = app.emit("youtube-done", DoneEvent { job_id: &job.id, project });
+            let _ = app.emit(
+                "youtube-done",
+                DoneEvent {
+                    job_id: &job.id,
+                    project,
+                },
+            );
         }
         Err((message, cancelled)) => {
-            let _ = app.emit("youtube-error", ErrorEvent { job_id: &job.id, message, cancelled });
+            let _ = app.emit(
+                "youtube-error",
+                ErrorEvent {
+                    job_id: &job.id,
+                    message,
+                    cancelled,
+                },
+            );
         }
     }
 }
 
 /// Скачивает и добавляет видео в проекты. Ход загрузки уходит событиями `youtube-progress`.
-async fn fetch(app: &AppHandle, job: &Job, ytdlp: PathBuf, out_dir: PathBuf, mut cancel: watch::Receiver<bool>) -> Result<Project, (String, bool)> {
+async fn fetch(
+    app: &AppHandle,
+    job: &Job,
+    ytdlp: PathBuf,
+    out_dir: PathBuf,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<Project, (String, bool)> {
     let state = app.state::<AppState>();
     emit_progress(app, job, "queued", &Snapshot::default());
 
@@ -266,16 +318,35 @@ async fn fetch(app: &AppHandle, job: &Job, ytdlp: PathBuf, out_dir: PathBuf, mut
                 out_dir,
                 ffmpeg_dir: engine::find_ffmpeg_dir(),
             };
-            engine::download(&ytdlp, &req, cancel.clone(), |u| emit_progress(app, job, stage_name(u.stage), &u.snapshot)).await
+            engine::download(&ytdlp, &req, cancel.clone(), |u| {
+                emit_progress(app, job, stage_name(u.stage), &u.snapshot)
+            })
+            .await
         }
     };
 
     match result {
         Ok(path) => {
-            emit_progress(app, job, "importing", &Snapshot { fraction: Some(1.0), ..Snapshot::default() });
+            emit_progress(
+                app,
+                job,
+                "importing",
+                &Snapshot {
+                    fraction: Some(1.0),
+                    ..Snapshot::default()
+                },
+            );
             commands::import_video(app.state(), path.display().to_string())
                 .await
-                .map_err(|e| (format!("Видео скачано ({}), но не добавилось в проекты: {e}", path.display()), false))
+                .map_err(|e| {
+                    (
+                        format!(
+                            "Видео скачано ({}), но не добавилось в проекты: {e}",
+                            path.display()
+                        ),
+                        false,
+                    )
+                })
         }
         Err(DownloadError::Cancelled) => Err(("Остановлено — можно продолжить".to_string(), true)),
         Err(DownloadError::Failed(message)) => Err((message, false)),
@@ -289,7 +360,7 @@ pub(crate) fn cancel_job(state: &AppState, job_id: &str) {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn youtube_cancel(state: State<'_, AppState>, job_id: String) {
     cancel_job(&state, &job_id);
 }

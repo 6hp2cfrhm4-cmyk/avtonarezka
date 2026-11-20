@@ -6,7 +6,17 @@ pub type Device = (i32, String, usize);
 
 fn is_discrete(name: &str) -> bool {
     let n = name.to_lowercase();
-    ["nvidia", "geforce", "rtx", "quadro", "radeon rx", "radeon pro", "arc "].iter().any(|k| n.contains(k))
+    [
+        "nvidia",
+        "geforce",
+        "rtx",
+        "quadro",
+        "radeon rx",
+        "radeon pro",
+        "arc ",
+    ]
+    .iter()
+    .any(|k| n.contains(k))
 }
 
 /// Дискретная карта с наибольшей памятью, иначе первое устройство. `None` — Vulkan ничего не видит.
@@ -22,10 +32,16 @@ pub fn pick(devices: &[Device]) -> Option<i32> {
 /// Номер из `AVTO_GPU_DEVICE` (для отладки и настроек), иначе автоматический выбор.
 #[cfg(feature = "gpu-probe")]
 pub fn choose() -> Option<i32> {
-    if let Some(d) = std::env::var("AVTO_GPU_DEVICE").ok().and_then(|v| v.parse().ok()) {
+    if let Some(d) = std::env::var("AVTO_GPU_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         return Some(d);
     }
-    let devices: Vec<Device> = whisper_rs::vulkan::list_devices().into_iter().map(|d| (d.id, d.name, d.vram.total)).collect();
+    let devices: Vec<Device> = whisper_rs::vulkan::list_devices()
+        .into_iter()
+        .map(|d| (d.id, d.name, d.vram.total))
+        .collect();
     pick(&devices)
 }
 
@@ -45,13 +61,19 @@ mod tests {
 
     #[test]
     fn laptop_picks_the_discrete_card_even_when_it_is_listed_second() {
-        let v = [d(0, "AMD Radeon Graphics (RADV RENOIR)", 8), d(1, "NVIDIA GeForce RTX 3050 Laptop GPU", 4)];
+        let v = [
+            d(0, "AMD Radeon Graphics (RADV RENOIR)", 8),
+            d(1, "NVIDIA GeForce RTX 3050 Laptop GPU", 4),
+        ];
         assert_eq!(pick(&v), Some(1));
     }
 
     #[test]
     fn biggest_discrete_card_wins() {
-        let v = [d(0, "NVIDIA GeForce GTX 1050", 2), d(1, "AMD Radeon RX 6800", 16)];
+        let v = [
+            d(0, "NVIDIA GeForce GTX 1050", 2),
+            d(1, "AMD Radeon RX 6800", 16),
+        ];
         assert_eq!(pick(&v), Some(1));
     }
 

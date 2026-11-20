@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { api, errText, fmtDuration, type Moment, type MomentStatus } from "../lib/api";
 import { useUi } from "../store";
 import { DENSE_ABOVE } from "../lib/dense";
+import SignalTimeline from "../components/SignalTimeline";
 import { Arrow, Check } from "../components/icons";
 
 type Dir = "accept" | "reject";
@@ -28,12 +29,14 @@ export default function MomentsScreen() {
   const patchMoment = useUi((s) => s.patchMoment);
   const go = useUi((s) => s.go);
   const notify = useUi((s) => s.notify);
+  const [manualStart, setManualStart] = useState<number | null>(null);
   const [src, setSrc] = useState<string | null>(null);
   const [playing, setPlaying] = useState(true);
   const [history, setHistory] = useState<{ id: number; prev: MomentStatus }[]>([]);
   const dirRef = useRef<Dir>("accept");
 
   useEffect(() => {
+    setManualStart(null);
     if (!project) return;
     api.momentsList(project.id).then(setMoments).catch((e) => notify(errText(e), "error"));
     api.mediaUrl(project.path).then(setSrc).catch(() => setSrc(null));
@@ -107,12 +110,13 @@ export default function MomentsScreen() {
         </div>
       </div>
 
+      <SignalTimeline projectId={project.id} duration={project.duration} start={top?.start} end={top?.end} onSelect={setManualStart} />
       <div className="grid gap-6 xl:grid-cols-[1.6fr_1fr]">
         <div className="relative min-h-[560px]" style={{ perspective: 1600 }}>
           {queue.slice(1, 3).map((m, i) => (
             <motion.div
               key={m.id}
-              className="glass absolute inset-x-0 top-0 h-[540px] rounded-[28px]"
+              className="moment-surface absolute inset-x-0 top-0 h-[540px] rounded-[28px]"
               animate={{ scale: 0.95 - i * 0.05, y: 22 + i * 22, z: -80 - i * 90, opacity: 0.7 - i * 0.25 }}
               transition={{ type: "spring", stiffness: 160, damping: 18 }}
             />
@@ -145,7 +149,7 @@ export default function MomentsScreen() {
                 key="empty"
                 initial={{ opacity: 0, scale: 0.9, rotateX: 20 }}
                 animate={{ opacity: 1, scale: 1, rotateX: 0 }}
-                className="glass absolute inset-x-0 top-0 grid h-[540px] place-items-center rounded-[28px] p-10 text-center"
+                className="moment-surface absolute inset-x-0 top-0 grid h-[540px] place-items-center rounded-[28px] p-10 text-center"
               >
                 <div>
                   <div className="mx-auto mb-4 grid h-16 w-16 place-items-center rounded-2xl bg-accent text-accent-ink">
@@ -164,18 +168,18 @@ export default function MomentsScreen() {
         </div>
 
         <aside className="flex flex-col gap-4">
-          <ManualAdd projectId={project.id} duration={project.duration} />
-          <section className="glass flex min-h-[200px] flex-1 flex-col gap-3 rounded-[28px] p-5">
-            <h2 className="font-display text-sm font-semibold uppercase tracking-[0.18em] text-white/45">Взято в работу</h2>
+          <ManualAdd projectId={project.id} duration={project.duration} selectedStart={manualStart} />
+          <section className="moment-surface flex flex-col gap-3 rounded-[28px] p-5">
+            <h2 className="font-display text-sm font-semibold text-white/75">Взято в работу</h2>
             <div className="flex max-h-[290px] flex-col gap-2 overflow-y-auto pr-1" style={dense ? undefined : { perspective: 800 }}>
               <AnimatePresence initial={false}>
                 {accepted.map((m) => (
                   <AcceptedRow key={m.id} m={m} dense={dense} onGiveBack={giveBack} />
                 ))}
               </AnimatePresence>
-              {accepted.length === 0 && <div className="py-6 text-center text-sm text-white/35">Пока ничего</div>}
+              {accepted.length === 0 && <div className="py-3 text-sm text-white/55">Пока ничего</div>}
             </div>
-            <button className="btn btn-primary mt-auto" disabled={accepted.length === 0} onClick={() => go("drafts")}>
+            <button className="btn btn-primary" disabled={accepted.length === 0} onClick={() => go("drafts")}>
               Собрать черновики ({accepted.length}) <Arrow size={18} />
             </button>
           </section>
@@ -242,7 +246,7 @@ function MomentCard({
   m, src, playing, duration, onChange,
 }: { m: Moment; src: string | null; playing: boolean; duration: number; onChange: (m: Moment) => void }) {
   return (
-    <div className="glass flex h-[540px] flex-col gap-4 rounded-[28px] p-5" style={{ transformStyle: "preserve-3d" }}>
+    <div className="moment-surface flex h-[540px] flex-col gap-4 rounded-[28px] p-5" style={{ transformStyle: "preserve-3d" }}>
       <Clip src={src} start={m.start} end={m.end} playing={playing} />
       <div className="flex items-start justify-between gap-4" style={{ transform: "translateZ(30px)" }}>
         <div className="min-w-0">
@@ -359,10 +363,11 @@ function parseTime(t: string): number | null {
   return parts.reduce((a, p) => a * 60 + p, 0);
 }
 
-function ManualAdd({ projectId, duration }: { projectId: number; duration: number }) {
+function ManualAdd({ projectId, duration, selectedStart }: { projectId: number; duration: number; selectedStart: number | null }) {
   const notify = useUi((s) => s.notify);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  useEffect(() => { if (selectedStart !== null) { setFrom(selectedStart.toFixed(1)); setTo(Math.min(duration, selectedStart + 40).toFixed(1)); } }, [selectedStart, duration]);
 
   const add = async () => {
     const [a, b] = [parseTime(from), parseTime(to)];
@@ -380,11 +385,11 @@ function ManualAdd({ projectId, duration }: { projectId: number; duration: numbe
   };
   const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-accent/60";
   return (
-    <section className="glass rounded-[28px] p-5">
-      <h2 className="mb-3 font-display text-sm font-semibold uppercase tracking-[0.18em] text-white/45">Свой момент</h2>
+    <section className="moment-surface rounded-[28px] p-5">
+      <h2 className="mb-3 font-display text-sm font-semibold text-white/75">Свой момент</h2>
       <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
-        <input className={input} placeholder="с 12:30" value={from} onChange={(e) => setFrom(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void add()} />
-        <input className={input} placeholder="до 13:10" value={to} onChange={(e) => setTo(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void add()} />
+        <input aria-label="Начало своего момента" className={input} placeholder="с 12:30" value={from} onChange={(e) => setFrom(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void add()} />
+        <input aria-label="Конец своего момента" className={input} placeholder="до 13:10" value={to} onChange={(e) => setTo(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void add()} />
         <button className="btn" onClick={() => void add()}>
           Добавить
         </button>

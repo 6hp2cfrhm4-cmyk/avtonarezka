@@ -1,13 +1,17 @@
 //! Поиск интересных моментов: сигналы звука и картинки → кривая интереса → кандидаты.
 
 pub mod audio;
+pub mod chat;
+pub mod clips;
 pub mod describe;
 pub mod events;
+pub mod face;
 pub mod gpu;
 pub mod llm;
 pub mod pipeline;
-pub mod speech;
 pub mod score;
+pub mod scout;
+pub mod speech;
 pub mod video;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +30,14 @@ pub struct Signals {
     pub speech: Option<Vec<f32>>,
     /// Моменты смены сцен, секунды.
     pub cuts: Vec<f64>,
+    #[serde(default)]
+    pub scout: Option<scout::ScoutReport>,
+    #[serde(default)]
+    pub chat: Option<Vec<f32>>,
+    #[serde(default)]
+    pub viewer_clips: Option<Vec<f32>>,
+    #[serde(default)]
+    pub camera: Option<Vec<f32>>,
 }
 
 /// Законченная фраза с таймкодами в секундах исходного видео.

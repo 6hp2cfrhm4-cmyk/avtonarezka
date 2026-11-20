@@ -29,7 +29,10 @@ pub struct Hook {
 pub enum Line {
     Download(Hook),
     /// Этап после скачивания: `Merger` (склейка), `MoveFiles` (перенос в папку) и другие.
-    Post { status: String, name: String },
+    Post {
+        status: String,
+        name: String,
+    },
     File(PathBuf),
     Other(String),
 }
@@ -39,17 +42,25 @@ fn field(s: &str) -> Option<&str> {
     (!s.is_empty() && s != "NA" && s != "None").then_some(s)
 }
 fn num(s: &str) -> Option<f64> {
-    field(s)?.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+    field(s)?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 pub fn parse_line(line: &str) -> Line {
-    let Some(rest) = line.strip_prefix("AVTO|") else { return Line::Other(line.to_string()) };
+    let Some(rest) = line.strip_prefix("AVTO|") else {
+        return Line::Other(line.to_string());
+    };
     if let Some(path) = rest.strip_prefix("F|") {
         return Line::File(PathBuf::from(path));
     }
     if let Some(body) = rest.strip_prefix("P|") {
         let mut it = body.split('|');
-        return Line::Post { status: it.next().unwrap_or("").to_string(), name: it.next().unwrap_or("").to_string() };
+        return Line::Post {
+            status: it.next().unwrap_or("").to_string(),
+            name: it.next().unwrap_or("").to_string(),
+        };
     }
     if let Some(body) = rest.strip_prefix("D|") {
         let f: Vec<&str> = body.split('|').collect();
@@ -114,7 +125,11 @@ pub fn stream_label(h: &Hook) -> String {
     let mut parts: Vec<String> = Vec::new();
     if matches!(kind, Kind::Video | Kind::Combined) {
         if let Some(height) = h.height {
-            let fps = h.fps.filter(|f| *f > 30.0).map(|f| format!("{}", f.round() as u32)).unwrap_or_default();
+            let fps = h
+                .fps
+                .filter(|f| *f > 30.0)
+                .map(|f| format!("{}", f.round() as u32))
+                .unwrap_or_default();
             parts.push(format!("{height}p{fps}"));
         }
         if let Some(c) = h.vcodec.as_deref().filter(|c| *c != "none") {
@@ -211,17 +226,30 @@ impl Tracker {
             s.eta = h.eta;
         }
 
-        let states: Vec<&State> = self.order.iter().filter_map(|k| self.streams.get(k)).collect();
+        let states: Vec<&State> = self
+            .order
+            .iter()
+            .filter_map(|k| self.streams.get(k))
+            .collect();
         let downloaded: u64 = states.iter().map(|s| s.downloaded).sum();
         // Общий размер известен, только когда его сообщил каждый поток.
-        let total: Option<u64> =
-            if states.iter().all(|s| s.total.is_some()) { Some(states.iter().filter_map(|s| s.total).sum()) } else { None };
+        let total: Option<u64> = if states.iter().all(|s| s.total.is_some()) {
+            Some(states.iter().filter_map(|s| s.total).sum())
+        } else {
+            None
+        };
         let active: Vec<&&State> = states.iter().filter(|s| !s.finished).collect();
         let speeds: Vec<f64> = active.iter().filter_map(|s| s.speed).collect();
-        let speed = if speeds.is_empty() { None } else { Some(speeds.iter().sum()) };
+        let speed = if speeds.is_empty() {
+            None
+        } else {
+            Some(speeds.iter().sum())
+        };
         let eta = active.iter().filter_map(|s| s.eta).max();
 
-        let fraction = total.filter(|t| *t > 0).map(|t| (downloaded as f64 / t as f64).min(1.0));
+        let fraction = total
+            .filter(|t| *t > 0)
+            .map(|t| (downloaded as f64 / t as f64).min(1.0));
         let fraction = fraction.map(|f| {
             self.peak = self.peak.max(f);
             self.peak
@@ -238,7 +266,10 @@ impl Tracker {
                 .map(|s| StreamView {
                     kind: s.kind,
                     label: s.label.clone(),
-                    fraction: s.total.filter(|t| *t > 0).map(|t| (s.downloaded as f64 / t as f64).min(1.0)),
+                    fraction: s
+                        .total
+                        .filter(|t| *t > 0)
+                        .map(|t| (s.downloaded as f64 / t as f64).min(1.0)),
                     finished: s.finished,
                 })
                 .collect(),
@@ -270,7 +301,9 @@ mod tests {
     #[test]
     fn parses_a_real_download_line() {
         let l = parse_line("AVTO|D|downloading|1047552|11829048|NA|1056109.2896501445|10|18|avc1.42001E|mp4a.40.2|360|25|NA");
-        let Line::Download(h) = l else { panic!("не строка загрузки") };
+        let Line::Download(h) = l else {
+            panic!("не строка загрузки")
+        };
         assert_eq!(h.status, "downloading");
         assert_eq!(h.downloaded, 1_047_552);
         assert_eq!(h.total, Some(11_829_048));
@@ -284,10 +317,22 @@ mod tests {
 
     #[test]
     fn parses_post_and_file_lines() {
-        assert_eq!(parse_line("AVTO|P|started|Merger"), Line::Post { status: "started".into(), name: "Merger".into() });
-        assert_eq!(parse_line("AVTO|F|/tmp/a|b [x].mp4"), Line::File(PathBuf::from("/tmp/a|b [x].mp4")));
+        assert_eq!(
+            parse_line("AVTO|P|started|Merger"),
+            Line::Post {
+                status: "started".into(),
+                name: "Merger".into()
+            }
+        );
+        assert_eq!(
+            parse_line("AVTO|F|/tmp/a|b [x].mp4"),
+            Line::File(PathBuf::from("/tmp/a|b [x].mp4"))
+        );
         assert_eq!(parse_line("ERROR: boom"), Line::Other("ERROR: boom".into()));
-        assert_eq!(parse_line("AVTO|D|short"), Line::Other("AVTO|D|short".into()));
+        assert_eq!(
+            parse_line("AVTO|D|short"),
+            Line::Other("AVTO|D|short".into())
+        );
     }
 
     #[test]
@@ -297,7 +342,10 @@ mod tests {
         a.speed = Some(10.0);
         a.eta = Some(5);
         let first = t.update(&a);
-        assert_eq!((first.downloaded, first.total, first.fraction), (50, Some(100), Some(0.5)));
+        assert_eq!(
+            (first.downloaded, first.total, first.fraction),
+            (50, Some(100), Some(0.5))
+        );
 
         let mut b = hook("downloading", 30, None, "251", "none", "opus");
         b.total_estimate = Some(300);
@@ -324,7 +372,10 @@ mod tests {
         let mut a = hook("downloading", 10, Some(20), "140", "none", "mp4a.40.2");
         a.abr = Some(129.5);
         let p = t.update(&a);
-        assert_eq!(p.streams.iter().map(|s| s.kind).collect::<Vec<_>>(), [Kind::Video, Kind::Audio]);
+        assert_eq!(
+            p.streams.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            [Kind::Video, Kind::Audio]
+        );
         assert_eq!(p.streams[0].fraction, Some(0.5));
         assert_eq!(p.streams[1].fraction, Some(0.5));
         assert_eq!(p.fraction, Some(0.5));
@@ -357,6 +408,9 @@ mod tests {
         v.height = Some(2160);
         v.fps = Some(60.0);
         assert_eq!(stream_label(&v), "2160p60 · AV1");
-        assert_eq!(stream_label(&hook("downloading", 0, None, "x", "none", "none")), "x");
+        assert_eq!(
+            stream_label(&hook("downloading", 0, None, "x", "none", "none")),
+            "x"
+        );
     }
 }

@@ -13,13 +13,22 @@ pub struct VideoInfo {
     pub fps: f64,
     pub has_audio: bool,
     pub codec: String,
+    pub audio_codec: Option<String>,
     pub size: u64,
 }
 
 pub async fn probe(path: &Path) -> anyhow::Result<VideoInfo> {
     let out = crate::platform::command("ffprobe")
-        .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
         .arg(path)
+        .kill_on_drop(true)
         .output()
         .await
         .context("не удалось запустить ffprobe (установлен ли ffmpeg?)")?;
@@ -46,14 +55,29 @@ pub async fn probe(path: &Path) -> anyhow::Result<VideoInfo> {
         fps: parse_rate(video["avg_frame_rate"].as_str().unwrap_or("0/1")),
         has_audio: streams.iter().any(|s| s["codec_type"] == "audio"),
         codec: video["codec_name"].as_str().unwrap_or("?").to_string(),
-        size: v["format"]["size"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
+        audio_codec: streams
+            .iter()
+            .find(|s| s["codec_type"] == "audio")
+            .and_then(|s| s["codec_name"].as_str())
+            .map(str::to_owned),
+        size: v["format"]["size"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
     })
 }
 
 /// Длительность аудиофайла (музыки). Ошибка, если в файле нет звука.
 pub async fn probe_audio(path: &Path) -> anyhow::Result<f64> {
     let out = crate::platform::command("ffprobe")
-        .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
         .arg(path)
         .output()
         .await
@@ -62,10 +86,16 @@ pub async fn probe_audio(path: &Path) -> anyhow::Result<f64> {
         bail!("ffprobe: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    if !v["streams"].as_array().is_some_and(|s| s.iter().any(|x| x["codec_type"] == "audio")) {
+    if !v["streams"]
+        .as_array()
+        .is_some_and(|s| s.iter().any(|x| x["codec_type"] == "audio"))
+    {
         bail!("в файле нет звука");
     }
-    v["format"]["duration"].as_str().and_then(|d| d.parse().ok()).context("не удалось определить длительность")
+    v["format"]["duration"]
+        .as_str()
+        .and_then(|d| d.parse().ok())
+        .context("не удалось определить длительность")
 }
 
 /// Кадр-миниатюра шириной 360 px.
@@ -73,8 +103,13 @@ pub async fn make_thumb(src: &Path, dst: &Path, at: f64) -> anyhow::Result<()> {
     if let Some(dir) = dst.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
-    let out = crate::platform::command("ffmpeg")
-        .args(["-y", "-v", "error", "-ss", &format!("{at:.2}"), "-i"])
+    let mut command = crate::platform::command("ffmpeg");
+    command.args(["-y", "-v", "error"]);
+    if at > 0.0 {
+        command.args(["-ss", &format!("{at:.2}")]);
+    }
+    let out = command
+        .arg("-i")
         .arg(src)
         .args(["-frames:v", "1", "-vf", "scale=360:-2", "-q:v", "4"])
         .arg(dst)
@@ -82,15 +117,23 @@ pub async fn make_thumb(src: &Path, dst: &Path, at: f64) -> anyhow::Result<()> {
         .await
         .context("не удалось запустить ffmpeg")?;
     if !out.status.success() || !dst.is_file() {
-        bail!("ffmpeg не смог снять кадр: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "ffmpeg не смог снять кадр: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
 
 /// Кадр черновика целиком (540 px по ширине) — афиша карточки.
 pub async fn make_poster(src: &Path, dst: &Path, at: f64) -> anyhow::Result<()> {
-    let out = crate::platform::command("ffmpeg")
-        .args(["-y", "-v", "error", "-ss", &format!("{at:.2}"), "-i"])
+    let mut command = crate::platform::command("ffmpeg");
+    command.args(["-y", "-v", "error"]);
+    if at > 0.0 {
+        command.args(["-ss", &format!("{at:.2}")]);
+    }
+    let out = command
+        .arg("-i")
         .arg(src)
         .args(["-frames:v", "1", "-q:v", "3"])
         .arg(dst)
@@ -98,7 +141,10 @@ pub async fn make_poster(src: &Path, dst: &Path, at: f64) -> anyhow::Result<()> 
         .await
         .context("не удалось запустить ffmpeg")?;
     if !out.status.success() || !dst.is_file() {
-        bail!("ffmpeg не смог снять кадр: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "ffmpeg не смог снять кадр: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -107,7 +153,11 @@ fn parse_rate(r: &str) -> f64 {
     match r.split_once('/') {
         Some((n, d)) => {
             let (n, d): (f64, f64) = (n.parse().unwrap_or(0.0), d.parse().unwrap_or(1.0));
-            if d == 0.0 { 0.0 } else { n / d }
+            if d == 0.0 {
+                0.0
+            } else {
+                n / d
+            }
         }
         None => r.parse().unwrap_or(0.0),
     }
@@ -152,15 +202,23 @@ pub struct EnvReport {
     pub ytdlp: Option<String>,
     /// yt-dlp не старше версии, с которой работает утилита-образец.
     pub ytdlp_ok: bool,
+    pub twitch_downloader: Option<String>,
     /// `deno` или `node`: без них YouTube отдаёт неполный список форматов.
     pub js_runtime: Option<String>,
 }
 
 pub async fn check_env() -> EnvReport {
-    let version = crate::platform::command("ffmpeg").arg("-version").output().await.ok();
-    let ffmpeg = version
-        .as_ref()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(str::to_owned));
+    let version = crate::platform::command("ffmpeg")
+        .arg("-version")
+        .output()
+        .await
+        .ok();
+    let ffmpeg = version.as_ref().and_then(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .next()
+            .map(str::to_owned)
+    });
 
     let has = |needle: &'static str, args: &'static [&'static str]| async move {
         crate::platform::command("ffmpeg")
@@ -181,8 +239,11 @@ pub async fn check_env() -> EnvReport {
         nvenc: has("h264_nvenc", &["-encoders"]).await,
         cuda: has("cuda", &["-hwaccels"]).await,
         libass: has(" ass ", &["-filters"]).await,
-        ytdlp_ok: ytdlp.as_deref().is_some_and(|v| crate::youtube::select::version_at_least(v, crate::youtube::select::MIN_YTDLP)),
+        ytdlp_ok: ytdlp.as_deref().is_some_and(|v| {
+            crate::youtube::select::version_at_least(v, crate::youtube::select::MIN_YTDLP)
+        }),
         ytdlp,
+        twitch_downloader: crate::sources::chat::version().await,
         js_runtime: crate::youtube::engine::find_js_runtime().map(str::to_owned),
     }
 }
@@ -192,15 +253,27 @@ mod tests {
     use super::*;
 
     fn make_video(name: &str, secs: u32, audio: bool) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("avto-media-{}-{name}.mp4", std::process::id()));
-        let mut args = vec!["-y".to_string(), "-v".into(), "error".into(), "-f".into(), "lavfi".into(), "-i".into(),
-            format!("testsrc2=s=320x240:r=25:d={secs}")];
+        let path =
+            std::env::temp_dir().join(format!("avto-media-{}-{name}.mp4", std::process::id()));
+        let mut args = vec![
+            "-y".to_string(),
+            "-v".into(),
+            "error".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            format!("testsrc2=s=320x240:r=25:d={secs}"),
+        ];
         if audio {
             args.extend(["-f", "lavfi", "-i", &format!("sine=d={secs}")].map(String::from));
         }
         args.extend(["-pix_fmt", "yuv420p", "-shortest"].map(String::from));
         args.push(path.to_string_lossy().into_owned());
-        assert!(std::process::Command::new("ffmpeg").args(&args).status().unwrap().success());
+        assert!(std::process::Command::new("ffmpeg")
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
         path
     }
 

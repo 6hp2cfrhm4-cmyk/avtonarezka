@@ -12,7 +12,7 @@ const basename = (p: string | null) => p?.split(/[\\/]/).pop() ?? "";
 /** Подтверждение перед отправкой в TikTok: что именно уйдёт и куда. Без клика «Отправить» ничего не происходит. */
 export default function PublishDialog({ draft, onClose, onOpenSettings }: { draft: Draft; onClose: () => void; onOpenSettings: () => void }) {
   const { tiktok, notify, project, setPosts } = useUi();
-  const [caption, setCaption] = useState(draft.caption);
+  const [caption, setCaption] = useState("");
   const [tags, setTags] = useState(draft.hashtags.join(" "));
   const [privacy, setPrivacy] = useState<Privacy>(tiktok?.privacy ?? "SELF_ONLY");
   const [comment, setComment] = useState(false);

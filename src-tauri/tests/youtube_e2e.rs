@@ -48,10 +48,29 @@ async fn fake_ytdlp_scenarios() {
     let out = dir.join("out");
 
     // --- сведения о ролике
-    let ytdlp = fake(&dir, &format!("if [ \"$1\" = \"-J\" ]; then cat <<'EOF'\n{INFO_JSON}\nEOF\nexit 0; fi\nexit 9"));
-    let info = engine::analyze(&ytdlp, "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ").await.unwrap();
-    assert_eq!((info.title.as_str(), info.max_height), ("Тестовый ролик", 1080));
-    assert_eq!(info.presets.iter().find(|p| p.key == "1080").unwrap().approx_bytes, Some(83_000_000));
+    let ytdlp = fake(
+        &dir,
+        &format!("if [ \"$1\" = \"-J\" ]; then cat <<'EOF'\n{INFO_JSON}\nEOF\nexit 0; fi\nexit 9"),
+    );
+    let info = engine::analyze(
+        &ytdlp,
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "dQw4w9WgXcQ",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (info.title.as_str(), info.max_height),
+        ("Тестовый ролик", 1080)
+    );
+    assert_eq!(
+        info.presets
+            .iter()
+            .find(|p| p.key == "1080")
+            .unwrap()
+            .approx_bytes,
+        Some(83_000_000)
+    );
 
     // --- успех: видео и аудио отдельными потоками, склейка, перенос
     let ytdlp = fake(
@@ -72,13 +91,21 @@ echo "AVTO|F|$f""#
     );
     let (_tx, rx) = watch::channel(false);
     let mut updates: Vec<Update> = Vec::new();
-    let path = engine::download(&ytdlp, &request(&out, "1080"), rx, |u| updates.push(u)).await.unwrap();
+    let path = engine::download(&ytdlp, &request(&out, "1080"), rx, |u| updates.push(u))
+        .await
+        .unwrap();
     assert_eq!(path, out.join("Fake [dQw4w9WgXcQ].mp4"));
     assert!(path.is_file());
     let stages: Vec<Stage> = updates.iter().map(|u| u.stage).collect();
     assert_eq!(stages.first(), Some(&Stage::Downloading));
-    let merge = stages.iter().position(|s| *s == Stage::Merging).expect("нет этапа склейки");
-    let finish = stages.iter().position(|s| *s == Stage::Finishing).expect("нет этапа переноса");
+    let merge = stages
+        .iter()
+        .position(|s| *s == Stage::Merging)
+        .expect("нет этапа склейки");
+    let finish = stages
+        .iter()
+        .position(|s| *s == Stage::Finishing)
+        .expect("нет этапа переноса");
     assert!(merge < finish && finish == stages.len() - 1);
     let last = &updates.last().unwrap().snapshot;
     assert_eq!((last.downloaded, last.total), (4400, Some(4400)));
@@ -96,15 +123,31 @@ echo "AVTO|F|$f""#
     std::fs::write(out2.join("Клип [dQw4w9WgXcQ].mp4"), "done").unwrap();
     let ytdlp = fake(&dir, "exit 0");
     let (_tx, rx) = watch::channel(false);
-    let found = engine::download(&ytdlp, &request(&out2, "720"), rx, |_| {}).await.unwrap();
+    let found = engine::download(&ytdlp, &request(&out2, "720"), rx, |_| {})
+        .await
+        .unwrap();
     assert_eq!(found, out2.join("Клип [dQw4w9WgXcQ].mp4"));
 
     // --- ошибка yt-dlp: показываем его текст без префикса
-    let ytdlp = fake(&dir, "echo 'ERROR: [youtube] dQw4w9WgXcQ: Video unavailable' >&2\nexit 1");
+    let ytdlp = fake(
+        &dir,
+        "echo 'ERROR: [youtube] dQw4w9WgXcQ: Video unavailable' >&2\nexit 1",
+    );
     let (_tx, rx) = watch::channel(false);
-    let err = engine::download(&ytdlp, &request(&dir.join("out3"), "1080"), rx, |_| {}).await.unwrap_err();
-    assert_eq!(err, DownloadError::Failed("[youtube] dQw4w9WgXcQ: Video unavailable".into()));
-    let err = engine::analyze(&ytdlp, "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ").await.unwrap_err();
+    let err = engine::download(&ytdlp, &request(&dir.join("out3"), "1080"), rx, |_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        DownloadError::Failed("[youtube] dQw4w9WgXcQ: Video unavailable".into())
+    );
+    let err = engine::analyze(
+        &ytdlp,
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "dQw4w9WgXcQ",
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err, "[youtube] dQw4w9WgXcQ: Video unavailable");
 
     // --- остановка посреди загрузки
@@ -125,12 +168,17 @@ echo "AVTO|F|$f""#
     // --- остановлено ещё до запуска
     let (tx, rx) = watch::channel(false);
     tx.send(true).unwrap();
-    assert_eq!(engine::download(&ytdlp, &request(&dir.join("out5"), "1080"), rx, |_| {}).await, Err(DownloadError::Cancelled));
+    assert_eq!(
+        engine::download(&ytdlp, &request(&dir.join("out5"), "1080"), rx, |_| {}).await,
+        Err(DownloadError::Cancelled)
+    );
 
     // --- yt-dlp нет в системе
     let (_tx, rx) = watch::channel(false);
     let missing = dir.join("нет-такого");
-    let err = engine::download(&missing, &request(&dir.join("out6"), "1080"), rx, |_| {}).await.unwrap_err();
+    let err = engine::download(&missing, &request(&dir.join("out6"), "1080"), rx, |_| {})
+        .await
+        .unwrap_err();
     assert_eq!(err, DownloadError::Failed(engine::NOT_FOUND.into()));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -151,20 +199,36 @@ async fn live_download_720p_is_h264_mp4() {
     let mut last_fraction = None;
     let path = engine::download(
         &ytdlp,
-        &DownloadRequest { url, video_id: id.into(), preset: "720".into(), out_dir: out.clone(), ffmpeg_dir: engine::find_ffmpeg_dir() },
+        &DownloadRequest {
+            url,
+            video_id: id.into(),
+            preset: "720".into(),
+            out_dir: out.clone(),
+            ffmpeg_dir: engine::find_ffmpeg_dir(),
+        },
         rx,
         |u| last_fraction = u.snapshot.fraction.or(last_fraction),
     )
     .await
     .expect("download");
-    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("mp4"), "{path:?}");
+    assert_eq!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("mp4"),
+        "{path:?}"
+    );
     assert_eq!(last_fraction, Some(1.0));
 
     // повторный запуск того же ролика не качает заново и возвращает тот же файл
     let (_tx, rx) = watch::channel(false);
     let again = engine::download(
         &ytdlp,
-        &DownloadRequest { url: format!("https://www.youtube.com/watch?v={id}"), video_id: id.into(), preset: "720".into(), out_dir: out.clone(), ffmpeg_dir: engine::find_ffmpeg_dir() },
+        &DownloadRequest {
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            video_id: id.into(),
+            preset: "720".into(),
+            out_dir: out.clone(),
+            ffmpeg_dir: engine::find_ffmpeg_dir(),
+        },
         rx,
         |_| {},
     )

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "avtonarezka",
-  "version": "0.3.0",
+  "version": "0.4.2",
   "identifier": "app.avtonarezka.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -37,8 +37,8 @@
       "icons/icon.png"
     ],
     "category": "Video",
-    "shortDescription": "Вертикальные рекламные ролики из длинного видео",
-    "longDescription": "Находит лучшие моменты в длинном видео локальными моделями, собирает из них вертикальные ролики с геймплеем и баннером и заливает в TikTok.",
+    "shortDescription": "Локальная фабрика вертикальных роликов",
+    "longDescription": "Объединяет источники, локальный анализ, шаблоны монтажа, одобрение, кампании и календарь публикаций. Сохраняет ручную Студию и восстанавливает очередь после перезапуска.",
     "copyright": "© Автонарезка",
     "externalBin": [
       "binaries/llm-worker"
@@ -53,7 +53,8 @@
         ],
         "recommends": [
           "chromium",
-          "yt-dlp"
+          "yt-dlp",
+          "libayatana-appindicator3-1"
         ],
         "desktopTemplate": "packaging/avtonarezka.desktop"
       }

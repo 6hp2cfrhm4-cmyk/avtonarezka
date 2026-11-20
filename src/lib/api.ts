@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { captionLen, composeCaption, normalizeTags } from "./caption";
+import { captionLen, normalizeTags } from "./caption";
 import { extractYoutubeLink } from "./youtube";
 
 export interface EnvReport {
@@ -12,6 +12,7 @@ export interface EnvReport {
   ytdlp: string | null;
   /** Версия не старее той, с которой работает утилита-образец. */
   ytdlpOk: boolean;
+  twitchDownloader: string | null;
   /** deno или node: без них YouTube отдаёт неполный список форматов. */
   jsRuntime: string | null;
 }
@@ -66,6 +67,28 @@ export interface AnalysisOptions {
   maxLen?: number;
   topK?: number;
   gpuLayers?: number;
+  language?: string;
+  fixedSeconds?: number | null;
+  weights?: { loudness: number; motion: number; events: number; speech: number; chat: number; viewer_clips: number; camera: number };
+  llmTop?: number;
+  llmWeight?: number;
+  scoutEnabled?: boolean;
+  scoutCoverage?: number;
+}
+
+export type AnalysisSettings = Required<AnalysisOptions>;
+export const defaultAnalysisSettings: AnalysisSettings = {
+  useEvents: true, useSpeech: true, useLlm: true, minLen: 20, maxLen: 60, topK: 30,
+  gpuLayers: 99, language: "ru", fixedSeconds: null,
+  weights: { loudness: 0.35, motion: 0.15, events: 0.35, speech: 0.15, chat: 0.15, viewer_clips: 0.2, camera: 0.15 }, scoutEnabled: true, scoutCoverage: 0.25, llmTop: 16, llmWeight: 0.5,
+};
+
+export interface ScoutReport { windows: { start: number; end: number }[]; duration: number; selectedSeconds: number; speechSeconds: number; full: boolean }
+export interface AnalysisTimeline { duration: number; hop: number; series: { key: string; label: string; values: number[] | null }[]; scout: ScoutReport | null }
+export interface AnalysisInputs { chat: { format: string; messages: number; ignored: number } | null; clips: { videoId: string; clips: number; missingOffset: number; truncated: boolean } | null; chatError: string | null }
+export interface TwitchSignalStatus { configured: boolean; storage: string }
+function normalizeAnalysis(settings: Partial<AnalysisSettings>): AnalysisSettings {
+  return { ...defaultAnalysisSettings, ...settings, weights: { ...defaultAnalysisSettings.weights, ...settings.weights } };
 }
 
 export type MomentStatus = "candidate" | "accepted" | "rejected";
@@ -108,6 +131,8 @@ export interface ErrorEvent {
 export type AssetKind = "banner" | "background" | "music";
 
 export interface Asset {
+  alpha?: boolean;
+  greenCorners?: number | null;
   id: number;
   kind: AssetKind;
   path: string;
@@ -124,6 +149,7 @@ export type TopFit = "auto" | "fill" | "contain";
 export type BannerAnim = "none" | "fade" | "slideUp" | "pop";
 
 export interface BannerStyle {
+  alpha?: boolean;
   enabled: boolean;
   keyColor: string;
   similarity: number;
@@ -166,6 +192,8 @@ export interface AudioMix {
   loudnorm: boolean;
 }
 export interface Style {
+  layout: "gameplayStack" | "reactionPip" | "reactionStack";
+  reaction: { background: boolean; circle: boolean; sizePct: number; position: "seamLeft" | "seamCenter" | "bottomRight"; zoom: number; ringPx: number; ringColor: string; shadow: boolean; pop: boolean; freeze: boolean };
   split: number;
   topFit: TopFit;
   /** Доля высоты исходника, срезаемая снизу (вшитые в видео субтитры). */
@@ -174,9 +202,12 @@ export interface Style {
   banner: BannerStyle;
   subtitles: SubtitleStyle;
   partLabel: PartLabelStyle;
+  hookEnabled: boolean;
   audio: AudioMix;
 }
 export interface DraftConfig {
+  camRect?: CameraRect | null;
+  faceCheck?: { frames: number; found: number; longestGap: number; median: CameraRect | null; error: string | null } | null;
   style: Style;
   bannerId: number | null;
   backgroundId: number | null;
@@ -238,12 +269,15 @@ export interface RenderFailedEvent {
 }
 
 export const defaultStyle: Style = {
+  layout: "gameplayStack",
+  reaction: { background: true, circle: true, sizePct: 0.30, position: "seamLeft", zoom: 1.1, ringPx: 6, ringColor: "ffffff", shadow: true, pop: true, freeze: true },
   split: 0.5,
   topFit: "auto",
   topCropBottom: 0,
   gameplayFreeze: false,
   banner: { enabled: true, keyColor: "00ff00", similarity: 0.18, blend: 0.08, despill: true, widthPct: 0.72, offsetX: 0, offsetY: 0, anim: "pop", maxSeconds: null },
   subtitles: { enabled: true, font: "Montserrat ExtraBold", size: 84, color: "ffffff", highlight: "b6ff3c", outlineColor: "000000", outline: 7, uppercase: true, wordsPerLine: 3, highlightScale: 112, yPct: null },
+  hookEnabled: false,
   partLabel: { enabled: true, template: "Часть {n}", font: "Montserrat Black", size: 76, color: "ffffff", outlineColor: "000000", outline: 6, yPct: 0.11 },
   audio: { main: 1, banner: 1, gameplay: 0, music: 0.18, loudnorm: true },
 };
@@ -435,7 +469,7 @@ export interface YoutubeStart {
   thumb: string | null;
 }
 /** Пачка: элемент и его стадия. `awaiting_approval` — черновики ждут человека, `rendering` — идёт финал. */
-export type BatchStage = "queued" | "downloading" | "importing" | "analyzing" | "drafting" | "awaiting_approval" | "rendering" | "done" | "failed";
+export type BatchStage = "discovered" | "fetching" | "scouting" | "selecting" | "awaiting_selection" | "qc" | "auto_approved" | "rendering_final" | "captioning" | "ready_to_schedule" | "scheduled" | "publishing" | "published" | "measured" | "completed" | "needs_check" | "queued" | "downloading" | "importing" | "analyzing" | "drafting" | "awaiting_approval" | "rendering" | "done" | "failed";
 export interface BatchItem {
   id: number;
   kind: "link" | "file";
@@ -446,8 +480,14 @@ export interface BatchItem {
   /** Для «ошибки» — причина, для «готово» — заметка, сколько черновиков не собрались. */
   error: string | null;
   projectId: number | null;
+  channelId: number | null;
+  priority: number;
+  position: number;
+  paused: boolean;
 }
 export interface BatchNewItem {
+  channelId?: number | null;
+  priority?: number;
   kind: "link" | "file";
   source: string;
   title?: string;
@@ -488,11 +528,231 @@ export interface YoutubeErrorEvent {
   cancelled: boolean;
 }
 
+export interface FactoryTemplate { id: number; name: string; layout: "gameplay_stack" | "reaction_pip" | "reaction_stack"; config: Defaults; isDefault: boolean; previewUrl?: string }
+export interface ChannelTarget { platform: "tiktok" | "youtube" | "instagram" | "vk" | "telegram"; accountId: number | null }
+export interface MonitorOptions {
+  enabled: boolean; intervalMinutes: number; minDuration: number | null; maxDuration: number | null;
+  titleRegex: string; cookiesBrowser: string | null; twoPass: boolean; downloadChat: boolean; viewerClips: boolean;
+}
+export const defaultMonitorOptions: MonitorOptions = { enabled: false, intervalMinutes: 15, minDuration: null, maxDuration: null, titleRegex: "", cookiesBrowser: null, twoPass: true, downloadChat: false, viewerClips: false };
+export interface SourcePollResult { found: number; queued: number; skipped: number; seen: number }
+export interface CameraRect { x: number; y: number; width: number; height: number }
+export interface CameraFrame { url: string; width: number; height: number; duration: number; at: number }
+export interface CameraScanProgress { id: string; frames: number; total: number; stage: "waiting" | "scanning" | "done" }
+export interface CameraScanResult { check: { frames: number; found: number; longestGap: number; median: CameraRect | null; error: string | null }; suggested: CameraRect | null }
+export interface PlatformCaps { platform: ChannelTarget["platform"]; name: string; captionMax: number; titleMax: number; hashtagsMax: number; durationMax: number | null; fileMax: number | null; dailyDefault: number; nativeSchedule: boolean; login: string }
+export interface CaptionFields { title: string; body: string; credit: string; link: string; promo: string; hashtags: string[] }
+export interface SavedCaption { adLocked?: boolean; spec: { platform: ChannelTarget["platform"]; template: string }; fields: CaptionFields }
+export interface ComposedCaption { text: string; len: number; max: number; min: number; bodyTrimmed: boolean }
+export interface OutputProfile { platform: ChannelTarget["platform"]; limits: { maxSeconds: number | null; videoKbps: number; audioKbps: number } }
+export interface OutputVariant { url: string; posterUrl: string; duration: number; bytes: number; videoKbps: number; partRemoved: boolean; truncated: boolean; maxSeconds: number | null }
+export interface ChannelIncident { id: number; channelId: number; publicationId: number | null; kind: "complaint" | "restriction"; note: string; createdAt: number; resolvedAt: number | null }
+export interface Channel {
+  id: number; name: string; sourceKind: "file" | "youtube" | "folder" | "twitch" | "kick";
+  source: string; templateId: number | null; mode: "auto" | "review" | "manual"; enabled: boolean;
+  analysis: AnalysisSettings; scoreThreshold: number; maxClips: number;
+  complaintLimit: number; rightsPaused: boolean; activeIncidents: number;
+  permission: "owned" | "agreed" | "unspecified"; credit: string; targets: ChannelTarget[];
+  campaignIds: number[]; camRect: CameraRect | null;
+  monitor: MonitorOptions; lastCheckedAt: number | null; nextCheckAt: number | null; sourceError: string | null;
+}
+export interface FactorySettings { draftConcurrency: number; finalConcurrency: number; resumeOnStart: boolean; inhibitSleep: boolean }
+export interface PowerStatus { active: boolean; needed: boolean; reason: string; error: string | null }
+export interface LifecycleStatus { trayEnabled: boolean; trayActive: boolean; trayError: string | null; autostartAvailable: boolean; autostartEnabled: boolean; autostartError: string | null; windowVisible: boolean }
+export interface DiskPolicy { automatic: boolean; keepDays: number; maxGib: number }
+export interface DiskSnapshot { policy: DiskPolicy; files: { path: string; channel: string; kind: string; bytes: number; createdAt: number; reason: string | null; selected: boolean }[]; channels: { id: number; name: string; bytes: number; protectedBytes: number; reclaimableBytes: number }[]; categories: { kind: string; bytes: number }[]; managedBytes: number; reclaimableBytes: number; selectedBytes: number; missing: number; limitUnreachable: boolean }
+export interface DiskCleanup { deleted: number; bytes: number; errors: string[] }
+export interface QcReport { version: number; path: string; fingerprint: string; issues: string[]; duration: number; checkedAt: number }
+export interface FactoryEvent { id: number; itemId: number | null; kind: string; stage: string | null; message: string; createdAt: number }
+export interface InboxItem { itemId: number; channelName: string; draft: Draft; qc: QcReport | null }
+export interface CalendarEntry { draftId: number; projectId: number; title: string; channelName: string; state: string; notBefore: number | null; finalPath: string | null }
+export interface PublicationPolicy { pauseMin: number; dailyLimit: number; windowStart: number; windowEnd: number }
+export interface YoutubeSettings { privacy: "private" | "unlisted" | "public"; madeForKids: boolean }
+export interface YoutubeOAuthSettings { clientId: string; hasSecret: boolean; secretBackend: string; loginRunning: boolean }
+export interface PublicationAccount { id: number; label: string; platform: ChannelTarget['platform']; externalRef: string; enabled: boolean; policy: PublicationPolicy; hasSecret: boolean; youtubeSettings?: YoutubeSettings | null }
+export interface InstagramAccountArgs { id: number | null; label: string; user: string; token: string | null; enabled: boolean; policy: PublicationPolicy }
+export interface VkMetricsAccountArgs { id: number | null; label: string; video: string; token: string | null; enabled: boolean }
+export interface VkMetricsClip { draftId: number | null; readyId: number | null; title: string; project: string }
+export interface VkMetricsOptions { accounts: { id: number; label: string; owner: string; enabled: boolean; hasSecret: boolean; probeVideo: string }[]; clips: VkMetricsClip[]; secretBackend: string }
+export interface VkMetricsLinkArgs { accountId: number; draftId: number | null; readyId: number | null; video: string; sentAt: number }
+export interface TelegramAccountArgs { id: number | null; label: string; chat: string; token: string | null; enabled: boolean; policy: PublicationPolicy }
+export interface TelegramConnectionCheck { botUsername: string; chatId: string; chatTitle: string; checkedAt: number }
+export interface Publication { id: number; draftId: number | null; readyId: number | null; projectId: number; title: string; platform: ChannelTarget['platform']; accountId: number | null; accountLabel: string; state: string; notBefore: number; caption: string; externalId: string | null; url: string | null; error: string | null; legacy: boolean; holdReason: string | null; holdKind: "channel" | "final" | null }
+export interface PublicationState { publications: Publication[]; running: boolean; note: string | null; secretBackend: string }
+export interface FactoryState { items: BatchItem[]; events: FactoryEvent[]; inbox: InboxItem[]; paused: boolean; running: boolean }
+
+export interface Campaign { id: number; name: string; advertiser: string; enabled: boolean; bannerIds: number[]; link: string; promo: string; utm: string; startsAt: number | null; endsAt: number | null; weight: number; dailyLimit: number | null; totalLimit: number | null; channelIds: number[]; platforms: string[] }
+export interface CampaignPick { campaignId: number; bannerId: number }
+export interface CampaignAssignment { draftId: number; campaignId: number; campaignName: string; advertiser: string; bannerId: number; assignedAt: number }
+export interface MetricCounts { views: number | null; likes: number | null; comments: number | null; shares: number | null }
+export interface MetricSample extends MetricCounts { publicationId: number; observedAt: number; source: "api" | "manual" }
+export interface AnalyticsRow { id: number; draftId: number | null; title: string; platform: string; accountId: number | null; account: string; channelId: number | null; channel: string; state: string; sentAt: number | null; url: string | null; sample: MetricSample | null; error: string | null }
+export interface AnalyticsDashboard { rows: AnalyticsRow[]; published: number; measured: number; views: number | null; medianViews: number | null; errors: number; attention: number; errorRate: number | null; hours: { hour: number; published: number; medianViews: number | null }[]; autoCollect: boolean; checkedAt: number | null }
+export interface AnalyticsFeedback { channelId: number; clips: number; reason: string; suggestions: { signal: string; current: number; proposed: number; correlation: number; sampleSize: number }[] }
+
 export const mockBus = new EventTarget();
 
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+export interface ServerConfig { host: string; port: number; user: string; keyPath: string; enabled: boolean }
+export interface NodeFuse { failures: number; blocked: boolean; message: string | null }
+export interface NodeSystem { load: number[]; mem_available_mb: number | null; psi: { cpu: number | null; memory: number | null; io: number | null }; disk_free_mb: number | null; data_bytes: number }
+export interface NodeRemote { db: boolean; schema?: number; stages: Record<string, number>; system?: NodeSystem }
+export interface NodeStatus { configured: boolean; enabled: boolean; config: ServerConfig | null; fuse: NodeFuse; online: boolean; error: string | null; remote: NodeRemote | null }
+export interface NodeCandidate { id: number; title: string; source: string; stage: string; canMove: boolean; reason: string | null; ownerNode: string }
+export interface NodeSendReport { sent: number[]; failed: [number, string][] }
+export interface NodeHandover { sent: number[]; failed: [number, string][]; safeToPowerOff: boolean; staysHere: number[] }
+export interface NodePulled { finished: number[]; failed: number[]; waiting: number }
+export interface NodeHostKey { fingerprint: string; line: string }
+
+export type FlowId = "live" | "studio" | "discovery" | "monitor" | "publish" | "offload";
+export type Placement = "pc" | "server" | "auto";
+export interface FlowSetting { flow: FlowId; enabled: boolean; placement: Placement }
+export interface SceneDto { id: number; name: string; flows: FlowSetting[]; builtin: boolean }
+export type RuleCond = { kind: "pc_online"; value: boolean } | { kind: "hours"; from: number; to: number } | { kind: "server_busy" } | { kind: "disk_low" } | { kind: "streamer_live" };
+export interface RuleDto { id: number; name: string; cond: RuleCond; sceneId: number; enabled: boolean }
+export interface FlowAction { flow: FlowId; node: "pc" | "server" | null; run: boolean; limit: number | null; reason: string }
+export interface ModesState { node: "pc" | "server"; scenes: SceneDto[]; rules: RuleDto[]; active: number | null; pinnedUntil: number; actions: FlowAction[]; log: [number, string][] }
+
+export interface TrendConfig { twitch: boolean; kick: boolean; youtube: boolean; topics: boolean; languages: string[]; categories: string[]; keywords: string[]; knownChannels: string[]; whitelist: string[]; threshold: number; showFrom: number; dailyLimit: number; intervalMin: number; region: string; gamesTop: number }
+export interface TrendCandidate { id: number; kind: "live" | "vod" | "clip"; platform: string; url: string; title: string; category: string; language: string; channelName: string; metric: number; previous: number; windowMin: number; score: number; why: string; state: string; auto: boolean; lastSeen: number }
+export interface TrendProvider { configured: boolean; ok: boolean | null; at: number; found: number; message: string }
+export interface TrendState { config: TrendConfig; new: TrendCandidate[]; watch: TrendCandidate[]; accepted: TrendCandidate[]; providers: Record<string, TrendProvider>; topics: string[]; lastPoll: number; flowEnabled: boolean; youtubeKey: boolean; kickToken: boolean; twitchKeys: boolean }
+export interface TrendStats { seen: number; fresh: number; shown: number; autoAccepted: number }
+
+export interface ServerKey { keyPath: string; publicKey: string; version: string; created: boolean }
+export interface PushReport { applied: string[]; skipped: string[] }
+export interface RemoteConfig { secrets: Record<string, boolean>; kv: Record<string, string>; keyStore: boolean }
+
+export interface NotifyConfig { enabled: boolean; chat: string; summaryHour: number; attention: boolean }
+export interface NotifyState { config: NotifyConfig; token: boolean }
+
+export interface LiveSession { id: number; platform: string; url: string; channel: string; title: string; state: "starting" | "live" | "ended" | "stopped" | "failed"; manual: boolean; chat: boolean; startedAt: number; endedAt: number | null; note: string; moments: number }
+export interface LiveMoment { id: number; sessionId: number; score: number; manual: boolean; state: "cut" | "failed" | "ignored"; itemId: number | null; error: string | null; createdAt: number; length: number }
+export interface LiveState { sessions: LiveSession[]; moments: LiveMoment[]; flowEnabled: boolean; maxSessions: number; diskFreeMb: number | null }
+export interface LiveSignal { sessionId: number; t: number; z: number; msgs: number; authors: number; audioDb: number }
+
 const real = {
+  nodeKeygen: () => invoke<ServerKey>("node_keygen"),
+  integrationTest: (name: "twitch" | "youtube" | "kick") => invoke<string>("integration_test", { name }),
+  nodeConfigPush: (groups: string[]) => invoke<PushReport>("node_config_push", { groups }),
+  nodeConfigRemote: () => invoke<RemoteConfig>("node_config_remote"),
+  notifyState: () => invoke<NotifyState>("notify_state"),
+  notifySet: (config: NotifyConfig, token?: string) => invoke<void>("notify_set", { config, token }),
+  notifyTest: () => invoke<void>("notify_test"),
+  liveState: () => invoke<LiveState>("live_state"),
+  liveStart: (url: string) => invoke<number>("live_start", { url }),
+  liveStop: (id: number) => invoke<void>("live_stop", { id }),
+  liveCutNow: (id: number, seconds?: number) => invoke<void>("live_cut_now", { id, seconds }),
+  liveMomentIgnore: (id: number) => invoke<void>("live_moment_ignore", { id }),
+  discoveryState: () => invoke<TrendState>("discovery_state"),
+  discoveryConfigSet: (config: TrendConfig) => invoke<TrendConfig>("discovery_config_set", { config }),
+  discoverySecretSet: (name: "youtube" | "kick", value: string) => invoke<void>("discovery_secret_set", { name, value }),
+  discoveryPollNow: () => invoke<TrendStats>("discovery_poll_now"),
+  discoveryAccept: (id: number) => invoke<number | null>("discovery_accept", { id }),
+  discoveryReject: (id: number) => invoke<void>("discovery_reject", { id }),
+  notificationsEnabled: () => invoke<boolean>("notifications_enabled"),
+  notificationsSet: (enabled: boolean) => invoke<void>("notifications_set", { enabled }),
+  analyticsDashboard: (days: number, channelId: number | null) => invoke<AnalyticsDashboard>("analytics_dashboard", { days, channelId }),
+  analyticsHistory: (publicationId: number) => invoke<MetricSample[]>("analytics_history", { publicationId }),
+  analyticsManual: (publicationId: number, observedAt: number | null, counts: MetricCounts) => invoke<void>("analytics_manual", { publicationId, observedAt, counts }),
+  analyticsCollect: () => invoke<{ collected: number; skipped: number; errors: string[] }>("analytics_collect"),
+  vkMetricsOptions: () => invoke<VkMetricsOptions>("vk_metrics_options"),
+  vkMetricsAccountSave: (args: VkMetricsAccountArgs) => invoke<number>("vk_metrics_account_save", { args }),
+  vkMetricsAccountEnabled: (id: number, enabled: boolean) => invoke<void>("vk_metrics_account_enabled", { id, enabled }),
+  vkMetricsLink: (args: VkMetricsLinkArgs) => invoke<number>("vk_metrics_link", { args }),
+  analyticsAuto: (enabled: boolean) => invoke<void>("analytics_auto", { enabled }),
+  analyticsFeedback: (channelId: number) => invoke<AnalyticsFeedback>("analytics_feedback", { channelId }),
+  analyticsApply: (channelId: number, signal: string, current: number) => invoke<void>("analytics_apply", { channelId, signal, current }),
+  campaignReportOpen: (campaignId: number) => invoke<string>("campaign_report_open", { campaignId }),
+  campaignReportExport: (campaignId: number, path: string) => invoke<{ html: string; csv: string }>("campaign_report_export", { campaignId, path }),
+  campaignsList: () => invoke<Campaign[]>("campaigns_list"),
+  campaignSave: (campaign: Campaign) => invoke<Campaign>("campaign_save", { campaign }),
+  campaignPreview: (channelId: number) => invoke<(CampaignPick | null)[]>("campaign_preview", { channelId }),
+  campaignAssignments: () => invoke<CampaignAssignment[]>("campaign_assignments"),
+  publicationAccounts: () => invoke<PublicationAccount[]>("publication_accounts"),
+  publicationAccountPolicy: (id: number, policy: PublicationPolicy) => invoke<void>("publication_account_policy", { id, policy }),
+  instagramAccountSave: (args: InstagramAccountArgs) => invoke<number>("instagram_account_save", { args }),
+  telegramAccountSave: (args: TelegramAccountArgs) => invoke<number>("telegram_account_save", { args }),
+  telegramAccountCheck: (args: { id: number | null; chat: string; token: string | null }) => invoke<TelegramConnectionCheck>("telegram_account_check", { args }),
+  youtubeOAuthSettings: () => invoke<YoutubeOAuthSettings>("youtube_oauth_settings"),
+  youtubeOAuthSave: (clientId: string, clientSecret: string | null) => invoke<void>("youtube_oauth_save", { clientId, clientSecret }),
+  youtubeLoginStart: () => invoke<string>("youtube_login_start"),
+  youtubeLoginCancel: () => invoke<void>("youtube_login_cancel"),
+  youtubeAccountSave: (id: number, label: string, enabled: boolean, policy: PublicationPolicy, settings: YoutubeSettings) => invoke<void>("youtube_account_save", { id, label, enabled, policy, settings }),
+  publicationsList: () => invoke<PublicationState>("publications_list"),
+  publicationAutofill: () => invoke<{ scheduled: number; existing: number; blocked: string[] }>("publication_autofill"),
+  publicationSchedule: (draftId: number, accountId: number, at: number | null) => invoke<number>("publication_schedule", { draftId, accountId, at }),
+  publicationMove: (id: number, at: number) => invoke<void>("publication_move", { id, at }),
+  publicationRefreshCaption: (id: number) => invoke<void>("publication_refresh_caption", { id }),
+  publicationCancel: (id: number) => invoke<void>("publication_cancel", { id }),
+  publicationResolve: (id: number, action: "mark_done" | "retry") => invoke<void>("publication_resolve", { id, action }),
+  publicationsStart: () => invoke<void>("publications_start"),
+  factoryCalendar: () => invoke<CalendarEntry[]>("factory_calendar"),
+  platformCaps: () => invoke<PlatformCaps[]>("platform_caps"),
+  outputProfiles: () => invoke<OutputProfile[]>("output_profiles"),
+  outputProfileSave: (profile: OutputProfile) => invoke<OutputProfile>("output_profile_save", { profile }),
+  outputPreview: (draftId: number, platform: ChannelTarget["platform"]) => invoke<OutputVariant>("output_preview", { draftId, platform }),
+  captionDraftLoad: (draftId: number, platform: ChannelTarget["platform"]) => invoke<SavedCaption>("caption_draft_load", { draftId, platform }),
+  captionDraftSave: (draftId: number, saved: SavedCaption) => invoke<ComposedCaption>("caption_draft_save", { draftId, saved }),
+  captionAccountLoad: (draftId: number, platform: ChannelTarget["platform"], accountId: number | null) => invoke<SavedCaption>("caption_account_load", { draftId, platform, accountId }),
+  captionAccountSave: (draftId: number, saved: SavedCaption, accountId: number | null) => invoke<ComposedCaption>("caption_account_save", { draftId, saved, accountId }),
+  captionApplyBody: (draftIds: number[], platform: ChannelTarget["platform"], accountId: number | null, body: string) => invoke<number>("caption_apply_body", { draftIds, platform, accountId, body }),
+  captionDraftGenerate: (draftId: number, saved: SavedCaption, accountId: number | null) => invoke<{ saved: SavedCaption; composed: ComposedCaption }>("caption_draft_generate", { draftId, saved, accountId }),
+  accountsList: () => invoke<AccountInfo[]>("accounts_list"),
+  channelsList: () => invoke<Channel[]>("channels_list"),
+  cameraFrame: (projectId: number, at: number) => invoke<CameraFrame>("camera_frame", { projectId, at }),
+  cameraDetect: (projectId: number, at: number) => invoke<{ rect: CameraRect; confidence: number }[]>("camera_detect", { projectId, at }),
+  cameraScan: (projectId: number, id: string, camera: CameraRect) => invoke<CameraScanResult>("camera_scan", { projectId, id, camera }),
+  cameraScanCancel: (id: string) => invoke<void>("camera_scan_cancel", { id }),
+  layoutPreview: (channelId: number, projectId: number, at: number, template: FactoryTemplate) => invoke<{ url: string; facePresent: boolean; note: string }>("layout_preview", { channelId, projectId, at, template }),
+  faceModelReady: () => invoke<boolean>("face_model_ready"),
+  faceModelDownload: () => invoke<boolean>("face_model_download"),
+  sourceCheck: (id: number) => invoke<SourcePollResult>("source_check", { id }),
+  channelIncidents: (channelId: number) => invoke<ChannelIncident[]>("channel_incidents", { channelId }),
+  channelIncidentAdd: (args: { channelId: number; publicationId: number | null; kind: ChannelIncident["kind"]; note: string }) => invoke<number>("channel_incident_add", { args }),
+  channelIncidentResolve: (id: number) => invoke<void>("channel_incident_resolve", { id }),
+  channelRightsResume: (channelId: number) => invoke<void>("channel_rights_resume", { channelId }),
+  channelSave: (channel: Channel) => invoke<Channel>("channel_save", { channel }),
+  channelRemove: (id: number) => invoke<void>("channel_remove", { id }),
+  templatesList: () => invoke<FactoryTemplate[]>("templates_list"),
+  templateSave: (template: FactoryTemplate) => invoke<FactoryTemplate>("template_save", { template }),
+  templateRemove: (id: number) => invoke<void>("template_remove", { id }),
+  factorySettings: () => invoke<FactorySettings>("factory_settings"),
+  powerStatus: () => invoke<PowerStatus>("power_status"),
+  lifecycleStatus: () => invoke<LifecycleStatus>("lifecycle_status"),
+  lifecycleTraySet: (enabled: boolean) => invoke<LifecycleStatus>("lifecycle_tray_set", { enabled }),
+  lifecycleAutostartSet: (enabled: boolean) => invoke<LifecycleStatus>("lifecycle_autostart_set", { enabled }),
+  lifecycleHide: () => invoke<void>("lifecycle_hide"),
+  diagnosticsCollect: () => invoke<DiagnosticBundle>("diagnostics_collect"),
+  diagnosticsExport: (path: string) => invoke<void>("diagnostics_export", { path }),
+  diskSnapshot: () => invoke<DiskSnapshot>("disk_snapshot"),
+  diskPolicySave: (policy: DiskPolicy) => invoke<DiskPolicy>("disk_policy_save", { policy }),
+  diskCleanup: () => invoke<DiskCleanup>("disk_cleanup"),
+  factorySettingsSet: (settings: FactorySettings) => invoke<FactorySettings>("factory_settings_set", { settings }),
+  factoryState: () => invoke<FactoryState>("factory_state"),
+  factoryItemUpdate: (id: number, priority: number, position: number, paused: boolean) => invoke<void>("factory_item_update", { id, priority, position, paused }),
+  factoryDecide: (ids: number[], approve: boolean) => invoke<number>("factory_decide", { ids, approve }),
+  nodeConfigGet: () => invoke<ServerConfig | null>("node_config_get"),
+  nodeConfigSet: (config: ServerConfig) => invoke<void>("node_config_set", { config }),
+  nodeFuseReset: () => invoke<void>("node_fuse_reset"),
+  nodeOverview: () => invoke<NodeStatus>("node_overview"),
+  nodeCheck: () => invoke<NodeStatus>("node_check"),
+  nodeHostkeyScan: () => invoke<NodeHostKey>("node_hostkey_scan"),
+  nodeHostkeyAccept: (line: string) => invoke<void>("node_hostkey_accept", { line }),
+  nodeCandidates: () => invoke<NodeCandidate[]>("node_candidates"),
+  nodeSend: (ids: number[]) => invoke<NodeSendReport>("node_send", { ids }),
+  nodePull: () => invoke<NodePulled>("node_pull"),
+  nodeRecall: (id: number) => invoke<void>("node_recall", { id }),
+  nodeHandover: (ids: number[]) => invoke<NodeHandover>("node_handover", { ids }),
+  nodePoweroff: () => invoke<void>("node_poweroff"),
+  modesState: () => invoke<ModesState>("modes_state"),
+  sceneActivate: (id: number) => invoke<FlowAction[]>("scene_activate", { id }),
+  sceneUnpin: () => invoke<void>("scene_unpin"),
+  sceneSave: (scene: SceneDto) => invoke<SceneDto>("scene_save", { scene }),
+  sceneDelete: (id: number) => invoke<void>("scene_delete", { id }),
+  ruleSave: (rule: RuleDto) => invoke<void>("rule_save", { rule }),
+  ruleDelete: (id: number) => invoke<void>("rule_delete", { id }),
   appInfo: () => invoke<AppInfo>("app_info"),
   mediaUrl: (path: string) => invoke<string>("media_url", { path }),
   importVideo: (path: string) => invoke<Project>("import_video", { path }),
@@ -503,7 +763,17 @@ const real = {
   modelsDownload: () => invoke<boolean>("models_download"),
   analysisStart: (projectId: number, options?: AnalysisOptions) =>
     invoke<void>("analysis_start", { projectId, options }),
+  analysisOptionsGet: () => invoke<AnalysisSettings>("analysis_options_get"),
+  analysisOptionsSet: (options: AnalysisOptions) => invoke<AnalysisSettings>("analysis_options_set", { options }),
   analysisCancel: (projectId: number) => invoke<void>("analysis_cancel", { projectId }),
+  analysisInputsGet: (projectId: number) => invoke<AnalysisInputs>("analysis_inputs_get", { projectId }),
+  analysisChatImport: (projectId: number, path: string) => invoke<AnalysisInputs>("analysis_chat_import", { projectId, path }),
+  analysisChatClear: (projectId: number) => invoke<void>("analysis_chat_clear", { projectId }),
+  analysisClipsClear: (projectId: number) => invoke<void>("analysis_clips_clear", { projectId }),
+  analysisTwitchClips: (projectId: number, vodId: string) => invoke<AnalysisInputs>("analysis_twitch_clips", { projectId, vodId }),
+  twitchSignalStatus: () => invoke<TwitchSignalStatus>("twitch_signal_status"),
+  twitchSignalCredentials: (clientId: string, clientSecret: string) => invoke<void>("twitch_signal_credentials", { clientId, clientSecret }),
+  analysisTimeline: (projectId: number) => invoke<AnalysisTimeline>("analysis_timeline", { projectId }),
   analysisNotes: (projectId: number) => invoke<string[]>("analysis_notes", { projectId }),
   momentsList: (projectId: number) => invoke<Moment[]>("moments_list", { projectId }),
   momentSetStatus: (id: number, status: MomentStatus) => invoke<void>("moment_set_status", { id, status }),
@@ -545,7 +815,7 @@ const real = {
   queueState: (projectId: number) => invoke<QueueState>("queue_state", { projectId }),
   queuePrepare: (projectId: number) => invoke<void>("queue_prepare", { projectId }),
   queuePrepareCancel: () => invoke<void>("queue_prepare_cancel"),
-  queueApplyText: (projectId: number, caption: string, hashtags: string[]) => invoke<number>("queue_apply_text", { projectId, caption, hashtags }),
+  queueApplyText: (projectId: number, caption: string, hashtags: string[], preserveHashtags = false) => invoke<number>("queue_apply_text", { projectId, caption, hashtags, preserveHashtags }),
   queueJobUpdate: (id: number, caption: string, hashtags: string[]) => invoke<PublishJob>("queue_job_update", { id, caption, hashtags }),
   queueJobResolve: (id: number, action: JobResolve) => invoke<void>("queue_job_resolve", { id, action }),
   queueJobAccount: (id: number, account: number | null) => invoke<void>("queue_job_account", { id, account }),
@@ -660,12 +930,6 @@ let demoRunning = false;
 let demoNextAt: number | null = null;
 let demoQueueSettings: QueueSettings = { pauseMin: 45, dailyLimit: 5, windowStart: 0, windowEnd: 1440 };
 let demoAccounts: AccountInfo[] = [{ id: 1, label: "Основной", enabled: true, main: true, sentToday: 0 }];
-const demoLongText = (n: number) => {
-  const base = "Он вернулся домой и не поверил своим глазам: на столе лежало то, чего он совсем не ждал. ";
-  let s = "";
-  while (s.length < n) s += base;
-  return `${s.slice(0, n - 1).trimEnd()}.`.padEnd(n, ".").slice(0, n);
-};
 const demoQueueState = (): QueueState => ({
   jobs: demoJobs.map((j) => ({ ...j })),
   settings: demoQueueSettings,
@@ -676,18 +940,179 @@ const demoQueueState = (): QueueState => ({
   sentToday: demoJobs.filter((j) => j.state === "done").length,
   nextAt: demoNextAt,
   note: null,
-  windowMin: 3990,
+  windowMin: 0,
   windowMax: 3999,
   maxTags: 5,
   captionLimit: 4000,
   chromium: true,
 });
 
+let demoAnalysisSettings: AnalysisSettings = { ...defaultAnalysisSettings };
+try {
+  const saved = localStorage.getItem("demo-analysis-options");
+  if (saved) demoAnalysisSettings = normalizeAnalysis(JSON.parse(saved));
+} catch { /* Приватный режим браузера или повреждённые демо-настройки. */ }
+
+function loadDemoFactory(): { channels: Channel[]; templates: FactoryTemplate[]; settings: FactorySettings } {
+  try { const saved = localStorage.getItem("demo-factory"); if (saved) return JSON.parse(saved); } catch { /* Нет сохранённых демо-данных. */ }
+  return { channels: [], templates: [{ id: 1, name: "По умолчанию", layout: "gameplay_stack", config: structuredClone(demoDefaults), isDefault: true }], settings: { draftConcurrency: 2, finalConcurrency: 1, resumeOnStart: true, inhibitSleep: true } };
+}
+const demoFactory = loadDemoFactory();
+const persistDemoFactory = () => localStorage.setItem("demo-factory", JSON.stringify(demoFactory));
+
+const demoTrendConfig: TrendConfig = { twitch: true, kick: false, youtube: false, topics: true, languages: ["ru"], categories: ["Dota 2"], keywords: ["турнир"], knownChannels: [], whitelist: [], threshold: 0.75, showFrom: 0.2, dailyLimit: 5, intervalMin: 10, region: "RU", gamesTop: 8 };
+const demoTrends: TrendCandidate[] = [
+  { id: 1, kind: "live", platform: "twitch", url: "https://twitch.tv/zxcursed", title: "ФИНАЛ турнира: решающая карта", category: "Dota 2", language: "ru", channelName: "ZXCursed", metric: 14200, previous: 3100, windowMin: 30, score: 0.91, why: "+358 % за 30 мин, категория Dota 2, совпала тема", state: "new", auto: false, lastSeen: 0 },
+  { id: 2, kind: "clip", platform: "twitch", url: "https://clips.twitch.tv/Demo", title: "Невероятный камбэк на последних секундах", category: "Dota 2", language: "ru", channelName: "Bro", metric: 5200, previous: 900, windowMin: 40, score: 0.74, why: "+478 % за 40 мин, категория Dota 2", state: "new", auto: false, lastSeen: 0 },
+  { id: 3, kind: "vod", platform: "youtube", url: "https://youtube.com/watch?v=demo", title: "Разбор главной новости недели", category: "25", language: "ru", channelName: "Новости", metric: 480000, previous: 0, windowMin: 0, score: 0.42, why: "", state: "new", auto: false, lastSeen: 0 },
+];
 const mock: typeof real = {
+  nodeKeygen: async () => ({ keyPath: "~/.local/share/app/server_key", publicKey: "ssh-ed25519 AAAA…demo avtonarezka", version: "0.4.1", created: true }),
+  integrationTest: async name => `${name}: проверка в демо-режиме не выполняется`,
+  nodeConfigPush: async groups => ({ applied: groups, skipped: [] }),
+  nodeConfigRemote: async () => ({ secrets: { factory_twitch_app: false, discovery_youtube_key: false, discovery_kick_token: false, notify_bot_token: false }, kv: {}, keyStore: true }),
+  notifyState: async () => ({ config: { enabled: false, chat: "", summaryHour: 9, attention: true }, token: false }),
+  notifySet: async () => undefined,
+  notifyTest: async () => undefined,
+  liveState: async () => ({ sessions: [{ id: 1, platform: "twitch", url: "https://twitch.tv/zxcursed", channel: "zxcursed", title: "", state: "live", manual: false, chat: true, startedAt: Math.floor(Date.now() / 1000) - 1500, endedAt: null, note: "", moments: 2 }, { id: 2, platform: "kick", url: "https://kick.com/abc", channel: "", title: "Слоты", state: "ended", manual: true, chat: false, startedAt: Math.floor(Date.now() / 1000) - 9000, endedAt: Math.floor(Date.now() / 1000) - 5400, note: "эфир закончился", moments: 1 }], moments: [{ id: 1, sessionId: 1, score: 8.4, manual: false, state: "cut", itemId: 5, error: null, createdAt: Math.floor(Date.now() / 1000) - 600, length: 62 }, { id: 2, sessionId: 1, score: 5.1, manual: false, state: "cut", itemId: 6, error: null, createdAt: Math.floor(Date.now() / 1000) - 200, length: 48 }, { id: 3, sessionId: 2, score: 0, manual: true, state: "failed", itemId: null, error: "Окно момента почти целиком вне кольца", createdAt: Math.floor(Date.now() / 1000) - 5500, length: 45 }], flowEnabled: true, maxSessions: 2, diskFreeMb: 48000 }),
+  liveStart: async () => 3,
+  liveStop: async () => undefined,
+  liveCutNow: async () => undefined,
+  liveMomentIgnore: async () => undefined,
+  discoveryState: async () => ({ config: demoTrendConfig, new: demoTrends, watch: [], accepted: [], providers: { twitch: { configured: true, ok: true, at: 0, found: 58, message: "" }, kick: { configured: false, ok: null, at: 0, found: 0, message: "не настроено" }, youtube: { configured: false, ok: null, at: 0, found: 0, message: "не настроено" }, topics: { configured: true, ok: true, at: 0, found: 50, message: "" } }, topics: ["финал лиги", "курс доллара", "чемпионат мира"], lastPoll: Math.floor(Date.now() / 1000) - 240, flowEnabled: true, youtubeKey: false, kickToken: false, twitchKeys: true }),
+  discoveryConfigSet: async c => c,
+  discoverySecretSet: async () => undefined,
+  discoveryPollNow: async () => ({ seen: 58, fresh: 3, shown: 3, autoAccepted: 0 }),
+  discoveryAccept: async () => 1,
+  discoveryReject: async () => undefined,
+  modesState: async () => ({ node: "pc" as const, scenes: [], rules: [], active: null, pinnedUntil: 0, actions: [], log: [] }),
+  sceneActivate: async () => [],
+  sceneUnpin: async () => undefined,
+  sceneSave: async (scene: SceneDto) => scene,
+  sceneDelete: async () => undefined,
+  ruleSave: async () => undefined,
+  ruleDelete: async () => undefined,
+  nodeConfigGet: async () => null,
+  nodeConfigSet: async () => { throw new Error("Доступно в настольном приложении"); },
+  nodeFuseReset: async () => undefined,
+  nodeOverview: async () => ({ configured: false, enabled: false, config: null, fuse: { failures: 0, blocked: false, message: null }, online: false, error: null, remote: null }),
+  nodeCheck: async () => { throw new Error("Связь с сервером доступна в настольном приложении"); },
+  nodeHostkeyScan: async () => { throw new Error("Доступно в настольном приложении"); },
+  nodeHostkeyAccept: async () => undefined,
+  nodeCandidates: async () => [],
+  nodeSend: async () => ({ sent: [], failed: [] }),
+  nodePull: async () => ({ finished: [], failed: [], waiting: 0 }),
+  nodeRecall: async () => undefined,
+  nodeHandover: async () => ({ sent: [], failed: [], safeToPowerOff: false, staysHere: [] }),
+  nodePoweroff: async () => undefined,
+  diagnosticsCollect: async () => ({format: "avtonarezka-diagnostics-v1", createdAt: new Date().toISOString(), app: {version: "0.3.0", os: "browser-preview", arch: "preview", debug: true}, database: {schema: 16, foreignKeyViolations: 0, counts: {}, factoryStages: {}, publicationStates: {}, events: []}, runtimeLog: [], logWriteFailed: false, resources: {analyses: 0, renders: 0, downloads: 0, mlBusy: false, sourceBusy: false, inhibitActive: false, inhibitNeeded: false, inhibitFailed: false}, models: {coreReady: false, face: false}, tools: {}, privacy: "Предпросмотр интерфейса без подключения к приложению."}),
+  diagnosticsExport: async () => { throw new Error("Экспорт диагностики доступен в приложении Автонарезка"); },
+  diskSnapshot: async () => ({ policy: { automatic: false, keepDays: 14, maxGib: 100 }, files: [], channels: [], categories: [], managedBytes: 0, reclaimableBytes: 0, selectedBytes: 0, missing: 0, limitUnreachable: false }),
+  diskPolicySave: async () => { throw new Error("Политика хранения настраивается в настольном приложении"); },
+  diskCleanup: async () => { throw new Error("Очистка доступна в настольном приложении"); },
+  powerStatus: async () => ({ active: false, needed: false, reason: "Доступно в настольном приложении", error: null }),
+  lifecycleStatus: async () => ({ trayEnabled: false, trayActive: false, trayError: null, autostartAvailable: false, autostartEnabled: false, autostartError: null, windowVisible: true }),
+  lifecycleTraySet: async () => { throw new Error("Трей доступен в настольном приложении"); },
+  lifecycleAutostartSet: async () => { throw new Error("Автозапуск доступен в настольном приложении"); },
+  lifecycleHide: async () => { throw new Error("Скрытие окна доступно в настольном приложении"); },
+  notificationsEnabled: async () => false,
+  notificationsSet: async () => { throw new Error("Уведомления настраиваются в настольном приложении"); },
+  analyticsDashboard: async (): Promise<AnalyticsDashboard> => ({ rows: [], published: 0, measured: 0, views: null, medianViews: null, errors: 0, attention: 0, errorRate: null, hours: Array.from({ length: 24 }, (_, hour) => ({ hour, published: 0, medianViews: null })), autoCollect: false, checkedAt: null }),
+  analyticsHistory: async (): Promise<MetricSample[]> => [],
+  analyticsManual: async () => { throw new Error("Замеры сохраняются в настольном приложении"); },
+  analyticsCollect: async () => { throw new Error("Сбор метрик доступен в настольном приложении"); },
+  analyticsAuto: async () => { throw new Error("Настройки сохраняются в настольном приложении"); },
+  analyticsFeedback: async (channelId: number): Promise<AnalyticsFeedback> => ({ channelId, clips: 0, reason: "Нужно 50 разных роликов с замерами в 48–54 часа после публикации.", suggestions: [] }),
+  analyticsApply: async () => { throw new Error("Подсказки применяются в настольном приложении"); },
+  campaignReportOpen: async () => { throw new Error("Просмотр отчёта доступен в настольном приложении"); },
+  campaignReportExport: async () => { throw new Error("Экспорт доступен в настольном приложении"); },
+  campaignsList: async () => [],
+  campaignSave: async () => { throw new Error("Кампании сохраняются в настольном приложении"); },
+  campaignPreview: async () => { throw new Error("Ротация доступна в настольном приложении"); },
+  campaignAssignments: async () => [],
+  layoutPreview: async () => { throw new Error("Предпросмотр доступен в настольном приложении"); },
+  publicationAccounts: async () => [],
+  vkMetricsOptions: async (): Promise<VkMetricsOptions> => ({ accounts: [], clips: [], secretBackend: "memory" }),
+  vkMetricsAccountSave: async () => { throw new Error("Подключение VK доступно в настольном приложении"); },
+  vkMetricsAccountEnabled: async () => { throw new Error("Настройки VK доступны в настольном приложении"); },
+  vkMetricsLink: async () => { throw new Error("Привязка VK доступна в настольном приложении"); },
+  publicationAccountPolicy: async () => {},
+  instagramAccountSave: (args: InstagramAccountArgs) => invoke<number>("instagram_account_save", { args }),
+  telegramAccountSave: async () => { throw new Error("Подключение Telegram доступно в настольном приложении"); },
+  telegramAccountCheck: async () => { throw new Error("Проверка Telegram доступна в настольном приложении"); },
+  youtubeOAuthSettings: async () => ({ clientId: "", hasSecret: false, secretBackend: "memory", loginRunning: false }),
+  youtubeOAuthSave: async () => { throw new Error("Подключение YouTube доступно в настольном приложении"); },
+  youtubeLoginStart: async () => { throw new Error("Подключение YouTube доступно в настольном приложении"); },
+  youtubeLoginCancel: async () => {},
+  youtubeAccountSave: async () => { throw new Error("Настройки YouTube доступны в настольном приложении"); },
+  publicationsList: async () => ({ publications: [], running: false, note: null, secretBackend: "memory" }),
+  publicationAutofill: async () => { throw new Error("Автозаполнение доступно в настольном приложении"); },
+  publicationSchedule: async () => { throw new Error("Расписание доступно в настольном приложении"); },
+  publicationMove: async () => { throw new Error("Расписание доступно в настольном приложении"); },
+  publicationRefreshCaption: async () => { throw new Error("Обновление подписи доступно в настольном приложении"); },
+  publicationCancel: async () => { throw new Error("Расписание доступно в настольном приложении"); },
+  publicationResolve: async () => { throw new Error("Проверка публикаций доступна в настольном приложении"); },
+  publicationsStart: async () => { throw new Error("Публикация доступна в настольном приложении"); },
+  factoryCalendar: async () => [],
+  platformCaps: async () => [{ platform: "tiktok", name: "TikTok", captionMax: 3999, titleMax: 0, hashtagsMax: 5, durationMax: null, fileMax: null, dailyDefault: 5, nativeSchedule: false, login: "oauth_or_browser" }, { platform: "telegram", name: "Telegram", captionMax: 1024, titleMax: 0, hashtagsMax: 30, durationMax: null, fileMax: 50_000_000, dailyDefault: 10, nativeSchedule: false, login: "bot_token" }, { platform: "youtube", name: "YouTube Shorts", captionMax: 5000, titleMax: 100, hashtagsMax: 15, durationMax: 180, fileMax: 256_000_000_000, dailyDefault: 5, nativeSchedule: true, login: "google_oauth" }],
+  outputProfiles: async () => (["tiktok", "telegram", "youtube", "instagram"] as const).map(platform => ({ platform, limits: { maxSeconds: platform === "youtube" ? 180 : platform === "instagram" ? 900 : null, videoKbps: 6000, audioKbps: 128 } })),
+  outputProfileSave: async () => { throw new Error("Выходные профили доступны в настольном приложении"); },
+  outputPreview: async () => { throw new Error("Рендер варианта доступен в настольном приложении"); },
+  captionDraftLoad: async (draftId, platform) => { const d = [...demoDrafts, ...demoFinals].find(d => d.id === draftId); return { spec: { platform, template: "{название}\n\n{тело}\n\n{кредит}\n{ссылка}\n{промокод}\n{хэштеги}" }, fields: { title: platform === "youtube" ? d?.title ?? "" : "", body: "", credit: "", link: "", promo: "", hashtags: d?.hashtags ?? [] } }; },
+  captionDraftSave: async () => { throw new Error("Проверка и сохранение подписи доступны в настольном приложении"); },
+  captionAccountLoad: async (draftId, platform) => mock.captionDraftLoad(draftId, platform),
+  captionAccountSave: async () => { throw new Error("Сохранение подписи доступно в настольном приложении"); },
+  captionApplyBody: async () => { throw new Error("Сохранение текста доступно в настольном приложении"); },
+  captionDraftGenerate: async () => { throw new Error("Локальная модель доступна в настольном приложении"); },
+  accountsList: async () => demoAccounts.map(a => ({ ...a })),
+  channelsList: async () => demoFactory.channels.map(c => ({ ...structuredClone(c), analysis: normalizeAnalysis(c.analysis), monitor: { ...defaultMonitorOptions, ...c.monitor }, lastCheckedAt: c.lastCheckedAt ?? null, nextCheckAt: c.nextCheckAt ?? null, sourceError: c.sourceError ?? null, complaintLimit: c.complaintLimit ?? 3, rightsPaused: c.rightsPaused ?? false, activeIncidents: c.activeIncidents ?? 0 })),
+  cameraFrame: async () => { throw new Error("Кадр камеры доступен в настольном приложении на импортированном видео"); },
+  cameraDetect: async () => { throw new Error("Поиск лица доступен в настольном приложении"); },
+  cameraScan: async () => { throw new Error("Проверка записи доступна в настольном приложении"); },
+  cameraScanCancel: async () => {},
+  faceModelReady: async () => false,
+  faceModelDownload: async () => { throw new Error("Загрузка YuNet доступна в настольном приложении"); },
+  sourceCheck: async () => { throw new Error("Проверка источников доступна в настольном приложении"); },
+  channelIncidents: async () => [],
+  channelIncidentAdd: async () => { throw new Error("Учёт жалоб доступен в настольном приложении"); },
+  channelIncidentResolve: async () => { throw new Error("Учёт жалоб доступен в настольном приложении"); },
+  channelRightsResume: async () => { throw new Error("Возобновление доступно в настольном приложении"); },
+  channelSave: async (channel) => {
+    if (!channel.name.trim()) throw new Error("Укажи название канала");
+    if (channel.monitor.minDuration !== null && channel.monitor.maxDuration !== null && channel.monitor.minDuration > channel.monitor.maxDuration) throw new Error("Максимальная длительность меньше минимальной");
+    if (channel.monitor.intervalMinutes < 1 || channel.monitor.intervalMinutes > 1440) throw new Error("Интервал проверки: от 1 до 1440 минут");
+    const saved = { ...structuredClone(channel), id: channel.id || Math.max(0, ...demoFactory.channels.map(c => c.id)) + 1 };
+    demoFactory.channels = [...demoFactory.channels.filter(c => c.id !== saved.id), saved]; persistDemoFactory(); return saved;
+  },
+  channelRemove: async (id) => { demoFactory.channels = demoFactory.channels.filter(c => c.id !== id); persistDemoFactory(); },
+  templatesList: async () => structuredClone(demoFactory.templates),
+  templateSave: async (template) => {
+    if (!template.name.trim()) throw new Error("Укажи название шаблона");
+    const saved = { ...structuredClone(template), id: template.id || Math.max(0, ...demoFactory.templates.map(t => t.id)) + 1, isDefault: template.id === 1 };
+    demoFactory.templates = [...demoFactory.templates.filter(t => t.id !== saved.id), saved]; persistDemoFactory(); return saved;
+  },
+  templateRemove: async (id) => {
+    if (id === 1 || demoFactory.channels.some(c => c.templateId === id)) throw new Error("Шаблон по умолчанию или используется каналом");
+    demoFactory.templates = demoFactory.templates.filter(t => t.id !== id); persistDemoFactory();
+  },
+  factorySettings: async () => ({ ...demoFactory.settings }),
+  factorySettingsSet: async (settings) => { demoFactory.settings = settings; persistDemoFactory(); return settings; },
+  factoryState: async () => {
+    const saved = localStorage.getItem("demo-factory-state");
+    return saved ? JSON.parse(saved) as FactoryState : { items: [], events: [], inbox: [], running: false, paused: false };
+  },
+  factoryItemUpdate: async () => {},
+  factoryDecide: async (ids, approve) => {
+    const saved = localStorage.getItem("demo-factory-state"); if (!saved) return 0;
+    const state: FactoryState = JSON.parse(saved);
+    const n = state.inbox.filter(i => ids.includes(i.draft.id) && (!approve || i.draft.status === "ready")).length;
+    state.inbox = state.inbox.filter(i => !ids.includes(i.draft.id) || (approve && i.draft.status !== "ready"));
+    localStorage.setItem("demo-factory-state", JSON.stringify(state)); return n;
+  },
   appInfo: async () => ({
     version: "dev",
     data_dir: "",
-    env: { os: "linux", ffmpeg: "ffmpeg", nvenc: true, libass: true, ytdlp: "2026.10.26", ytdlpOk: true, jsRuntime: "deno" },
+    env: { os: "linux", ffmpeg: "ffmpeg", nvenc: true, libass: true, ytdlp: "2026.10.26", ytdlpOk: true, twitchDownloader: null, jsRuntime: "deno" },
   }),
   mediaUrl: async () => "",
   importVideo: async () => demoProject,
@@ -700,6 +1125,12 @@ const mock: typeof real = {
   },
   modelsStatus: async () => ({ dir: "~/.local/share/…/models", whisper: true, yamnet: true, llm: true, worker: true, ready: true, downloading: false }),
   modelsDownload: async () => false,
+  analysisOptionsGet: async () => structuredClone(demoAnalysisSettings),
+  analysisOptionsSet: async (options) => {
+    demoAnalysisSettings = normalizeAnalysis(options);
+    localStorage.setItem("demo-analysis-options", JSON.stringify(demoAnalysisSettings));
+    return structuredClone(demoAnalysisSettings);
+  },
   analysisStart: async (projectId) => {
     const stages: [string, string][] = [["audio", "Читаю звук"], ["events", "Ищу смех, крики и аплодисменты"], ["speech", "Распознаю речь"], ["video", "Считаю динамику кадра"], ["score", "Выбираю лучшие места"], ["llm", "Оцениваю моменты"]];
     let i = 0;
@@ -716,6 +1147,14 @@ const mock: typeof real = {
     tick();
   },
   analysisCancel: async () => {},
+  analysisInputsGet: async () => ({ chat: null, clips: null, chatError: null }),
+  analysisChatImport: async () => { throw new Error("Импорт чата доступен в настольном приложении"); },
+  analysisChatClear: async () => {},
+  analysisClipsClear: async () => {},
+  analysisTwitchClips: async () => { throw new Error("Запрос Twitch доступен в настольном приложении"); },
+  twitchSignalStatus: async () => ({ configured: false, storage: "memory" }),
+  twitchSignalCredentials: async () => { throw new Error("Секреты сохраняются только в настольном приложении"); },
+  analysisTimeline: async () => ({ duration: 0, hop: 0.5, series: [], scout: null }),
   analysisNotes: async () => [],
   momentsList: async () => demoMoments,
   momentSetStatus: async (id, status) => void (demoMoments.find((m) => m.id === id)!.status = status),
@@ -796,12 +1235,12 @@ const mock: typeof real = {
     demoJobs = demoFinals.map((d, i) => ({ id: 300 + i, draftId: d.id, readyId: null, name: "", wantedAccount: null, caption: "", hashtags: [], state: "drafting" as JobState, error: null, attempts: 0, notBefore: 0, len: 0, updatedAt: nowSec() }));
     mockBus.dispatchEvent(new CustomEvent("queue-update", { detail: { projectId } }));
     demoJobs.forEach((j, i) => {
-      for (const [k, message] of ["Подбираю хэштеги", "Пишу описание, часть 2 из 4", "Пишу описание, часть 4 из 4"].entries()) {
+      for (const [k, message] of ["Подбираю хэштеги"].entries()) {
         setTimeout(() => mockBus.dispatchEvent(new CustomEvent("queue-text", { detail: { draftId: j.draftId, message } })), 500 + i * 1800 + k * 500);
       }
       setTimeout(() => {
         const tags = ["юмор", "сериал", "тикток", "момент", "смех"];
-        j.caption = demoLongText(3990 - composeCaption("", tags).length - 1 + (i % 3) * 3);
+        // Текст вводится вручную; модель подбирает только теги.
         j.hashtags = tags.map((t) => `#${t}`);
         j.len = captionLen(j.caption, j.hashtags);
         j.state = "ready";
@@ -813,18 +1252,22 @@ const mock: typeof real = {
   queuePrepareCancel: async () => {
     demoGenerating = false;
   },
-  queueApplyText: async (projectId, caption, hashtags) => {
+  queueApplyText: async (projectId, caption, hashtags, preserveHashtags = false) => {
     const tags = normalizeTags(hashtags);
     const len = captionLen(caption, tags);
-    if (!caption.trim()) throw "Описание пустое";
-    if (tags.length < 1 || tags.length > 5) throw "Хэштегов должно быть от 1 до 5";
+    if (tags.length > 5) throw "Хэштегов должно быть не больше 5";
     if (len > 4000) throw `Подпись с хэштегами ${len} знаков, а страница TikTok принимает не больше 4000`;
     const busy: JobState[] = ["drafting", "queued", "sending", "done", "needs_check"];
     const eligible = demoFinals.filter((d) => !demoJobs.some((j) => j.draftId === d.id && busy.includes(j.state)));
     if (eligible.length === 0) throw "Нет роликов, которым можно назначить текст: все уже в очереди, выложены или ждут проверки";
     for (const d of eligible) {
-      const fields = { caption: caption.trim(), hashtags: tags, len, state: "ready" as JobState, error: null };
+      const ownTags = preserveHashtags ? (demoJobs.find(j => j.draftId === d.id)?.hashtags ?? []) : tags;
+      if (captionLen(caption, ownTags) > 4000) throw "Текст вместе с хэштегами одного из роликов превышает 4000 знаков";
+    }
+    for (const d of eligible) {
       const old = demoJobs.find((j) => j.draftId === d.id);
+      const ownTags = preserveHashtags ? (old?.hashtags ?? []) : tags;
+      const fields = { caption: caption.trim(), hashtags: ownTags, len: captionLen(caption, ownTags), state: "ready" as JobState, error: null };
       if (old) Object.assign(old, fields);
       else demoJobs.push({ id: 300 + demoJobs.length + 1, draftId: d.id, readyId: null, name: "", wantedAccount: null, attempts: 0, notBefore: 0, updatedAt: nowSec(), ...fields });
     }
@@ -989,4 +1432,16 @@ export function fmtDuration(sec: number): string {
 
 export function errText(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
+}
+
+export interface DiagnosticBundle {
+  format: string; createdAt: string;
+  app: {version: string; os: string; arch: string; debug: boolean};
+  database: {schema: number; foreignKeyViolations: number; counts: Record<string, number>; factoryStages: Record<string, number>; publicationStates: Record<string, number>; events: {id: number; at: number; kind: string; class: string}[]};
+  runtimeLog: {at: number; level: string; component: string; class: string; fingerprint: string}[];
+  logWriteFailed: boolean;
+  resources: {analyses: number; renders: number; downloads: number; mlBusy: boolean; sourceBusy: boolean; inhibitActive: boolean; inhibitNeeded: boolean; inhibitFailed: boolean};
+  models: {coreReady: boolean; face: boolean};
+  tools: Record<string, boolean>;
+  privacy: string;
 }

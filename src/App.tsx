@@ -1,7 +1,20 @@
 import { useEffect } from "react";
 import { AnimatePresence, motion, type Variants } from "motion/react";
 import Scene from "./scene/Scene";
-import Stepper from "./components/Stepper";
+import FactoryNav, { AREAS } from "./components/FactoryNav";
+import Calendar from "./screens/Calendar";
+import Factory from "./screens/Factory";
+import Channels from "./screens/Channels";
+import Templates from "./screens/Templates";
+import Campaigns from "./screens/Campaigns";
+import Analytics from "./screens/Analytics";
+import Disk from "./screens/Disk";
+import Server from "./screens/Server";
+import Modes from "./screens/Modes";
+import Trends from "./screens/Trends";
+import Live from "./screens/Live";
+import Integrations from "./screens/Integrations";
+import { Accounts, Settings } from "./screens/FactoryAux";
 import TopBar from "./components/TopBar";
 import Toasts from "./components/Toasts";
 import ModelsBanner from "./components/ModelsBanner";
@@ -41,13 +54,14 @@ function Screen({ id }: { id: ScreenId }) {
 
 export default function App() {
   const screen = useUi((s) => s.screen);
+  const area = useUi((s) => s.area);
   const dir = useUi((s) => s.dir);
   const lite = useUi((s) => s.lite);
   const accent = useUi((s) => s.accent);
   const setInfo = useUi((s) => s.setInfo);
   const setProjects = useUi((s) => s.setProjects);
   const notify = useUi((s) => s.notify);
-  const heavy = HEAVY.includes(screen);
+  const heavy = area !== "studio" || HEAVY.includes(screen);
   const custom: PageCustom = { d: dir, heavy };
 
   useEffect(() => {
@@ -71,7 +85,7 @@ export default function App() {
           ui().setMoments(await api.momentsList(fresh.id));
         }
         ui().notify(`Анализ готов: найдено моментов — ${d.moments}`);
-        if (ui().screen === "analysis" && d.notes.length === 0) ui().go("moments");
+        if (ui().area === "studio" && ui().project?.id === d.projectId && ui().screen === "analysis" && d.notes.length === 0) ui().go("moments");
       }),
       onEvent<ErrorEvent>("analysis-error", (e) => {
         ui().setAnalysis({ running: false });
@@ -86,7 +100,7 @@ export default function App() {
     if (!import.meta.env.DEV || !inTauri) return;
     let dead = false;
     const offs: (() => void)[] = [];
-    listen<ScreenId>("dev-go", (e) => useUi.getState().go(e.payload)).then((f) => (dead ? f() : offs.push(f)));
+    listen<string>("dev-go", (e) => { const a = AREAS.find(a => a.id === e.payload); if (a) useUi.getState().setArea(a.id); else useUi.getState().go(e.payload as ScreenId); }).then((f) => (dead ? f() : offs.push(f)));
     listen<number>("dev-select", async (e) => {
       const projects = await api.listProjects();
       useUi.getState().setProjects(projects);
@@ -217,13 +231,13 @@ export default function App() {
         <TopBar />
         <ModelsBanner />
         <div className="flex min-h-0 flex-1 gap-8">
-          <aside className="w-[230px] shrink-0 pt-2">
-            <Stepper />
+          <aside className="factory-sidebar w-[210px] shrink-0 pt-2">
+            <FactoryNav />
           </aside>
           <main className="relative min-w-0 flex-1" style={heavy ? undefined : { perspective: 1800 }}>
             <AnimatePresence mode="wait" custom={custom} initial={false}>
               <motion.div
-                key={screen}
+                key={area === "studio" ? screen : area}
                 custom={custom}
                 variants={page}
                 initial="enter"
@@ -232,10 +246,10 @@ export default function App() {
                 transition={{ type: "spring", stiffness: 150, damping: 21, mass: 0.9 }}
                 className="absolute inset-0 overflow-y-auto overflow-x-hidden pr-1"
                 style={heavy ? undefined : { transformStyle: "preserve-3d" }}
-                aria-label={SCREENS.find((s) => s.id === screen)?.label}
+                aria-label={area === "studio" ? SCREENS.find((s) => s.id === screen)?.label : AREAS.find(a => a.id === area)?.label}
               >
-                <ErrorBoundary resetKey={screen}>
-                  <Screen id={screen} />
+                <ErrorBoundary resetKey={area + screen}>
+                  {area === "studio" ? <Screen id={screen} /> : area === "factory" ? <Factory /> : area === "channels" ? <Channels /> : area === "templates" ? <Templates /> : area === "calendar" ? <Calendar /> : area === "accounts" ? <Accounts /> : area === "settings" ? <Settings /> : area === "campaigns" ? <Campaigns /> : area === "disk" ? <Disk /> : area === "server" ? <Server /> : area === "modes" ? <Modes /> : area === "trends" ? <Trends /> : area === "live" ? <Live /> : area === "integrations" ? <Integrations /> : <Analytics />}
                 </ErrorBoundary>
               </motion.div>
             </AnimatePresence>
